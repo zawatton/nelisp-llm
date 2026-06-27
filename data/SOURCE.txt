@@ -1,0 +1,2 @@
+Source: Project Gutenberg (public domain), "Alice in Wonderland" by Lewis Carroll.
+A Pile component; used here only as a small fully-open training sample.
