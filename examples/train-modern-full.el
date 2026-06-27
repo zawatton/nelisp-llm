@@ -1,0 +1,100 @@
+;;; train-modern-full.el --- train a full modern block (GQA + MoE) directly  -*- lexical-binding: t; -*-
+;; Trains the *complete* modern transformer block -- multi-head grouped-query
+;; attention (RoPE) plus a top-k sparse mixture-of-experts FFN -- built entirely
+;; from nl-llm autograd ops, on public-domain text, and shows the loss
+;; decreasing.  This exercises the multi-head GQA backward (per-head autograd
+;; slice/concat) and the MoE backward (top-k routing) added on top of the
+;; single-head SwiGLU demo in train-modern.el.  CPU path.
+;;   emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l examples/train-modern-full.el
+(add-to-list 'load-path (expand-file-name "lisp"))
+(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+(require 'cl-lib)
+(require 'photon-tensor)
+(require 'photon-bpe)
+(require 'photon-autograd)
+(require 'nl-llm-autograd)
+
+(defun tmf--p (shape seed scale)
+  (let ((n 1)) (dolist (d shape) (setq n (* n d)))
+    (photon-autograd-const
+     (photon-tensor-from-list
+      shape
+      (mapcar (lambda (i)
+                (* scale 2.0
+                   (- (/ (float (mod (+ (* (1+ i) 2654435761) (* (1+ seed) 40503)) 65536))
+                         65536.0) 0.5)))
+              (number-sequence 0 (1- n)))))))
+(defun tmf--ones (n) (photon-autograd-const (photon-tensor-create (list n) 1.0)))
+(defun tmf--zeros (n) (photon-autograd-const (photon-tensor-create (list n) 0.0)))
+
+(let* ((corpus (with-temp-buffer (insert-file-contents "data/corpus.txt") (buffer-string)))
+       (bpe (photon-bpe-train (list corpus) 100))
+       (ids (apply #'vector (photon-bpe-encode bpe corpus)))
+       (ntok (length ids)) (vocab (photon-bpe-size bpe))
+       (dim 16) (ff 32) (seq 12) (steps 30) (lr 0.3)
+       (heads 4) (kv-heads 2) (ne 4) (top-k 2)         ; GQA + sparse MoE
+       (hd (/ dim heads)) (kvdim (* kv-heads hd))
+       (sc (/ 1.0 (sqrt (float dim))))
+       (wte (tmf--p (list vocab dim) 1 sc))
+       (ln1g (tmf--ones dim))
+       (Wq (tmf--p (list dim dim) 2 sc)) (bq (tmf--zeros dim))
+       (Wk (tmf--p (list kvdim dim) 3 sc)) (bk (tmf--zeros kvdim))
+       (Wv (tmf--p (list kvdim dim) 4 sc)) (bv (tmf--zeros kvdim))
+       (Wo (tmf--p (list dim dim) 5 sc)) (bo (tmf--zeros dim))
+       (ln2g (tmf--ones dim))
+       (router (tmf--p (list ne dim) 10 sc)) (brouter (tmf--zeros ne))
+       (experts (let ((ex nil) (e 0))
+                  (while (< e ne)
+                    (push (list :wg (tmf--p (list ff dim) (+ 20 (* e 6)) sc) :bg (tmf--zeros ff)
+                                :wu (tmf--p (list ff dim) (+ 21 (* e 6)) sc) :bu (tmf--zeros ff)
+                                :wd (tmf--p (list dim ff) (+ 22 (* e 6)) sc) :bd (tmf--zeros dim))
+                          ex)
+                    (setq e (1+ e)))
+                  (nreverse ex)))
+       (lnfg (tmf--ones dim))
+       (Wh (tmf--p (list vocab dim) 9 sc)) (bh (tmf--zeros vocab))
+       (block (list :ln1g ln1g :wq Wq :bq bq :wk Wk :bk bk :wv Wv :bv bv :wo Wo :bo bo
+                    :ln2g ln2g :router router :brouter brouter :experts experts :top-k top-k))
+       (expert-pavs (apply #'append
+                           (mapcar (lambda (p) (list (plist-get p :wg) (plist-get p :bg)
+                                                     (plist-get p :wu) (plist-get p :bu)
+                                                     (plist-get p :wd) (plist-get p :bd)))
+                                   experts)))
+       (params (append (list wte ln1g Wq bq Wk bk Wv bv Wo bo ln2g router brouter)
+                       expert-pavs (list lnfg Wh bh)))
+       (losses nil))
+  (cl-flet ((forward (toks targets)
+              (photon-autograd-reset-tape)
+              (let* ((x (photon-autograd-embedding wte toks dim))
+                     (h (nl-llm-ag-block x block heads kv-heads))
+                     (xf (nl-llm-ag-rmsnorm h lnfg))
+                     (logits (photon-autograd-linear xf Wh bh)))
+                (photon-autograd-softmax-ce logits targets)))
+            (window (start)
+              (let ((toks nil) (tgts (make-vector seq 0)) (j 0))
+                (while (< j seq)
+                  (push (aref ids (+ start j)) toks)
+                  (aset tgts j (aref ids (+ start j 1)))
+                  (setq j (1+ j)))
+                (cons (nreverse toks) tgts)))
+            (lval (l) (aref (photon-tensor-data (pav-value l)) 0)))
+    (princ (format "full modern block: dim=%d heads=%d kv-heads=%d (GQA) ff=%d experts=%d top-k=%d seq=%d vocab=%d\n"
+                   dim heads kv-heads ff ne top-k seq vocab))
+    (let ((span (- ntok seq 1)) (step 0))
+      (while (< step steps)
+        (let* ((start (% (* step 7) span)) (w (window start))
+               (l (forward (car w) (cdr w))) (loss (lval l)))
+          (push loss losses)
+          (photon-autograd-zero-grad params)
+          (photon-autograd-backward l)
+          (photon-autograd-sgd params lr)
+          (when (or (= (% step 5) 0) (= step (1- steps)))
+            (princ (format "step %2d  loss=%.4f\n" step loss))))
+        (setq step (1+ step))))
+    (setq losses (nreverse losses))
+    (let* ((first5 (/ (apply #'+ (cl-subseq losses 0 5)) 5.0))
+           (last5 (/ (apply #'+ (last losses 5)) 5.0)))
+      (princ (format "mean loss: first5=%.4f last5=%.4f\n" first5 last5))
+      (princ (format "TRAIN-MODERN-FULL=%s\n" (if (< last5 first5) "PASS" "FAIL")))
+      (kill-emacs (if (< last5 first5) 0 1)))))
+;;; train-modern-full.el ends here

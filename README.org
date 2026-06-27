@@ -21,12 +21,17 @@ Adopt, on top of the ~nelisp-photon~ substrate, the architectural techniques
 shared by the strongest open-weight models (GLM, DeepSeek, Qwen) that the
 plain GPT baseline lacks:
 
-- *RMSNorm* (instead of LayerNorm)        -- implemented
-- *RoPE* rotary position embeddings        -- implemented
-- *SwiGLU* / SiLU feed-forward             -- implemented
-- *KV cache* (incremental decode)          -- planned (biggest inference win)
-- *GQA* grouped-query attention            -- planned
-- *MoE* mixture-of-experts                  -- planned
+- *RMSNorm* (instead of LayerNorm)        -- implemented, trainable
+- *RoPE* rotary position embeddings        -- implemented, trainable
+- *SwiGLU* / SiLU feed-forward             -- implemented, trainable
+- *KV cache* (incremental decode)          -- implemented (decode == full)
+- *GQA* grouped-query attention            -- implemented, trainable
+- *MoE* mixture-of-experts                  -- implemented, trainable
+
+Every primitive has both a forward path and a reverse-mode autograd backward
+(numerically gradient-checked), so the full modern block -- multi-head GQA with
+RoPE plus a top-k sparse MoE FFN -- is *directly trainable*, not only run
+forward.  See ~examples/train-modern-full.el~.
 
 Training data: fully-open corpora only -- The Pile (EleutherAI), FineWeb /
 FineWeb-Edu, or Dolma -- so the whole pipeline (data + code + weights) stays
@@ -34,17 +39,24 @@ reproducible.
 
 * Layout
 
-- ~lisp/nl-llm-arch.el~  -- modern transformer primitives over ~photon-tensor~
-- ~test/arch-test.el~    -- correctness tests for the primitives
+- ~lisp/nl-llm-arch.el~     -- core primitives (RMSNorm, RoPE, SiLU, SwiGLU)
+- ~lisp/nl-llm-attn.el~     -- RoPE causal MHA/GQA + KV-cache decode
+- ~lisp/nl-llm-moe.el~      -- top-k sparse mixture-of-experts FFN
+- ~lisp/nl-llm-block.el~    -- pre-norm block + model forward (GQA/MoE)
+- ~lisp/nl-llm-autograd.el~ -- reverse-mode backward for all of the above
+- ~test/*-test.el~          -- correctness + numerical gradient checks
+- ~examples/train-modern.el~      -- train a single-head RMSNorm/RoPE/SwiGLU block
+- ~examples/train-modern-full.el~ -- train the full block (multi-head GQA + MoE)
 
 * Run
 
 #+begin_src sh
-make test
+make test                 # all correctness + gradient-check suites
+make train-modern-full    # train the full GQA + MoE block on open data
 #+end_src
 
 or directly:
 
 #+begin_src sh
-emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l test/arch-test.el
+emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l test/autograd-test.el
 #+end_src

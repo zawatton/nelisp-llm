@@ -2,7 +2,7 @@
 EMACS ?= emacs
 PHOTON ?= ../nelisp-photon/lisp
 
-.PHONY: test compile clean train
+.PHONY: test compile clean train train-modern train-modern-full
 
 test:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/arch-test.el
@@ -18,6 +18,12 @@ compile:
 
 train:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l examples/train-open.el
+
+train-modern:
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l examples/train-modern.el
+
+train-modern-full:
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l examples/train-modern-full.el
 
 clean:
 	rm -f lisp/*.elc
