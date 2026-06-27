@@ -9,6 +9,7 @@ test:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/attn-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/moe-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/block-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/autograd-test.el
 
 compile:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) \
