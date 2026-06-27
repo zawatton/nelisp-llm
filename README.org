@@ -1,0 +1,50 @@
+#+title: nelisp-llm
+
+* Overview
+
+~nelisp-llm~ is the *experiment repository* for building and training small
+language models in Emacs Lisp / NeLisp.  It is deliberately separate from
+~nelisp-photon~:
+
+- ~nelisp-photon~ = the stable *library*: an implementation of Fujitsu's
+  PHOTON architecture plus the tensor core (~photon-tensor~), the GPT-style
+  dense baseline (~photon-transformer~), tokenizer (~photon-bpe~), weight
+  IO (~photon-weights~), the hardware autosizer (~photon-spec~), and the
+  GPU backend (sibling ~nelisp-gpu~).  API is kept clean and NeLisp-loadable.
+- ~nelisp-llm~ (this repo) = the *lab*: depends on ~nelisp-photon~ and moves
+  fast, adopting modern open-weight techniques and training on fully-open
+  data.  Breaking changes are fine here.
+
+* Direction
+
+Adopt, on top of the ~nelisp-photon~ substrate, the architectural techniques
+shared by the strongest open-weight models (GLM, DeepSeek, Qwen) that the
+plain GPT baseline lacks:
+
+- *RMSNorm* (instead of LayerNorm)        -- implemented
+- *RoPE* rotary position embeddings        -- implemented
+- *SwiGLU* / SiLU feed-forward             -- implemented
+- *KV cache* (incremental decode)          -- planned (biggest inference win)
+- *GQA* grouped-query attention            -- planned
+- *MoE* mixture-of-experts                  -- planned
+
+Training data: fully-open corpora only -- The Pile (EleutherAI), FineWeb /
+FineWeb-Edu, or Dolma -- so the whole pipeline (data + code + weights) stays
+reproducible.
+
+* Layout
+
+- ~lisp/nl-llm-arch.el~  -- modern transformer primitives over ~photon-tensor~
+- ~test/arch-test.el~    -- correctness tests for the primitives
+
+* Run
+
+#+begin_src sh
+make test
+#+end_src
+
+or directly:
+
+#+begin_src sh
+emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l test/arch-test.el
+#+end_src
