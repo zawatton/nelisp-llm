@@ -228,6 +228,20 @@ mask (each element 1/(1-p) with prob 1-p else 0, mean 1), and ~nlga-dropout~
 elementwise-multiplies it (gradient passes through the mask).  Refresh the mask
 per step with ~nlga-update~; ~test/dropout-test.el~ checks the mask statistics.
 
+*** Full recipe in one run
+
+~examples/train-full-gpu.el~ runs the whole recipe together: train a weight-tied
+stacked model over sliding windows of the corpus, on-device, with Adam +
+warmup/cosine LR + global-norm gradient clipping + dropout (mask refreshed each
+step), then generate via the KV-cache decode with both greedy and
+high-temperature top-k sampling.  On the tiny demo model the corpus loss falls
+(avg 5.5 -> 4.5); greedy collapses to the most frequent token (expected for a
+small model), while temperature sampling stays varied and non-degenerate:
+
+: prompt        : "In another momen"
+: greedy        : "In another momen eo o o o o o ..."
+: sampled(T1.0) : "In another momenb, eabr ouse eor, ok she e..."
+
 *** End-to-end: train on-device, then generate
 
 ~examples/generate-gpu.el~ closes the loop: BPE-encode a passage, train a
@@ -294,6 +308,7 @@ size, while on-device keeps everything resident and only moves the loss out.
 - ~examples/train-stacked-gpu.el~ -- train a multi-block model on-device
 - ~examples/train-corpus-gpu.el~  -- on-device training over a whole corpus
 - ~examples/generate-gpu.el~      -- train on-device, then autoregressively generate
+- ~examples/train-full-gpu.el~    -- full recipe: corpus + clip + dropout + sampling
 
 * Run
 
