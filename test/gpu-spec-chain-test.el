@@ -44,9 +44,21 @@
        (cr (nl-llm-gpu-spec-chain-decode prompt nsteps blocks wte lnfg bh
                                          (list (cons w2 b2) (cons w3 b3)) heads kvh dim vocab maxseq tables maxdepth))
        (chain (car cr)) (forwards (cdr cr)))
-  (nl-llm-gpu-disable)
   (sc--ck "depth-3 chain spec == plain greedy" (equal chain plain)
           (format "%d toks / %d verifies = %.2f tok/fwd" nsteps forwards (/ (float nsteps) forwards)))
+  ;; lossless sampling chain (rejection rule over the tree verify): deterministic
+  ;; given a seed, in-vocab, and reproducible -- distributional losslessness is
+  ;; pinned by spec-test (rejection-d ~ target).
+  (random "nl-llm-chain-sample-seed")
+  (let ((s1 (car (nl-llm-gpu-spec-chain-sample-decode prompt nsteps blocks wte lnfg bh
+                  (list (cons w2 b2) (cons w3 b3)) heads kvh dim vocab maxseq tables maxdepth 0.8 6))))
+    (random "nl-llm-chain-sample-seed")
+    (let ((s2 (car (nl-llm-gpu-spec-chain-sample-decode prompt nsteps blocks wte lnfg bh
+                    (list (cons w2 b2) (cons w3 b3)) heads kvh dim vocab maxseq tables maxdepth 0.8 6)))
+          (inv t))
+      (dolist (tk s1) (unless (and (>= tk 0) (< tk vocab)) (setq inv nil)))
+      (sc--ck "chain-sample: in-vocab + deterministic per seed" (and inv (= (length s1) nsteps) (equal s1 s2)))))
+  (nl-llm-gpu-disable)
   (princ (format "NL-LLM-GPU-SPEC-CHAIN %s (%d failures)\n" (if (= sc--fail 0) "ALL-PASS" "HAS-FAILURES") sc--fail))
   (kill-emacs (if (= sc--fail 0) 0 1)))
 ;;; gpu-spec-chain-test.el ends here

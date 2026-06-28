@@ -586,5 +586,42 @@ plain greedy (lossless) and length(TOKENS)/FORWARDS is the mean tokens per verif
     (nl-llm-gpu-tree-verify-free vctx)
     (cons (nreverse out) forwards)))
 
+;;;###autoload
+(defun nl-llm-gpu-spec-chain-sample-decode (prompt nsteps blocks wte lnfg bh mtp-heads heads kvh dim vocab maxseq tables maxdepth temp topk)
+  "Lossless speculative SAMPLING over a depth-D MTP chain via the persistent GPU
+tree verify.  Each round drafts d1..dD from head1..headD of one hidden, verifies
+the chain in one tree-verify forward, and accepts each draft by the rejection rule
+\(accept w.p. min(1,p/q) else a residual sample) under temperature TEMP / TOPK --
+so every emitted token is distributed EXACTLY as plain sampling, regardless of the
+heads.  Stops at the first reject (emitting its residual); emits a bonus if all
+accept.  Returns (TOKENS . FORWARDS)."
+  (let* ((depth (1+ (length mtp-heads))) (acc (append prompt nil)) (out nil) (forwards 0)
+         (maxctx (+ (length prompt) nsteps 1))
+         (vctx (nl-llm-gpu-tree-verify-new blocks wte lnfg bh heads kvh dim vocab maxctx depth tables maxdepth)))
+    (while (< (length out) nsteps)
+      (setq forwards (1+ forwards))
+      (let* ((cdc (mapcar (lambda (_) (nl-llm-dcache-new maxctx dim heads kvh)) blocks)) (h nil) (l (length acc)))
+        (dolist (tk acc) (setq h (nl-llm-decode-h tk blocks cdc wte lnfg dim)))
+        (let* ((p0 (nl-llm-spec-probs (photon-tensor-data (photon-tensor-linear h wte bh)) 0 vocab temp topk))
+               (t1 (nl-llm-spec--cat p0 vocab))
+               (qs (mapcar (lambda (wb) (nl-llm-spec-probs (photon-tensor-data (photon-tensor-linear h (car wb) (cdr wb))) 0 vocab temp topk)) mtp-heads))
+               (dks (mapcar (lambda (q) (nl-llm-spec--cat q vocab)) qs))
+               (drafts (cons t1 dks))
+               (parents (let ((p nil) (k 0)) (while (< k depth) (push (float (if (= k 0) depth (1- k))) p) (setq k (1+ k))) (nreverse p)))
+               (positions (let ((p nil) (k 0)) (while (< k depth) (push (+ l k) p) (setq k (1+ k))) (nreverse p)))
+               (pa (nl-llm-gpu-tree-verify-step vctx cdc l drafts parents positions))
+               (emit (list t1)) (j 1) (stopped nil))
+          (while (and (< j depth) (not stopped))
+            (let* ((target (nl-llm-spec-probs (nth (1- j) pa) 0 vocab temp topk))
+                   (rj (nl-llm-spec-rejection-d target (nth (1- j) qs) (nth j drafts) vocab)))
+              (push (car rj) emit)
+              (unless (cdr rj) (setq stopped t)))
+            (setq j (1+ j)))
+          (unless stopped
+            (push (nl-llm-spec--cat (nl-llm-spec-probs (nth (1- depth) pa) 0 vocab temp topk) vocab) emit))
+          (dolist (tk (nreverse emit)) (when (< (length out) nsteps) (push tk out) (setq acc (append acc (list tk))))))))
+    (nl-llm-gpu-tree-verify-free vctx)
+    (cons (nreverse out) forwards)))
+
 (provide 'nl-llm-gpu-decode)
 ;;; nl-llm-gpu-decode.el ends here

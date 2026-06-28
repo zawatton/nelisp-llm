@@ -45,9 +45,18 @@ The verify is now *persistent* (compile-once): =nl-llm-gpu-tree-verify-new/-step
 round -step only write-resident's the context K/V (first L rows) + node inputs and
 re-submits (tree-attn reads L at runtime, so L grows without a recompile).
 =nl-llm-gpu-spec-chain-decode= builds the graph once before the loop; results are
-unchanged (2.86/4.0/5.0, lossless).  Remaining: fold the verify into the sampling
-decode loop, and keep the context K/V resident incrementally (vs the per-round CPU
-prefill).
+unchanged (2.86/4.0/5.0, lossless).
+
+The verify is also folded into a lossless *sampling* loop:
+=nl-llm-gpu-spec-chain-sample-decode= drafts d1..dD from head1..headD, verifies the
+chain in one tree-verify forward, and accepts each draft by the rejection rule
+\(=nl-llm-spec-rejection-d=, accept w.p. min(1,p/q) else residual) under
+temperature/top-k -- so every emitted token is distributed exactly as plain
+sampling, stopping at the first reject (its residual) or emitting a bonus if all
+accept.  =test/spec-test.el= pins the pre-drafted rejection rule statistically
+\(rejection-d output ~ target, max|hist-P| 0.003); =test/gpu-spec-chain-test.el=
+checks the GPU sampler is in-vocab + deterministic per seed.  Remaining: keep the
+context K/V resident incrementally (vs the per-round CPU prefill).
 
 MTP self-speculative greedy decode lands: training adds a second look-ahead head
 H2 (predicts the token two ahead) via a second =nlga-seed-ce-idx= at a +2 target;

@@ -422,8 +422,10 @@ matches decoding each node's full path on the CPU (depth-2 tree, maxrel 7.8e-6).
 With several MTP heads (head2..head4), ~nl-llm-gpu-spec-chain-decode~ drafts a
 depth-D chain and verifies it in one tree-verify forward per round, accepting the
 longest greedy match: ~examples/spec-chain.el~ (trained) shows tokens/forward
-rising with depth -- 2.86 (D=2), 4.00 (D=3), 5.00 (D=4), all lossless
-(~docs/design/04-speculative-decoding.org~).
+rising with depth -- 2.86 (D=2), 4.00 (D=3), 5.00 (D=4), all lossless.  The same
+verify drives lossless *sampling* (~nl-llm-gpu-spec-chain-sample-decode~): the
+rejection rule over the chain makes the emitted stream distributed exactly as
+plain temperature/top-k sampling (~docs/design/04-speculative-decoding.org~).
 
 *** Capstone: a real(er) run with mid-run checkpoint + resume
 

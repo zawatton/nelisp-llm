@@ -127,6 +127,22 @@ The returned token is distributed EXACTLY as P, regardless of Q."
         (if (<= s 0.0) (nl-llm-spec--cat p vocab)
           (progn (dotimes (i vocab) (aset r i (/ (aref r i) s))) (nl-llm-spec--cat r vocab)))))))
 
+(defun nl-llm-spec--residual (p q vocab)
+  "Sample from the normalized residual max(0, P-Q); fall back to P if it vanishes."
+  (let ((r (make-vector vocab 0.0)) (s 0.0))
+    (dotimes (i vocab) (let ((v (- (aref p i) (aref q i)))) (when (> v 0.0) (aset r i v) (setq s (+ s v)))))
+    (if (<= s 0.0) (nl-llm-spec--cat p vocab)
+      (progn (dotimes (i vocab) (aset r i (/ (aref r i) s))) (nl-llm-spec--cat r vocab)))))
+
+;;;###autoload
+(defun nl-llm-spec-rejection-d (p q d vocab)
+  "Speculative-sampling acceptance for an ALREADY-drafted token D ~ Q against
+target P.  Returns (TOKEN . ACCEPTED): TOKEN is D if accepted (prob
+min(1, P[d]/Q[d])) else a residual sample; TOKEN ~ P either way.  ACCEPTED (t/nil)
+says whether D was kept -- used to stop verifying a draft chain at the first miss."
+  (let ((acc (if (> (aref q d) 0.0) (min 1.0 (/ (aref p d) (aref q d))) 1.0)))
+    (if (< (nl-llm-spec--randf) acc) (cons d t) (cons (nl-llm-spec--residual p q vocab) nil))))
+
 ;;;###autoload
 (defun nl-llm-spec-sample-decode (prompt nsteps blocks wte lnfg bh w2 b2 heads kvh dim vocab maxseq temp topk)
   "Self-speculative decode with lossless sampling (temperature TEMP, TOPK): the

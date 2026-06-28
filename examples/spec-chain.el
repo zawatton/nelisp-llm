@@ -84,6 +84,11 @@
              (chain (car cr)) (forwards (cdr cr)))
         (princ (format "  depth %d : %.2f tok/fwd  (%d toks / %d verifies)  lossless=%s\n"
                        depth (/ (float ngen) forwards) ngen forwards (if (equal chain plain) "YES" "NO!!")))))
+    (random "spec-chain-sample-seed")
+    (let* ((ss (nl-llm-gpu-spec-chain-sample-decode prompt ngen blks wte lnfg bh allh heads kvh dim vocab maxseq tables maxdepth 0.8 30))
+           (sf (cdr ss)))
+      (princ (format "  sampling (depth 4, T0.8/top-k30, lossless): %.2f tok/fwd  (%d toks / %d verifies)\n"
+                     (/ (float ngen) sf) ngen sf)))
     (princ (format "prompt: %S\n  cont: %S\n" (photon-bpe-decode bpe prompt) (photon-bpe-decode bpe plain))))
   (nl-llm-gpu-disable)
   (princ "NL-LLM-SPEC-CHAIN-DEMO=OK\n"))

@@ -46,7 +46,13 @@
     (random "nl-llm-spec-rejection-seed")
     (dotimes (_ nn) (let ((tok (nl-llm-spec-rejection p q v))) (aset cnt tok (1+ (aref cnt tok)))))
     (dotimes (i v) (setq mx (max mx (abs (- (/ (float (aref cnt i)) nn) (aref p i))))))
-    (sp--ck "lossless sampling: rejection output ~ target P" (< mx 0.02) (format "max|hist-P|=%.3f over %d draws" mx nn)))
+    (sp--ck "lossless sampling: rejection output ~ target P" (< mx 0.02) (format "max|hist-P|=%.3f over %d draws" mx nn))
+    ;; pre-drafted variant (used by the chain tree verify): same losslessness
+    (let ((cnt2 (make-vector v 0)) (mx2 0.0))
+      (random "nl-llm-spec-rejection-d-seed")
+      (dotimes (_ nn) (let ((tok (car (nl-llm-spec-rejection-d p q (nl-llm-spec--cat q v) v)))) (aset cnt2 tok (1+ (aref cnt2 tok)))))
+      (dotimes (i v) (setq mx2 (max mx2 (abs (- (/ (float (aref cnt2 i)) nn) (aref p i))))))
+      (sp--ck "lossless sampling: rejection-d output ~ target P" (< mx2 0.02) (format "max|hist-P|=%.3f" mx2))))
   (princ (format "NL-LLM-SPEC %s (%d failures)\n" (if (= sp--fail 0) "ALL-PASS" "HAS-FAILURES") sp--fail))
   (kill-emacs (if (= sp--fail 0) 0 1)))
 ;;; spec-test.el ends here
