@@ -12,7 +12,7 @@ work.
 
 | #  | Doc                                      | Status | Effort | Payoff            |
 |----+------------------------------------------+--------+--------+-------------------|
-|  1 | [[file:01-bitnet-ternary.org][BitNet b1.58 ternary quantization]]        | DRAFT  | med-hi | memory (PC-fit)   |
+|  1 | [[file:01-bitnet-ternary.org][BitNet b1.58 ternary quantization]]        | PhaseA  | med-hi | memory (PC-fit)   |
 |  2 | [[file:02-streaming-llm-attention-sink.org][StreamingLLM attention sink]]              | SHIPPED | low-md | bounded long ctx  |
 |  3 | [[file:03-paged-attention.org][PagedAttention KV paging]]                 | DRAFT  | med    | var-len batching  |
 |  4 | [[file:04-speculative-decoding.org][Speculative / multi-token decoding]]       | DRAFT  | high   | decode latency    |

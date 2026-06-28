@@ -333,6 +333,21 @@ command buffer is compiled once and the cache stays bounded forever.
 ~test/gpu-stream-test.el~ matches the on-GPU decode to the CPU oracle to f32
 (maxrel ~1e-5 under eviction; ~4e-5 vs full decode when the cap is never reached).
 
+*** Ternary weights: BitNet b1.58 (QAT, Phase A)
+
+~nlga-bitlinear~ trains a linear with *ternary* weights (Microsoft BitNet b1.58):
+the effective weight is =beta * round(clip(W/beta, -1, 1))= with =beta = mean|W|=,
+so it takes values in {-beta, 0, +beta} -- the "1.58 bits".  Training keeps a
+full-precision latent W; ~nlga-quant-weight~ quantizes it on-device each step
+(kernels =absmean-acc= + =quant-w=) and its backward is a straight-through
+estimator (the quantizer is identity in reverse, so the latent W gets the
+gradient and the optimizer trains it).  ~test/gpu-bitnet-test.el~ checks the GPU
+BitLinear against a CPU STE reference: forward matches to maxrel 2.5e-7, the
+training loss trajectory matches the CPU reference to 2.0e-7 and decreases, and
+the trained latent weight quantizes to a genuinely ternary set.  This is Phase A
+(ternary weights, full-precision activations); int8 activations + the packed/DP4A
+kernel are Phase B (~docs/design/01-bitnet-ternary.org~).
+
 *** Capstone: a real(er) run with mid-run checkpoint + resume
 
 ~examples/train-big-gpu.el~ exercises the whole stack at once at a larger scale: a

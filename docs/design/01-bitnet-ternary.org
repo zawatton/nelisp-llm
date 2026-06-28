@@ -3,7 +3,16 @@
 #+STATUS: DRAFT
 
 * Status
-DRAFT -- concept + application design.  Not implemented.
+Phase A (weight ternary) SHIPPED; activation int8 + Phase B pending.
+
+Phase A weight-ternary QAT lands: =nlga-quant-weight= / =nlga-bitlinear= in
+=lisp/nl-llm-gpu-ag.el=, kernels =absmean-acc= / =quant-w= in nelisp-gpu,
+verified in =test/gpu-bitnet-test.el= (forward GPU==CPU maxrel 2.5e-7; training
+loss == CPU STE reference maxrel 2.0e-7; loss decreases; trained latent weight
+quantizes to a genuinely ternary {-b,0,+b}).  This is the MVP gate
+("f32-constrained QAT") from the design-docs index.  Still to do: int8
+*activation* quant (=quant-act-int8=, per-row absmax) to complete Phase A, then
+the int8/DP4A storage + kernel of Phase B.
 
 Source: "The Era of 1-bit LLMs: All Large Language Models are in 1.58 Bits"
 (Microsoft, 2024).

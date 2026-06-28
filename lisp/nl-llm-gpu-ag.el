@@ -109,6 +109,29 @@ RT must be a resident input created by `nlga-const' (same shape).  Use between
             (lambda (dst) (nlga--d b (list 'colsum (list gy dst) (list seq out) (nlga--g out))))))))
     y))
 
+(defun nlga-quant-weight (b w)
+  "Ternary (absmean) quantization of weight W for BitNet b1.58 (QAT, Phase A).
+Forward: WQ = beta * round(clip(W/beta, -1, 1)) with beta = mean|W|, so WQ takes
+values in {-beta, 0, +beta}.  Backward is straight-through (STE): the quantizer is
+treated as identity, so the full-precision latent W receives WQ's gradient
+unchanged and the optimizer trains W.  Returns the WQ rt (same shape as W)."
+  (let* ((n (nlga-rt-size w))
+         (ss (nlga--tmp b 1))                 ; sum|W| accumulator (zeroed each run)
+         (wqs (nlga--tmp b n))
+         (wq (nlga-rt--make :slot wqs :rows (nlga-rt-rows w) :cols (nlga-rt-cols w))))
+    (nlga--d b (list 'absmean-acc (list (nlga-rt-slot w) ss) (list n) (nlga--g 1)))
+    (nlga--d b (list 'quant-w (list (nlga-rt-slot w) ss wqs) (list n) (nlga--g n)))
+    (nlga--bwd-push b
+      (lambda ()                              ; STE: dW_latent += dWQ (identity)
+        (nlga--accum b (nlga--grad b w) (nlga--grad b wq) n)))
+    wq))
+
+(defun nlga-bitlinear (b x w bias)
+  "BitLinear (BitNet b1.58, Phase A): affine with ternary weights via QAT + STE.
+Forward uses WQ = `nlga-quant-weight' of W; backward trains the full-precision W.
+Activations are full precision in this phase (the ternary weights are the win)."
+  (nlga-linear b x (nlga-quant-weight b w) bias))
+
 (defun nlga-gelu (b x)
   (let* ((n (nlga-rt-size x)) (os (nlga--tmp b n))
          (o (nlga-rt--make :slot os :rows (nlga-rt-rows x) :cols (nlga-rt-cols x))))

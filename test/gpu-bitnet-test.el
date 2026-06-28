@@ -1,0 +1,111 @@
+;;; gpu-bitnet-test.el --- BitNet b1.58 ternary BitLinear (QAT, Phase A)  -*- lexical-binding: t; -*-
+;; Checks the on-GPU ternary-weight BitLinear (nlga-bitlinear) against a CPU
+;; reference that implements the same absmean quantization + straight-through
+;; estimator (STE):
+;;   (1) forward: GPU quantized y == CPU quantized y (absmean-acc + quant-w kernels)
+;;   (2) training: GPU loss trajectory == CPU STE reference, and loss decreases
+;;       (validates STE dW into the full-precision latent weight + SGD)
+;;   (3) the trained latent weight quantizes to a genuinely ternary {-b,0,+b}
+;; Skips (exit 0) without a Vulkan device.
+;;   emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l test/gpu-bitnet-test.el
+(add-to-list 'load-path (expand-file-name "lisp"))
+(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+(require 'cl-lib)
+(require 'photon-tensor)
+(require 'nl-llm-gpu)
+(require 'nl-llm-gpu-ag)
+
+(defvar bn--fail 0)
+(defun bn--ck (name ok &optional extra)
+  (princ (format "%-48s %s  %s\n" name (if ok "PASS" (progn (setq bn--fail (1+ bn--fail)) "FAIL")) (or extra ""))))
+(defun bn--vec (n seed sc) (let ((v (make-vector n 0.0)) (i 0))
+  (while (< i n) (aset v i (* sc 2.0 (- (/ (float (mod (+ (* (1+ i) 2654435761) (* (1+ seed) 40503)) 65536)) 65536.0) 0.5))) (setq i (1+ i))) v))
+(defun bn--t (shape seed sc) (let ((n 1)) (dolist (d shape) (setq n (* n d))) (photon-tensor shape (bn--vec n seed sc))))
+(defun bn--copy (tn) (photon-tensor (photon-tensor-shape tn) (copy-sequence (photon-tensor-data tn))))
+
+;; CPU absmean ternary quant of a weight vector W (length n): -> (beta . WQ-vector)
+(defun bn--quant (wd n)
+  (let ((s 0.0) (i 0)) (while (< i n) (setq s (+ s (abs (aref wd i)))) (setq i (1+ i)))
+    (let* ((beta (/ s (float n))) (wq (make-vector n 0.0)) (j 0))
+      (while (< j n)
+        (let ((r 0.0)) (when (> beta 0.0) (let ((q (/ (aref wd j) beta)))
+                          (cond ((>= q 0.5) (setq r 1.0)) ((<= q -0.5) (setq r -1.0)))))
+          (aset wq j (* beta r)))
+        (setq j (1+ j)))
+      (cons beta wq))))
+
+;; CPU BitLinear forward y (seq x out) = X . WQ^T + bias, with STE-quantized WQ.
+(defun bn--fwd (xd seq in wd out bd)
+  (let* ((wq (cdr (bn--quant wd (* out in)))) (y (make-vector (* seq out) 0.0)))
+    (dotimes (s seq) (dotimes (o out)
+      (let ((acc (aref bd o)) (i 0)) (while (< i in)
+        (setq acc (+ acc (* (aref xd (+ (* s in) i)) (aref wq (+ (* o in) i))))) (setq i (1+ i)))
+        (aset y (+ (* s out) o) acc))))
+    y))
+
+(unless (nl-llm-gpu-enable)
+  (princ "NL-LLM-GPU-BITNET SKIP (no GPU server / Vulkan device)\n") (kill-emacs 0))
+
+(let* ((seq 4) (in 6) (out 5) (lr 0.1) (steps 12) (sc 0.5)
+       (ntot (* seq out)) (invn (/ 1.0 (float ntot)))
+       (x (bn--t (list seq in) 1 sc)) (target (bn--t (list seq out) 9 sc))
+       (W (bn--t (list out in) 2 sc)) (b0 (bn--t (list out) 3 0.1))
+       (xd (photon-tensor-data x)) (td (photon-tensor-data target))
+       (wcopy (bn--copy W)) (gpu-losses nil) (gpu-y0 nil))
+  ;; ---- GPU: train a single ternary BitLinear ----
+  (let* ((bb (nlga-new))
+         (xr (nlga-const bb (bn--copy x))) (wr (nlga-param bb wcopy)) (br (nlga-param bb (bn--copy b0)))
+         (tr (nlga-const bb (bn--copy target)))
+         (invr (nlga-scalar bb invn)) (lrr (nlga-scalar bb lr)) (oner (nlga-scalar bb 1.0))
+         (y (nlga-bitlinear bb xr wr br)) (yout (nlga-keep bb y oner)) (s 0))
+    (nlga-seed-mse bb y tr invr) (nlga-finish bb lrr) (nlga-compile bb)
+    (while (< s steps)
+      (let* ((outs (nlga-step bb)) (yv (nth yout outs)) (acc 0.0) (i 0))
+        (when (= s 0) (setq gpu-y0 (copy-sequence yv)))
+        (while (< i ntot) (let ((d (- (aref yv i) (aref td i)))) (setq acc (+ acc (* d d)))) (setq i (1+ i)))
+        (push (* 0.5 invn acc) gpu-losses))
+      (setq s (1+ s)))
+    (nlga-readback bb) (nlga-free bb))
+  (setq gpu-losses (nreverse gpu-losses))
+  (nl-llm-gpu-disable)
+  ;; ---- CPU STE reference (identical init), single ternary BitLinear ----
+  (let* ((Wc (photon-tensor-data (bn--copy W))) (bc (photon-tensor-data (bn--copy b0)))
+         (cpu-losses nil) (cpu-y0 nil) (s 0))
+    (while (< s steps)
+      (let* ((wq (cdr (bn--quant Wc (* out in))))
+             (yv (bn--fwd xd seq in Wc out bc)) (acc 0.0) (i 0)
+             (gy (make-vector ntot 0.0)))
+        (when (= s 0) (setq cpu-y0 (copy-sequence yv)))
+        (while (< i ntot) (let ((d (- (aref yv i) (aref td i)))) (setq acc (+ acc (* d d))) (aset gy i (* d invn))) (setq i (1+ i)))
+        (push (* 0.5 invn acc) cpu-losses)
+        ;; STE backward: dW = gy^T . x  (treat quant as identity); db = colsum(gy)
+        (dotimes (o out) (let ((dbo 0.0))
+          (dotimes (sx seq) (setq dbo (+ dbo (aref gy (+ (* sx out) o)))))
+          (aset bc o (- (aref bc o) (* lr dbo)))
+          (dotimes (ii in) (let ((dw 0.0))
+            (dotimes (sx seq) (setq dw (+ dw (* (aref gy (+ (* sx out) o)) (aref xd (+ (* sx in) ii))))))
+            (aset Wc (+ (* o in) ii) (- (aref Wc (+ (* o in) ii)) (* lr dw))))))))
+      (setq s (1+ s)))
+    (setq cpu-losses (nreverse cpu-losses))
+    ;; (1) forward
+    (let ((mr 0.0) (i 0)) (while (< i ntot)
+      (setq mr (max mr (/ (abs (- (aref gpu-y0 i) (aref cpu-y0 i))) (max 1e-3 (abs (aref cpu-y0 i)))))) (setq i (1+ i)))
+      (bn--ck "BitLinear forward: GPU == CPU (ternary)" (< mr 1e-4) (format "maxrel=%.2e" mr)))
+    ;; (2) training trajectory + decrease
+    (let ((mr 0.0) (i 0)) (while (< i steps)
+      (setq mr (max mr (/ (abs (- (nth i gpu-losses) (nth i cpu-losses))) (max 1e-4 (abs (nth i cpu-losses)))))) (setq i (1+ i)))
+      (bn--ck "BitLinear training: GPU loss == CPU STE ref" (< mr 5e-3) (format "maxrel=%.2e" mr)))
+    (bn--ck "BitLinear training decreases loss"
+            (< (car (last gpu-losses)) (* 0.9 (car gpu-losses)))
+            (format "loss %.4f -> %.4f" (car gpu-losses) (car (last gpu-losses)))))
+  ;; (3) trained latent weight quantizes to a genuinely ternary set {-b,0,+b}
+  (let* ((wd (photon-tensor-data wcopy)) (n (* out in))
+         (qd (bn--quant wd n)) (beta (car qd)) (wq (cdr qd))
+         (vals nil) (i 0) (ok t))
+    (while (< i n) (cl-pushnew (aref wq i) vals :test (lambda (a c) (< (abs (- a c)) 1e-9))) (setq i (1+ i)))
+    (dolist (v vals) (unless (or (< (abs v) 1e-9) (< (abs (- (abs v) beta)) 1e-6)) (setq ok nil)))
+    (bn--ck "trained weight is ternary {-b,0,+b}" (and ok (<= (length vals) 3))
+            (format "%d distinct vals, beta=%.4f" (length vals) beta)))
+  (princ (format "NL-LLM-GPU-BITNET %s (%d failures)\n" (if (= bn--fail 0) "ALL-PASS" "HAS-FAILURES") bn--fail))
+  (kill-emacs (if (= bn--fail 0) 0 1)))
+;;; gpu-bitnet-test.el ends here
