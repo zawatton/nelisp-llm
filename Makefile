@@ -2,7 +2,7 @@
 EMACS ?= emacs
 PHOTON ?= ../nelisp-photon/lisp
 
-.PHONY: test compile clean train train-modern train-modern-full gpu-test gpu-train-test gpu-ag-test gpu-block-test gpu-moe-test gpu-stack-test gpu-window-test gpu-gather-test gpu-adam-test gpu-tie-test gpu-sched-test bench-gpu bench-gpu-train bench-ondevice train-stacked-gpu train-corpus-gpu generate-gpu train-full-gpu checkpoint-gpu train-big-gpu stream-decode spec-decode bitnet-model bench-dp4a spec-chain integrated-decode
+.PHONY: test compile clean train train-modern train-modern-full gpu-test gpu-train-test gpu-ag-test gpu-block-test gpu-moe-test gpu-stack-test gpu-window-test gpu-gather-test gpu-adam-test gpu-tie-test gpu-sched-test bench-gpu bench-gpu-train bench-ondevice train-stacked-gpu train-corpus-gpu generate-gpu train-full-gpu checkpoint-gpu train-big-gpu stream-decode spec-decode bitnet-model bench-dp4a spec-chain integrated-decode bench-longctx
 
 test:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/arch-test.el
@@ -110,6 +110,9 @@ spec-chain:
 
 integrated-decode:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l examples/integrated-decode.el
+
+bench-longctx:
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l examples/bench-longctx.el
 
 clean:
 	rm -f lisp/*.elc

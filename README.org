@@ -477,6 +477,14 @@ layer live: 8.0x smaller weight VRAM, KV bounded at sink+window while decoding f
 more positions, a genuinely paged non-identity table, and ~1.9 tokens/forward
 speculative (lossless == greedy).
 
+~examples/bench-longctx.el~ benchmarks the two long-context wins over a real 512-
+token generation (4 layers, sink 4 + window 124): *1.57 tokens/forward* lossless
+(spec stream byte-identical to greedy), weights *8.0x* smaller, and -- the point of
+long context -- a KV cache that stays *pinned* at the cap (0.12 MB, 4 paged blocks)
+no matter the length while a naive cache grows O(L).  Projected out: KV savings hit
+512x at 64k tokens and 2048x at 256k, so total resident memory at a 256k context is
+~256 MB (f32 weights + growing KV) -> ~0.2 MB (ternary weights + pinned KV).
+
 *** Capstone: a real(er) run with mid-run checkpoint + resume
 
 ~examples/train-big-gpu.el~ exercises the whole stack at once at a larger scale: a
