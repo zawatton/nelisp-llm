@@ -491,9 +491,19 @@ and gate|up are each packed into one *per-row-beta* weight (kernel
 ~bitlinear-packed-v~) and run in one dispatch, and all weights are uploaded once as
 resident buffers (~nl-llm-integrated-resident-model~ / ~nl-llm-integrated-fused-spec-greedy~).
 That cuts the per-block linear dispatches from 7 to 4 and removes the per-token
-upload; on the 512-token bench it runs *2.49x faster* (5.3 -> 13.2 tok/s) with
+upload; on the 512-token bench it runs *2.4x faster* (5.4 -> 13.2 tok/s) with
 *byte-identical* output (the fused decode == the non-fused == greedy, pinned in
 ~test/integrated-test.el~).
+
+Attention then moves onto the GPU too (~nl-llm-integrated-gpattn-model~ /
+~-gpattn-spec-greedy~): the KV pools are resident, Q|K|V never leaves the GPU, and
+the sink+window attention -- cache-relative RoPE, scores, softmax and the weighted
+sum -- runs in one kernel (~attn-stream-entries~, driven by a small CPU-built
+entry list of [physical-base, cache-relative-rank] pairs; the raw K/V is appended
+on the GPU by ~qkv-append~).  Removing the interpreted-Elisp attention loop is the
+big lever: on the same bench the GPU-attention path hits *40 tok/s -- 7.4x over the
+baseline and ~3x over the fused CPU-attention path* -- still byte-identical to
+greedy.
 
 *** Capstone: a real(er) run with mid-run checkpoint + resume
 

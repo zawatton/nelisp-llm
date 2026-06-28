@@ -246,6 +246,32 @@ resident buffers, and return a resident fused-linear spec (a plist with :ph :bet
                 (cons 'out out))
           (vector 1 in out pk fcount) (/ (+ out 63) 64)))))
 
+(defun nl-llm-bitnet--run-fused-res-io (in-handle out-handle spec)
+  "Run fused packed linear SPEC reading input from resident IN-HANDLE and writing
+the result to resident OUT-HANDLE -- nothing crosses the PCIe bus (ONE dispatch)."
+  (let ((in (plist-get spec :in)) (out (plist-get spec :out)) (fcount (plist-get spec :fcount)) (pk nl-llm-bitnet-pk))
+    (nelisp-gpu-server-run2
+     'bitlinear-packed-v
+     (list (list 'res in-handle in)
+           (list 'res (plist-get spec :ph) (* out fcount))
+           (list 'res (plist-get spec :biash) out)
+           (list 'res (plist-get spec :betah) out)
+           (list 'res out-handle out))
+     (vector 1 in out pk fcount) (/ (+ out 63) 64))))
+
+(defun nl-llm-bitnet--run-fused-res-rin (in-handle spec)
+  "Run fused packed linear SPEC reading input from resident IN-HANDLE, returning
+the result as a CPU vector (no input upload)."
+  (let ((in (plist-get spec :in)) (out (plist-get spec :out)) (fcount (plist-get spec :fcount)) (pk nl-llm-bitnet-pk))
+    (car (nelisp-gpu-server-run2
+          'bitlinear-packed-v
+          (list (list 'res in-handle in)
+                (list 'res (plist-get spec :ph) (* out fcount))
+                (list 'res (plist-get spec :biash) out)
+                (list 'res (plist-get spec :betah) out)
+                (cons 'out out))
+          (vector 1 in out pk fcount) (/ (+ out 63) 64)))))
+
 ;; --- DP4A int8 path (compute win via hardware OpSDot) -----------------------
 ;; Four int8 lanes/group are carried in two f32 halves (each a 0..65535 value,
 ;; exact in f32): lo = b0 + 256*b1, hi = b2 + 256*b3, unsigned bytes b = int8&255.

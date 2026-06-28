@@ -297,5 +297,135 @@ tokens enter the cache, so the streaming ring is never rolled back."
             (setq h h1)))))                                                          ; reject: d never entered cache
     (cons (nreverse out) rounds)))
 
+;; ---- attention ON the GPU: KV pools resident, cache-relative RoPE + softmax in
+;; a kernel, no q/k/v read-back and no CPU attention loop.  The streaming/paged
+;; bookkeeping (which slots are kept, their cache-relative ranks) stays on the CPU
+;; -- it is cheap integer work -- and is shipped to the kernel as a small entry
+;; list.  Only the heavy per-head RoPE/score/softmax/weighted-sum runs on the GPU.
+
+(defun nl-llm-integrated--rope-tables (cap hd rbase)
+  "cos/sin tables (CAP x hd/2) for cache-relative RoPE, indexed [pos*half + m],
+matching `nl-llm--rope-block' (theta = pos / RBASE^(2m/hd))."
+  (let* ((half (/ hd 2)) (co (make-vector (* cap half) 0.0)) (si (make-vector (* cap half) 0.0)))
+    (dotimes (p cap) (dotimes (m half)
+      (let ((th (/ (float p) (expt rbase (/ (* 2.0 m) (float hd))))))
+        (aset co (+ (* p half) m) (cos th)) (aset si (+ (* p half) m) (sin th)))))
+    (cons co si)))
+
+(defun nl-llm-integrated--stream-plan (cache)
+  "Advance streaming CACHE by one token; return (WBASE ENTV QCREL NE): physical
+base to append this token's K/V, the kept-entry list as a flat float vector
+\[base crel base crel ...], the query's cache-relative position, and the count."
+  (let* ((nsink (nl-llm-spcache-nsink cache)) (win (nl-llm-spcache-win cache))
+         (p (nl-llm-spcache-seen cache)) (slot (nl-llm--scache-slot p nsink win))
+         (start (max nsink (- p (1- win)))) (qcrel (if (< p nsink) p (+ nsink (- p start))))
+         (wbase (nl-llm-spcache--base cache slot)) (ents nil))
+    (setf (nl-llm-spcache-seen cache) (1+ p))
+    (let ((s 0) (lim (min nsink (1+ p)))) (while (< s lim) (push (cons (nl-llm-spcache--base cache s) s) ents) (setq s (1+ s))))
+    (let ((s (max nsink start))) (while (<= s p)
+      (push (cons (nl-llm-spcache--base cache (nl-llm--scache-slot s nsink win)) (+ nsink (- s start))) ents) (setq s (1+ s))))
+    (setq ents (nreverse ents))
+    (let* ((ne (length ents)) (ev (make-vector (* 2 ne) 0.0)) (i 0))
+      (dolist (e ents) (aset ev (* 2 i) (float (car e))) (aset ev (+ (* 2 i) 1) (float (cdr e))) (setq i (1+ i)))
+      (list wbase ev qcrel ne))))
+
+(defun nl-llm-integrated-gpattn--blk (xrow rblk pool model wbase entv ne qcrel)
+  "One block with attention ON the GPU.  RBLK = resident fused weights, POOL =
+this block's (CK . CV) resident KV handles, MODEL holds shared scratch + RoPE
+tables + dims.  QKV stays resident, is appended + attended on the GPU, and only
+the post-O attention vector returns to the CPU for the residual + FFN."
+  (let* ((dim (plist-get model :dim)) (heads (plist-get model :heads)) (kvh (plist-get model :kvh))
+         (hd (/ dim heads)) (kvdim (* kvh hd)) (qkvn (+ dim (* 2 kvdim))) (psz (plist-get model :poolsz))
+         (co (plist-get model :co)) (si (plist-get model :si)) (cosz (plist-get model :cosz))
+         (a-h (plist-get model :a-h)) (qkv-h (plist-get model :qkv-h)) (attn-h (plist-get model :attn-h))
+         (ck (car pool)) (cv (cdr pool))
+         (a (nl-llm-rmsnorm xrow (plist-get rblk :ln1g))))
+    (nelisp-gpu-server-write-resident a-h (copy-sequence (photon-tensor-data a)))
+    (nl-llm-bitnet--run-fused-res-io a-h qkv-h (plist-get rblk :qkv))                  ; QKV (resident in/out)
+    (nelisp-gpu-server-run2 'qkv-append                                                ; append raw K/V to pools
+      (list (list 'res qkv-h qkvn) (list 'res ck psz) (list 'res cv psz))
+      (vector dim kvdim wbase) (/ (+ kvdim 63) 64))
+    (nelisp-gpu-server-run2 'attn-stream-entries                                       ; GPU streaming attention
+      (list (list 'res qkv-h qkvn) (list 'res ck psz) (list 'res cv psz)
+            (cons 'in entv) (list 'res co cosz) (list 'res si cosz) (list 'res attn-h dim))
+      (vector dim heads kvh ne qcrel) (/ (+ dim 63) 64))
+    (let* ((attn (nl-llm-bitnet--run-fused-res-rin attn-h (plist-get rblk :o)))        ; O (resident in -> CPU)
+           (x1 (photon-tensor-add xrow (photon-tensor (list 1 dim) attn)))
+           (bnorm (nl-llm-rmsnorm x1 (plist-get rblk :ln2g)))
+           (guspec (plist-get rblk :gu)) (gu (nl-llm-bitnet--run-fused-res bnorm guspec))
+           (ff (nth 0 (plist-get guspec :splits)))
+           (sd (photon-tensor-data (nl-llm-silu (photon-tensor (list 1 ff) (cl-subseq gu 0 ff)))))
+           (hh (make-vector ff 0.0)))
+      (dotimes (i ff) (aset hh i (* (aref sd i) (aref gu (+ ff i)))))
+      (photon-tensor-add x1 (photon-tensor (list 1 dim)
+                                           (nl-llm-bitnet--run-fused-res (photon-tensor (list 1 ff) hh) (plist-get rblk :d)))))))
+
+;;;###autoload
+(defun nl-llm-integrated-gpattn-model (blocks wte bh dim heads kvh nsink win bs &optional rope-base)
+  "Build a fully-resident model whose attention runs on the GPU: resident fused
+weights per block (`nl-llm-bitnet-resident-block'), a resident (CK . CV) KV pool
+per block, shared scratch + cache-relative RoPE tables + a resident head.  Free
+with `nl-llm-integrated-gpattn-free'."
+  (let* ((hd (/ dim heads)) (kvdim (* kvh hd)) (cap (+ nsink win)) (nlblk (/ (+ cap bs -1) bs))
+         (psz (* nlblk bs kvdim)) (cosz (* cap (/ hd 2)))
+         (tabs (nl-llm-integrated--rope-tables cap hd (or rope-base 10000.0))))
+    (list :rblocks (mapcar #'nl-llm-bitnet-resident-block blocks)
+          :pools (mapcar (lambda (_) (cons (nelisp-gpu-server-upload (make-vector psz 0.0))
+                                           (nelisp-gpu-server-upload (make-vector psz 0.0)))) blocks)
+          :wte-spec (nl-llm-bitnet-pack-wte wte)
+          :head (nl-llm-bitnet-pack-fused-res (list wte) (list bh))
+          :co (nelisp-gpu-server-upload (car tabs)) :si (nelisp-gpu-server-upload (cdr tabs))
+          :a-h (nelisp-gpu-server-upload (make-vector dim 0.0))
+          :qkv-h (nelisp-gpu-server-upload (make-vector (+ dim (* 2 kvdim)) 0.0))
+          :attn-h (nelisp-gpu-server-upload (make-vector dim 0.0))
+          :dim dim :heads heads :kvh kvh :vocab (car (photon-tensor-shape wte))
+          :nsink nsink :win win :bs bs :poolsz psz :cosz cosz)))
+
+(defun nl-llm-integrated-gpattn-free (model)
+  "Free every resident handle of a GPU-attention MODEL."
+  (dolist (rblk (plist-get model :rblocks))
+    (dolist (k '(:qkv :o :gu :d)) (nl-llm-bitnet-free-fused-res (plist-get rblk k))))
+  (nl-llm-bitnet-free-fused-res (plist-get model :head))
+  (dolist (p (plist-get model :pools)) (ignore-errors (nelisp-gpu-server-free (car p))) (ignore-errors (nelisp-gpu-server-free (cdr p))))
+  (dolist (k '(:co :si :a-h :qkv-h :attn-h)) (ignore-errors (nelisp-gpu-server-free (plist-get model k)))))
+
+(defun nl-llm-integrated-gpattn-h (token model book lnfg)
+  "Embed TOKEN, run MODEL's GPU-attention blocks with streaming bookkeeping BOOK
+\(an `nl-llm-spcache' used only for slot/entry computation), return the hidden."
+  (let* ((plan (nl-llm-integrated--stream-plan book))
+         (wbase (nth 0 plan)) (entv (nth 1 plan)) (qcrel (nth 2 plan)) (ne (nth 3 plan))
+         (ws (plist-get model :wte-spec)) (dim (plist-get model :dim))
+         (packed (nth 0 ws)) (beta (nth 1 ws)) (fcount (nth 2 ws))
+         (x (photon-tensor (list 1 dim) (nl-llm-bitnet-unpack-row packed beta fcount token dim)))
+         (bl (plist-get model :rblocks)) (pl (plist-get model :pools)))
+    (while bl
+      (setq x (nl-llm-integrated-gpattn--blk x (car bl) (car pl) model wbase entv ne qcrel))
+      (setq bl (cdr bl) pl (cdr pl)))
+    (nl-llm-rmsnorm x lnfg)))
+
+(defun nl-llm-integrated-gpattn--book (model)
+  (nl-llm-spcache-new (plist-get model :nsink) (plist-get model :win)
+                      (plist-get model :dim) (plist-get model :heads) (plist-get model :kvh) (plist-get model :bs)))
+
+;;;###autoload
+(defun nl-llm-integrated-gpattn-spec-greedy (prompt nsteps model lnfg w2 b2)
+  "Self-speculative greedy decode with attention ON the GPU.  Same lossless output
+as the CPU-attention path; returns (TOKENS . ROUNDS)."
+  (let* ((vocab (plist-get model :vocab)) (head (plist-get model :head))
+         (book (nl-llm-integrated-gpattn--book model)) (h nil) (out nil) (n 0) (rounds 0))
+    (dolist (tk prompt) (setq h (nl-llm-integrated-gpattn-h tk model book lnfg)))
+    (while (< n nsteps)
+      (setq rounds (1+ rounds))
+      (let ((t1 (nl-llm-spec-argmax (nl-llm-bitnet--run-fused-res h head) 0 vocab))
+            (d  (nl-llm--head-argmax h w2 b2 vocab)))
+        (push t1 out) (setq n (1+ n))
+        (let* ((h1 (nl-llm-integrated-gpattn-h t1 model book lnfg))
+               (true2 (nl-llm-spec-argmax (nl-llm-bitnet--run-fused-res h1 head) 0 vocab)))
+          (if (and (= d true2) (< n nsteps))
+              (progn (push d out) (setq n (1+ n))
+                     (setq h (nl-llm-integrated-gpattn-h d model book lnfg)))
+            (setq h h1)))))
+    (cons (nreverse out) rounds)))
+
 (provide 'nl-llm-integrated)
 ;;; nl-llm-integrated.el ends here
