@@ -105,12 +105,16 @@ ONE fused batch per step with the weights resident.  A model is expressed once
 (~nlga-linear~ / ~rmsnorm~ / ~rope~ / ~gqa~ / ~swiglu~ / ~softmax~ / ...) and is
 trained on-device automatically.
 
-The full modern *dense* block -- RMSNorm + grouped-query attention with RoPE +
-SwiGLU + an LM head with cross-entropy -- trains entirely on-device this way;
-~test/gpu-block-test.el~ checks its loss trajectory matches the CPU autograd
-reference (~nl-llm-ag-block~) to f32 precision (maxrel < 1e-7).  New backward
-kernels added for this: ~rmsnorm-istd/-fwd/-dx/-dgamma~, ~rope-apply~, ~silu~ /
-~silu-bwd~, ~mul~, ~softmax-bwd~, ~ce-grad~.
+The full modern block -- RMSNorm + grouped-query attention with RoPE + a feed
+-forward (SwiGLU, or a top-k sparse MoE) + an LM head with cross-entropy --
+trains entirely on-device this way.  ~test/gpu-block-test.el~ (dense/SwiGLU) and
+~test/gpu-moe-test.el~ (GQA + MoE) check the loss trajectory matches the CPU
+autograd reference (~nl-llm-ag-block~) to f32 precision (maxrel < 1e-7).  For
+MoE the top-k routing selection is computed on-GPU (~topk-mask~) and held
+constant (straight-through); the gate softmax and expert SwiGLUs are
+differentiated.  New backward kernels added for the block:
+~rmsnorm-istd/-fwd/-dx/-dgamma~, ~rope-apply~, ~silu~ / ~silu-bwd~, ~mul~,
+~softmax-bwd~, ~ce-grad~, and for MoE ~topk-mask~ / ~scale-rows~ / ~rowdot~.
 
 * Layout
 

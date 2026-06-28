@@ -245,7 +245,27 @@ RoPE is orthogonal so the backward is the inverse rotation (SNEG)."
             (setq c (+ c w)))))))
     o))
 
-;; --- composite: GQA attention + SwiGLU FFN + full block --------------
+(defun nlga-scale-rows (b y s)
+  "Multiply each row of Y (M x N) by per-row scalar S (M x 1)."
+  (let* ((m (nlga-rt-rows y)) (n (nlga-rt-cols y)) (os (nlga--tmp b (* m n)))
+         (o (nlga-rt--make :slot os :rows m :cols n)))
+    (nlga--d b (list 'scale-rows (list (nlga-rt-slot y) (nlga-rt-slot s) os) (list m n) (nlga--g (* m n))))
+    (nlga--bwd-push b (lambda ()
+      (let ((go (nlga--grad b o)) (dy (nlga--tmp b (* m n))) (ds (nlga--tmp b m)))
+        (nlga--d b (list 'scale-rows (list go (nlga-rt-slot s) dy) (list m n) (nlga--g (* m n))))
+        (nlga--accum b (nlga--grad b y) dy (* m n))
+        (nlga--d b (list 'rowdot (list go (nlga-rt-slot y) ds) (list m n) (nlga--g m)))
+        (nlga--accum b (nlga--grad b s) ds m))))
+    o))
+
+(defun nlga-topk-mask (b logits top-k)
+  "Top-K additive selection mask from LOGITS (M x E); forward-only (the hard
+selection is held constant -- straight-through, no gradient to LOGITS)."
+  (let* ((m (nlga-rt-rows logits)) (e (nlga-rt-cols logits)) (os (nlga--tmp b (* m e))))
+    (nlga--d b (list 'topk-mask (list (nlga-rt-slot logits) os) (list m e top-k) (nlga--g (* m e))))
+    (nlga-rt--make :slot os :rows m :cols e)))
+
+;; --- composite: GQA attention + SwiGLU FFN + MoE + full block --------
 (defun nlga-gqa (b x wq bq wk bk wv bv wo bo heads kvheads cosr sinr spos sneg scl mask)
   "Autograd causal GQA over X (seq x dim).  COSR/SINR RoPE tables, SPOS/SNEG
 sign scalars, SCL the 1/sqrt(hd) scalar, MASK an additive (seq x seq) causal
@@ -270,20 +290,44 @@ mask -- all resident consts.  KVHEADS divides HEADS."
   (nlga-linear b (nlga-mul b (nlga-silu b (nlga-linear b x wg bg))
                           (nlga-linear b x wu bu)) wd bd))
 
+(defun nlga-moe (b x router brouter experts top-k)
+  "Top-K sparse MoE over X (seq x dim).  ROUTER (E x dim) param, BROUTER (E)
+param, EXPERTS a list of E plists each with :wg :bg :wu :bu :wd :bd param rts.
+The top-K selection is computed on-GPU and held constant; the gate softmax and
+the expert SwiGLUs are differentiated."
+  (let* ((logits (nlga-linear b x router brouter))
+         (gate (nlga-softmax b (nlga-add b logits (nlga-topk-mask b logits top-k))))
+         (acc nil) (e 0) (ne (length experts)))
+    (while (< e ne)
+      (let* ((ex (nth e experts))
+             (ge (nlga-slice-cols b gate e 1))
+             (ye (nlga-swiglu b x (plist-get ex :wg) (plist-get ex :bg)
+                              (plist-get ex :wu) (plist-get ex :bu)
+                              (plist-get ex :wd) (plist-get ex :bd)))
+             (contrib (nlga-scale-rows b ye ge)))
+        (setq acc (if acc (nlga-add b acc contrib) contrib)))
+      (setq e (1+ e)))
+    acc))
+
 (defun nlga-block (b x blk heads kvheads cosr sinr spos sneg scl mask)
-  "Full pre-norm modern block (RMSNorm + GQA/RoPE + SwiGLU) on X (seq x dim).
-BLK is a plist of param rts: :ln1g :wq :bq :wk :bk :wv :bv :wo :bo :ln2g
-:wg :bg :wu :bu :wd :bd."
+  "Full pre-norm modern block (RMSNorm + GQA/RoPE + FFN) on X (seq x dim).
+BLK is a plist of param rts: :ln1g :wq :bq :wk :bk :wv :bv :wo :bo :ln2g and a
+feed-forward: either (:router :brouter :experts :top-k) for MoE, or
+(:wg :bg :wu :bu :wd :bd) for a single SwiGLU."
   (let* ((x1 (nlga-add b x (nlga-gqa b (nlga-rmsnorm b x (plist-get blk :ln1g))
                                     (plist-get blk :wq) (plist-get blk :bq)
                                     (plist-get blk :wk) (plist-get blk :bk)
                                     (plist-get blk :wv) (plist-get blk :bv)
                                     (plist-get blk :wo) (plist-get blk :bo)
-                                    heads kvheads cosr sinr spos sneg scl mask))))
-    (nlga-add b x1 (nlga-swiglu b (nlga-rmsnorm b x1 (plist-get blk :ln2g))
-                                (plist-get blk :wg) (plist-get blk :bg)
-                                (plist-get blk :wu) (plist-get blk :bu)
-                                (plist-get blk :wd) (plist-get blk :bd)))))
+                                    heads kvheads cosr sinr spos sneg scl mask)))
+         (bn (nlga-rmsnorm b x1 (plist-get blk :ln2g)))
+         (ffn (if (plist-get blk :router)
+                  (nlga-moe b bn (plist-get blk :router) (plist-get blk :brouter)
+                            (plist-get blk :experts) (or (plist-get blk :top-k) 1))
+                (nlga-swiglu b bn (plist-get blk :wg) (plist-get blk :bg)
+                             (plist-get blk :wu) (plist-get blk :bu)
+                             (plist-get blk :wd) (plist-get blk :bd)))))
+    (nlga-add b x1 ffn)))
 
 ;; RoPE cos/sin tables (seq x hd/2), row-major by (position, pair).
 (defun nl-llm-gpu-rope-tables (seq hd &optional base)
