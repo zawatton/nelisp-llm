@@ -36,9 +36,11 @@ test:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-bitpack-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-dp4a-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-bitnet-dp4a-model-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-bitnet-wte-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-paged-spike-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-paged-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-paged-v-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-paged-cow-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-tree-attn-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-tree-verify-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-spec-chain-test.el

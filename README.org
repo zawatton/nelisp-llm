@@ -373,6 +373,14 @@ wires it through a whole-model decode (every block linear via DP4A);
 ~test/gpu-bitnet-dp4a-model-test.el~ matches a CPU int8-ternary reference (maxrel
 1e-5) at 4x less block-linear weight VRAM.
 
+Finally the tied embedding/head is packed too, so *no f32 weight matrix remains*:
+~nl-llm-bitnet-pack-wte~ base-4-packs the ~wte~, the embedding becomes an unpacked
+ternary row (~nl-llm-bitnet-unpack-row~) and the head is the packed linear, driven
+by ~nl-llm-bitnet-decode-step-fullpacked~.  ~test/gpu-bitnet-wte-test.el~: the
+fully-packed decode equals a CPU reference that ternarizes both blocks and ~wte~
+(maxrel 1.1e-4), and the whole-model weight VRAM is now the full 8.0x smaller
+(77 -> 9.6 KB), up from 6.9x when the embedding was left f32.
+
 *** Paged KV cache: PagedAttention
 
 ~nl-llm-gpu-paged-new~ / ~-step~ decode B sequences whose KV lives in a shared
@@ -390,12 +398,23 @@ per-sequence decode to f32 (maxrel 8.1e-6) and checks the on-demand block count.
 The variable-length path (~nl-llm-gpu-paged-v-new~ / ~-step~ + a
 ~nl-llm-paged-alloc~) gives each sequence its own position (a =LENS[s]= buffer
 read by ~decode-rope-b-v~ / ~cache-append-paged-v~ / ~decode-attn-paged-v~), a
-host *free-list* that recycles a finished sequence's blocks, and whole-block
-*prefix sharing* (several sequences point their prompt blocks at one physical
-copy).  ~test/gpu-paged-v-test.el~: a batch of differing-length sequences matches
+host *free-list* that recycles a finished sequence's blocks, and *prefix sharing*
+(several sequences point their prompt blocks at one physical copy).
+~test/gpu-paged-v-test.el~: a batch of differing-length sequences matches
 per-sequence CPU decode (maxrel 1.8e-6), freed blocks are reused, and a shared
 prefix adds no blocks while the sharer's continuation is bit-identical to the
-owner's (~docs/design/03-paged-attention.org~).
+owner's.
+
+Prefix sharing also handles a prompt that ends *mid-block*: the partial last block
+is shared, and ~nl-llm-paged-cow-block~ does *copy-on-write* on the first write
+into it -- a fresh private block is allocated and the shared block's K/V is copied
+across every layer pool on the GPU (kernel ~block-copy~, an in-place resident copy)
+before the table is redirected, so the owner's prefix is never touched.  The
+allocator also reserves the last physical block as a write *scratch* so idle
+sequences in a batch (no block allocated yet) cannot corrupt block 0.
+~test/gpu-paged-cow-test.el~: a sequence sharing a 5-token mid-block prefix and
+COW-ing on its first continuation write produces logits matching a standalone
+decode of the full sequence (maxrel 1.8e-4) (~docs/design/03-paged-attention.org~).
 
 *** Faster decode: self-speculative (MTP) generation
 

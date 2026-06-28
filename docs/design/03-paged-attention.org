@@ -3,21 +3,34 @@
 #+STATUS: DRAFT
 
 * Status
-SHIPPED -- synchronous + variable-length + free-list + prefix sharing.
+SHIPPED -- synchronous + variable-length + free-list + prefix sharing +
+partial-block copy-on-write.
 
 The variable-length extension lands: per-sequence positions via a LENS[s] buffer
 (kernels =decode-rope-b-v= / =cache-append-paged-v= / =decode-attn-paged-v=, each
 reading LENS[s] not a shared POS), a host block allocator with a free-list
 (=nl-llm-paged-alloc-*=: allocate on demand, =nl-llm-paged-free-seq= returns a
-sequence's private blocks, leaving shared ones), and whole-block prefix sharing
+sequence's private blocks, leaving shared ones), and prefix sharing
 (=nl-llm-paged-share-prefix= points a sequence's prefix logical blocks at
 another's physical blocks).  Wiring: =nl-llm-gpu-paged-v-new/-step= in
 =nl-llm-gpu-decode.el=.  =test/gpu-paged-v-test.el=: a batch of differing-length
 sequences matches per-sequence CPU decode (maxrel 1.8e-6); the free-list recycles
 freed blocks; a shared 4-token prefix adds no new blocks and the sharing
-sequence's continuation logits are bit-identical to the owner's.  Remaining:
-copy-on-write for a *partial* last prefix block (sharing now requires a whole-block
-prefix).
+sequence's continuation logits are bit-identical to the owner's.
+
+Partial-block prefix sharing + copy-on-write now lands too: =share-prefix= accepts
+a prefix that ends mid-block (it shares =ceil(nprefix/bs)= blocks, including the
+partial last one), and =nl-llm-paged-cow-block= performs copy-on-write before the
+first write into a shared block -- it allocates a fresh private block, copies the
+shared block's K/V across *every* layer pool on the GPU (kernel =block-copy=, an
+in-place resident copy via =nelisp-gpu-server-run2= res-only), and redirects the
+sequence's table entry, so the owner's prefix is never corrupted.  The allocator
+also reserves the last physical block as a write *scratch*: idle/unallocated table
+slots in a batch point at it (=nl-llm-paged-alloc-scratch=), so a sequence that has
+not yet allocated cannot scribble into block 0 and corrupt another sequence's
+prefix.  =test/gpu-paged-cow-test.el=: a sequence sharing a 5-token (mid-block)
+prefix, with COW on its first continuation write, produces continuation logits
+that match a standalone decode of the full sequence (maxrel 1.8e-4).
 
 Feasibility spike PASSED (kernels =gather-spike= / =scatter-spike=,
 =test/gpu-paged-spike-test.el=, maxdiff 0).  Full paged decode then landed:

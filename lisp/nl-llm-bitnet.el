@@ -159,6 +159,35 @@ Returns the (vocab) logit vector (cf. `nl-llm-decode-step')."
     (while bl (setq x (nl-llm-bitnet-decode-block x (car bl) (car cl) rope-base)) (setq bl (cdr bl) cl (cdr cl)))
     (photon-tensor-data (photon-tensor-linear (nl-llm-rmsnorm x lnfg) wte bh))))
 
+;; --- packing the (tied) embedding/head too: fully-ternary model -------------
+(defun nl-llm-bitnet-pack-wte (wte)
+  "Pack the tied embedding/head WTE (vocab x dim) base-4.  Returns a spec
+\(PACKED BETA FCOUNT DIM VOCAB) usable both as the head's `nl-llm-bitnet--run1'
+weight and, row by row, as the embedding via `nl-llm-bitnet-unpack-row'."
+  (let* ((sh (photon-tensor-shape wte)) (vocab (car sh)) (dim (nth 1 sh)) (p (nl-llm-bitnet-pack wte)))
+    (list (nth 0 p) (nth 1 p) (nth 2 p) dim vocab)))
+
+(defun nl-llm-bitnet-unpack-row (packed beta fcount token dim &optional pk)
+  "Unpack row TOKEN of a base-4 PACKED weight into its (dim) ternary*BETA values
+\(the ternary embedding for TOKEN)."
+  (let ((pk (or pk nl-llm-bitnet-pk)) (v (make-vector dim 0.0)) (base (* token fcount)))
+    (dotimes (i dim)
+      (let* ((f (/ i pk)) (z (% i pk)) (code (% (/ (round (aref packed (+ base f))) (expt 4 z)) 4)))
+        (aset v i (* beta (float (- code 1))))))
+    v))
+
+;;;###autoload
+(defun nl-llm-bitnet-decode-step-fullpacked (token pblocks caches wte-spec lnfg bh dim &optional rope-base)
+  "Decode one TOKEN with EVERYTHING ternary: WTE-SPEC (`nl-llm-bitnet-pack-wte')
+is the packed tied weight -- the embedding is its unpacked row and the head is a
+packed linear over it -- so no f32 weight matrix remains (only biases / norms).
+Returns the (vocab) logit vector."
+  (let* ((packed (nth 0 wte-spec)) (beta (nth 1 wte-spec)) (fcount (nth 2 wte-spec))
+         (x (photon-tensor (list 1 dim) (nl-llm-bitnet-unpack-row packed beta fcount token dim)))
+         (bl pblocks) (cl caches))
+    (while bl (setq x (nl-llm-bitnet-decode-block x (car bl) (car cl) rope-base)) (setq bl (cdr bl) cl (cdr cl)))
+    (nl-llm-bitnet--run1 (nl-llm-rmsnorm x lnfg) wte-spec bh)))
+
 (defun nl-llm-bitnet-block-bytes (blk &optional pk)
   "Return (F32-BYTES . PACKED-BYTES) for the seven linear weights of block BLK."
   (let ((pk (or pk nl-llm-bitnet-pk)) (f32 0) (pkb 0) (kv blk))

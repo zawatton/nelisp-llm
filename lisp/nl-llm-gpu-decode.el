@@ -338,15 +338,22 @@ the resident block table.  Returns the flat (BSZ*vocab) logits."
 (defun nl-llm-paged-alloc-new (nblocks bsz mbps bs)
   "Allocator over NBLOCKS physical blocks for BSZ sequences, MBPS logical blocks
 each, block size BS."
-  (let ((free nil) (i nblocks))
-    (while (> i 0) (setq i (1- i)) (push i free))   ; free = (0 1 ... nblocks-1)
+  ;; The last physical block is reserved as a write scratch: unallocated table
+  ;; slots (idle sequences in a batch) point at it so their writes can't corrupt
+  ;; block 0.  Allocatable blocks are 0 .. nblocks-2.
+  (let ((free nil) (i (1- nblocks)))
+    (while (> i 0) (setq i (1- i)) (push i free))   ; free = (0 1 ... nblocks-2)
     (nl-llm-paged-alloc--make
      :free free :table (let ((v (make-vector (* bsz mbps) -1.0))) v) :lens (make-vector bsz 0.0)
      :nblocks nblocks :bsz bsz :mbps mbps :bs bs)))
 
+(defun nl-llm-paged-alloc-scratch (a)
+  "Physical index of the reserved scratch block (last block)."
+  (1- (nl-llm-paged-alloc-nblocks a)))
+
 (defun nl-llm-paged-alloc-used (a)
-  "Physical blocks currently in use (allocated, not on the free-list)."
-  (- (nl-llm-paged-alloc-nblocks a) (length (nl-llm-paged-alloc-free a))))
+  "Allocatable physical blocks currently in use (excludes the scratch block)."
+  (- (1- (nl-llm-paged-alloc-nblocks a)) (length (nl-llm-paged-alloc-free a))))
 
 (defun nl-llm-paged-alloc--block (a)
   (or (pop (nl-llm-paged-alloc-free a)) (error "nl-llm-paged: out of blocks")))
@@ -381,13 +388,36 @@ left for their owner; this frees only ids unique to S."
 
 (defun nl-llm-paged-share-prefix (a dst src nprefix)
   "Point DST's first ceil(NPREFIX/bs) logical blocks at SRC's physical blocks
-\(read-only prefix sharing) and set DST's length to NPREFIX.  NPREFIX must be a
-multiple of the block size (whole-block sharing; partial-block COW is future)."
+\(read-only prefix sharing) and set DST's length to NPREFIX.  NPREFIX may end
+mid-block: the partial last block is shared too, and the first write into it
+copy-on-writes via `nl-llm-paged-cow-block'."
   (let* ((mbps (nl-llm-paged-alloc-mbps a)) (bs (nl-llm-paged-alloc-bs a)) (tbl (nl-llm-paged-alloc-table a))
-         (nb (/ nprefix bs)) (lb 0))
-    (unless (= (% nprefix bs) 0) (error "nl-llm-paged-share-prefix: NPREFIX must be a multiple of bs"))
+         (nb (/ (+ nprefix bs -1) bs)) (lb 0))                ; ceil(NPREFIX/bs), incl. a partial last block
     (while (< lb nb) (aset tbl (+ (* dst mbps) lb) (aref tbl (+ (* src mbps) lb))) (setq lb (1+ lb)))
     (aset (nl-llm-paged-alloc-lens a) dst (float nprefix))))
+
+(defun nl-llm-gpu--block-copy (pool-handle pool-size src dst bs kvdim)
+  "Copy physical block SRC -> DST in the resident POOL (in place)."
+  (nelisp-gpu-server-run2 'block-copy (list (list 'res pool-handle pool-size))
+                          (list bs kvdim src dst) (/ (+ (* bs kvdim) 63) 64)))
+
+(defun nl-llm-paged-cow-block (a pools s bs kvdim)
+  "Copy-on-write: if sequence S's current write block is shared with another
+sequence, copy that block to a fresh private block in EVERY layer pool (POOLS, a
+list of (CK-rt . CV-rt)) and redirect S's table entry, so the upcoming write does
+not corrupt the shared prefix.  Returns t if a copy happened."
+  (let* ((mbps (nl-llm-paged-alloc-mbps a)) (tbl (nl-llm-paged-alloc-table a))
+         (lb (/ (nl-llm-paged-len a s) bs)) (k (+ (* s mbps) lb)) (phys (aref tbl k)) (did nil))
+    (when (>= phys 0.0)
+      (let ((shared nil) (i 0) (n (length tbl)))
+        (while (< i n) (when (and (/= i k) (= (aref tbl i) phys)) (setq shared t)) (setq i (1+ i)))
+        (when shared
+          (let ((new (nl-llm-paged-alloc--block a)) (op (truncate phys)))
+            (dolist (pool pools)
+              (nl-llm-gpu--block-copy (nlga-rt-handle (car pool)) (nlga-rt-size (car pool)) op new bs kvdim)
+              (nl-llm-gpu--block-copy (nlga-rt-handle (cdr pool)) (nlga-rt-size (cdr pool)) op new bs kvdim))
+            (aset tbl k (float new)) (setq did t)))))
+    did))
 
 (defun nl-llm-gpu--decode-block-pv (b x blk ck cv lens table sign cosr sinr heads kvh dim kvdim bsz bs mbps)
   (let* ((a (nlga-rmsnorm b x (plist-get blk :ln1g)))
@@ -440,7 +470,7 @@ context for `nl-llm-gpu-paged-v-step'; pair it with a `nl-llm-paged-alloc-new'."
       (setq bl (cdr bl) cl (cdr cl)))
     (let ((lout (nlga-keep b (nlga-linear b (nlga-rmsnorm b x lnfgr) wter bhr) one)))
       (nlga-compile b)
-      (list :b b :tok tok :lens lens :table table :lout lout :bsz bsz :vocab vocab))))
+      (list :b b :tok tok :lens lens :table table :lout lout :bsz bsz :vocab vocab :pools pools))))
 
 ;;;###autoload
 (defun nl-llm-gpu-paged-v-step (ctx alloc tokens)
@@ -455,8 +485,9 @@ flat (BSZ*vocab) logits.  Advancing lengths after the step is the caller's job
                                              (dotimes (i bsz) (aset v i (float (aref tokens i)))) v)))
     (nlga-update (plist-get ctx :lens) (photon-tensor (list bsz) (copy-sequence (nl-llm-paged-alloc-lens alloc))))
     (nlga-update (plist-get ctx :table) (photon-tensor (list (* bsz (nl-llm-paged-alloc-mbps alloc)))
-                                                       (let ((tb (copy-sequence (nl-llm-paged-alloc-table alloc))))
-                                                         (dotimes (i (length tb)) (when (< (aref tb i) 0.0) (aset tb i 0.0))) tb)))
+                                                       (let ((tb (copy-sequence (nl-llm-paged-alloc-table alloc)))
+                                                             (scr (float (nl-llm-paged-alloc-scratch alloc))))
+                                                         (dotimes (i (length tb)) (when (< (aref tb i) 0.0) (aset tb i scr))) tb)))
     (nth (plist-get ctx :lout) (nlga-step (plist-get ctx :b)))))
 
 ;;;###autoload

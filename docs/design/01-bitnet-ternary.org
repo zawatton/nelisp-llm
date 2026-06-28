@@ -3,7 +3,9 @@
 #+STATUS: DRAFT
 
 * Status
-Phase A SHIPPED (ternary weights + int8 activations); Phase B (int8/DP4A) pending.
+Phase A SHIPPED (ternary weights + int8 activations); Phase B SHIPPED (packed
+storage, int8/DP4A compute, 1-f32 bitcast packing, whole-model DP4A decode, and
+packed tied embedding/head -- no f32 weight matrix remains).
 
 Phase A QAT lands fully: =nlga-quant-weight= (ternary, kernels =absmean-acc= /
 =quant-w=) and =nlga-quant-act= (per-row absmax int8, kernel =quant-act=)
@@ -52,7 +54,16 @@ uploads each block linear's 1-f32 packed weight resident once and
 (activations int8-quantized per token).  =test/gpu-bitnet-dp4a-model-test.el=
 matches a CPU int8-activation / ternary-weight reference (reusing the shared
 =nl-llm-bitnet--blk= glue) to maxrel 1e-5 over a decode, at 4x less block-linear
-weight VRAM (1 byte/weight).  Remaining: pack the embedding/head.
+weight VRAM (1 byte/weight).
+
+The tied embedding/head is now packed too, so no f32 weight matrix remains:
+=nl-llm-bitnet-pack-wte= base-4-packs the =wte= (8 codes/f32), the embedding is an
+unpacked ternary row (=nl-llm-bitnet-unpack-row=), and the head is the packed
+linear (=nl-llm-bitnet--run1=).  =nl-llm-bitnet-decode-step-fullpacked= drives a
+fully-ternary model.  =test/gpu-bitnet-wte-test.el=: the fully-packed decode is
+bit-equal to a CPU reference that ternarizes both blocks and =wte= (maxrel 1.1e-4),
+and the whole-model weight VRAM is now the full 8x smaller (77 -> 9.6 KB), vs 6.9x
+when the embedding was left f32.
 
 Source: "The Era of 1-bit LLMs: All Large Language Models are in 1.58 Bits"
 (Microsoft, 2024).
