@@ -1,0 +1,70 @@
+;;; gpu-batch-test.el --- batched GPU decode == per-sequence decode  -*- lexical-binding: t; -*-
+;; Checks that decoding B sequences in parallel (nl-llm-gpu-decode-batch) gives,
+;; for each sequence, the same per-position logits as decoding it alone with the
+;; CPU KV-cache decoder.  Skips (exit 0) without a Vulkan device.
+;;   emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l test/gpu-batch-test.el
+(add-to-list 'load-path (expand-file-name "lisp"))
+(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+(require 'cl-lib)
+(require 'photon-tensor)
+(require 'nl-llm-decode)
+(require 'nl-llm-gpu)
+(require 'nl-llm-gpu-ag)
+(require 'nl-llm-gpu-decode)
+
+(defvar gb--fail 0)
+(defun gb--ck (name ok &optional extra)
+  (princ (format "%-46s %s  %s\n" name (if ok "PASS" (progn (setq gb--fail (1+ gb--fail)) "FAIL")) (or extra ""))))
+(defun gb--t (shape seed sc) (let ((n 1)) (dolist (d shape) (setq n (* n d)))
+  (photon-tensor shape (let ((v (make-vector n 0.0)) (i 0))
+    (while (< i n) (aset v i (* sc 2.0 (- (/ (float (mod (+ (* (1+ i) 2654435761) (* (1+ seed) 40503)) 65536)) 65536.0) 0.5))) (setq i (1+ i))) v))))
+(defun gb--ones (n) (photon-tensor (list n) (make-vector n 1.0)))
+
+(unless (nl-llm-gpu-enable)
+  (princ "NL-LLM-GPU-BATCH SKIP (no GPU server / Vulkan device)\n") (kill-emacs 0))
+
+(let* ((seq 6) (bsz 3) (dim 16) (heads 4) (kvh 2) (ff 24) (vocab 12) (hd (/ dim heads)) (kvdim (* kvh hd))
+       (sc 0.4)
+       (toks (vector (vector 0 1 2 3 4 5) (vector 6 7 8 9 10 11) (vector 0 2 4 6 8 10)))
+       (wte (gb--t (list vocab dim) 1 sc)) (lnfg (gb--ones dim)) (bh (gb--t (list vocab) 19 0.1))
+       (mkblk (lambda (s0) (list :ln1g (gb--ones dim) :wq (gb--t (list dim dim) (+ s0 1) sc) :bq (gb--t (list dim) (+ s0 11) 0.1)
+                                 :wk (gb--t (list kvdim dim) (+ s0 2) sc) :bk (gb--t (list kvdim) (+ s0 12) 0.1)
+                                 :wv (gb--t (list kvdim dim) (+ s0 3) sc) :bv (gb--t (list kvdim) (+ s0 13) 0.1)
+                                 :wo (gb--t (list dim dim) (+ s0 4) sc) :bo (gb--t (list dim) (+ s0 14) 0.1) :ln2g (gb--ones dim)
+                                 :wg (gb--t (list ff dim) (+ s0 5) sc) :bg (gb--t (list ff) (+ s0 15) 0.1)
+                                 :wu (gb--t (list ff dim) (+ s0 6) sc) :bu (gb--t (list ff) (+ s0 16) 0.1)
+                                 :wd (gb--t (list dim ff) (+ s0 7) sc) :bd (gb--t (list dim) (+ s0 17) 0.1))))
+       (blocks (list (funcall mkblk 100) (funcall mkblk 200)))
+       (tables (nl-llm-gpu-rope-tables seq hd))
+       (gpu nil) (cpu nil))
+  ;; GPU batch decode: B sequences at once
+  (let ((ctx (nl-llm-gpu-decode-batch-new wte blocks lnfg bh heads kvh dim vocab seq bsz tables)) (p 0))
+    (while (< p seq)
+      (let ((row (make-vector bsz 0))) (dotimes (s bsz) (aset row s (aref (aref toks s) p)))
+        (push (copy-sequence (nl-llm-gpu-decode-batch-step ctx row p)) gpu))
+      (setq p (1+ p)))
+    (nl-llm-gpu-decode-free ctx))
+  (setq gpu (nreverse gpu))   ; list of (bsz*vocab) per position
+  (nl-llm-gpu-disable)
+  ;; CPU per-sequence decode
+  (dotimes (s bsz)
+    (let ((caches (mapcar (lambda (_) (nl-llm-dcache-new seq dim heads kvh)) blocks)) (row nil) (p 0))
+      (while (< p seq)
+        (push (copy-sequence (nl-llm-decode-step (aref (aref toks s) p) blocks caches wte lnfg bh dim)) row)
+        (setq p (1+ p)))
+      (push (nreverse row) cpu)))
+  (setq cpu (nreverse cpu))   ; cpu[s] = list of (vocab) per position
+  (let ((maxrel 0.0) (p 0))
+    (while (< p seq)
+      (let ((g (nth p gpu)) (s 0))
+        (while (< s bsz)
+          (let ((c (nth p (nth s cpu))) (j 0))
+            (while (< j vocab)
+              (setq maxrel (max maxrel (/ (abs (- (aref g (+ (* s vocab) j)) (aref c j))) (max 1e-3 (abs (aref c j))))))
+              (setq j (1+ j))))
+          (setq s (1+ s))))
+      (setq p (1+ p)))
+    (gb--ck "batch decode == per-sequence decode" (< maxrel 5e-3) (format "maxrel=%.2e" maxrel)))
+  (princ (format "NL-LLM-GPU-BATCH %s (%d failures)\n" (if (= gb--fail 0) "ALL-PASS" "HAS-FAILURES") gb--fail))
+  (kill-emacs (if (= gb--fail 0) 0 1)))
+;;; gpu-batch-test.el ends here

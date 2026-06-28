@@ -297,6 +297,12 @@ buffer (the attention kernel's loop bound is a runtime value).
 ~test/gpu-decode-test.el~ matches the CPU decode to f32 (maxrel ~3e-5);
 ~examples/generate-gpu.el~ uses it.
 
+Batched decode (~nl-llm-gpu-decode-batch~) generates B sequences in parallel:
+each sequence has its own resident key/value cache, and one fused batch processes
+B new tokens per step (B-row projections + ~decode-rope-b~ / ~cache-append-b~ /
+~decode-attn-b~ kernels, shared position).  ~test/gpu-batch-test.el~ checks each
+sequence's logits match decoding it alone (maxrel ~8e-6).
+
 *** Scaling: on-device vs host-driven training
 
 Per training step of one full block (RMSNorm + GQA/RoPE + SwiGLU + head, GTX
