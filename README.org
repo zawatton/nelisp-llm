@@ -270,6 +270,15 @@ whole O(t^2) prefill every step.  The cache path supports biases and the tied
 head and is verified position-for-position against the prefill forward
 (~test/decode-test.el~, maxdiff ~1e-15).
 
+Decoding can also run entirely on the GPU (~nl-llm-gpu-decode~): the weights and a
+per-block key/value cache stay resident, and each token is one fused command
+buffer (compiled once, re-submitted) computing only the new position --
+projections + RoPE at a runtime position, an append into the resident cache, and
+a single-query attention over the cache whose length is read from a resident POS
+buffer (the attention kernel's loop bound is a runtime value).
+~test/gpu-decode-test.el~ matches the CPU decode to f32 (maxrel ~3e-5);
+~examples/generate-gpu.el~ uses it.
+
 *** Scaling: on-device vs host-driven training
 
 Per training step of one full block (RMSNorm + GQA/RoPE + SwiGLU + head, GTX
@@ -294,7 +303,8 @@ size, while on-device keeps everything resident and only moves the loss out.
 - ~lisp/nl-llm-attn.el~     -- RoPE causal MHA/GQA + KV-cache decode
 - ~lisp/nl-llm-moe.el~      -- top-k sparse mixture-of-experts FFN
 - ~lisp/nl-llm-block.el~    -- pre-norm block + model forward (GQA/MoE) + sampling
-- ~lisp/nl-llm-decode.el~   -- KV-cache incremental decode (with biases, tied head)
+- ~lisp/nl-llm-decode.el~   -- KV-cache incremental decode (CPU; biases, tied head)
+- ~lisp/nl-llm-gpu-decode.el~ -- on-GPU KV-cache decode (resident cache, runtime pos)
 - ~lisp/nl-llm-autograd.el~ -- reverse-mode backward for all of the above
 - ~lisp/nl-llm-gpu.el~      -- GPU backend wiring (enable / invalidate)
 - ~lisp/nl-llm-gpu-train.el~ -- on-device (resident) training step + SGD (MLP)

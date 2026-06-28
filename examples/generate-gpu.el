@@ -15,9 +15,10 @@
 (require 'photon-autograd)
 (require 'nl-llm-autograd)
 (require 'nl-llm-block)   ; nl-llm-sample
-(require 'nl-llm-decode)  ; KV-cache incremental decode
+(require 'nl-llm-decode)  ; KV-cache incremental decode (CPU)
 (require 'nl-llm-gpu)
 (require 'nl-llm-gpu-ag)
+(require 'nl-llm-gpu-decode)  ; on-GPU KV-cache decode
 
 (defun ge--t (shape seed sc) (let ((n 1)) (dolist (d shape) (setq n (* n d)))
   (photon-tensor shape (let ((v (make-vector n 0.0)) (i 0))
@@ -65,27 +66,27 @@
         (nlga-adam-update-t b (1+ s) (nl-llm-lr-warmup-cosine (1+ s) steps warmup base-lr minlr))
         (nlga-step b) (setq s (1+ s))))
       (nlga-readback b) (nlga-free b)))
-  (nl-llm-gpu-disable)
-  ;; ---- generate with an O(len)/step KV-cache decode (trained tied model) ----
+  ;; ---- generate ON the GPU with a KV-cache decode (server still up) ----
   (let* ((prompt (let ((l nil)) (dotimes (i plen) (push (aref ids i) l)) (nreverse l)))
          (orig (let ((l nil)) (dotimes (i seq) (push (aref ids i) l)) (nreverse l))))
-    (cl-flet ((generate (pick)               ; PICK: (logits-vec 0 vocab) -> token id
-                (let ((caches (mapcar (lambda (_) (nl-llm-dcache-new seq dim heads kvh)) blks))
-                      (gen (copy-sequence prompt)) (p 0))
-                  (while (< p (1- seq))
-                    (let ((ld (nl-llm-decode-step (nth p gen) blks caches wte lnfg bh dim)))
-                      (when (and (>= (1+ p) plen) (< (length gen) seq))
-                        (setq gen (append gen (list (funcall pick ld 0 vocab)))))
+    (cl-flet ((generate (pick)               ; PICK: (logits-vec vocab) -> token id
+                (let* ((ctx (nl-llm-gpu-decode-new wte blks lnfg bh heads kvh dim vocab seq tables))
+                       (gen (copy-sequence prompt)) (p 0))
+                  (while (< (length gen) seq)
+                    (let ((ld (nl-llm-gpu-decode-step ctx (nth p gen) p)))
+                      (when (>= (1+ p) plen) (setq gen (append gen (list (funcall pick ld vocab)))))
                       (setq p (1+ p))))
+                  (nl-llm-gpu-decode-free ctx)
                   gen)))
-      (let* ((greedy (generate (lambda (d _base v) (ge--argmax d 0 v))))
+      (let* ((greedy (generate (lambda (d v) (ge--argmax d 0 v))))
              (match (let ((m 0) (i 0)) (while (< i seq) (when (= (nth i greedy) (nth i orig)) (setq m (1+ m))) (setq i (1+ i))) m)))
         (random "nl-llm-generate-seed")      ; deterministic sampling
-        (let ((sampled (generate (lambda (d _base v) (nl-llm-sample d 0 v 0.7 20)))))
+        (let ((sampled (generate (lambda (d v) (nl-llm-sample d 0 v 0.7 20)))))
+          (nl-llm-gpu-disable)
           (princ (format "prompt        : %S\n" (photon-bpe-decode bpe prompt)))
           (princ (format "greedy        : %S\n" (photon-bpe-decode bpe greedy)))
           (princ (format "sampled(T0.7) : %S\n" (photon-bpe-decode bpe sampled)))
           (princ (format "original      : %S\n" (photon-bpe-decode bpe orig)))
-          (princ (format "greedy match  : %d/%d  %s (KV-cache decode)\n" match seq (if (>= match (- seq 2)) "reproduced" "partial")))
+          (princ (format "greedy match  : %d/%d  %s (on-GPU KV-cache decode)\n" match seq (if (>= match (- seq 2)) "reproduced" "partial")))
           (princ (format "GENERATE-GPU=%s\n" (if (>= match (- seq 2)) "PASS" "OK"))))))))
 ;;; generate-gpu.el ends here

@@ -25,6 +25,7 @@ test:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-tie-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-sched-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-clip-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-decode-test.el
 
 compile:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) \
