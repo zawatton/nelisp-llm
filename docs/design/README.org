@@ -42,3 +42,17 @@ dynamic-index gather spike, 4 = greedy-equivalence) before any performance phase
   cheaper and the verify forward in 4 cheaper.
 - 4's verify step reuses the same multi-position forward machinery that the
   batched decode in =nl-llm-gpu-decode.el= already provides.
+
+** All four integrated (SHIPPED)
+
+The four techniques compose in one decode loop, each at its own layer: BitNet =
+weight layer (ternary packed linears + packed tied head), StreamingLLM = eviction
+layer (sink+window bounded KV, cache-relative RoPE), PagedAttention = storage layer
+(the bounded KV in a block pool behind a non-identity table), Speculative MTP =
+generation layer (draft +2, only accepted tokens enter the cache so the streaming
+ring never rolls back).  =lisp/nl-llm-integrated.el= (=nl-llm-spcache= paged
+streaming cache + =nl-llm-integrated-{greedy,spec-greedy}=), pinned lossless two
+ways in =test/integrated-test.el= (paged == flat streaming to f32 through eviction;
+speculative == greedy on the ternary model), demoed in
+=examples/integrated-decode.el= (8.0x weight VRAM, bounded paged KV, ~1.9
+tokens/forward lossless).

@@ -452,6 +452,31 @@ verify drives lossless *sampling* (~nl-llm-gpu-spec-chain-sample-decode~): the
 rejection rule over the chain makes the emitted stream distributed exactly as
 plain temperature/top-k sampling (~docs/design/04-speculative-decoding.org~).
 
+*** All four together: the integrated decode
+
+~nl-llm-integrated.el~ runs all four techniques in *one* decode loop, each at its
+own layer so they compose without conflict:
+- *BitNet* is the weight layer -- every linear goes through a ternary packed LINFN
+  (the GPU base-4 kernel) and the tied embedding/head is the packed ~wte~, so no
+  f32 weight matrix is touched.
+- *StreamingLLM* is the eviction layer -- the KV keeps ~NSINK~ sink + ~WIN~ window
+  slots with cache-relative RoPE, bounding memory however long you generate.
+- *PagedAttention* is the storage layer -- that bounded KV lives in a block pool
+  behind a per-cache block table with a non-identity physical layout
+  (~nl-llm-spcache~), blocks allocated on demand from a free-list.
+- *Speculative MTP* is the generation layer -- an MTP head drafts the +2 token;
+  only accepted tokens enter the cache, so the streaming ring never rolls back.
+
+The composition is lossless by construction, pinned two ways in
+~test/integrated-test.el~: paged storage reproduces the flat streaming cache to f32
+even through window eviction (the storage layer is transparent), and MTP-speculative
+greedy is byte-identical to plain greedy on the same ternary/streaming/paged model
+(the generation layer is transparent).  ~examples/integrated-decode.el~ runs the
+full stack -- fitting the MTP draft head on a short self-rollout -- and reports each
+layer live: 8.0x smaller weight VRAM, KV bounded at sink+window while decoding far
+more positions, a genuinely paged non-identity table, and ~1.9 tokens/forward
+speculative (lossless == greedy).
+
 *** Capstone: a real(er) run with mid-run checkpoint + resume
 
 ~examples/train-big-gpu.el~ exercises the whole stack at once at a larger scale: a

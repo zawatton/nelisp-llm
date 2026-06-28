@@ -1,0 +1,208 @@
+;;; nl-llm-integrated.el --- end-to-end decode integrating all four techniques  -*- lexical-binding: t; -*-
+
+;; One decode loop that composes the four GIGAZINE techniques at their four
+;; natural layers, each doing its own job without conflicting with the others:
+;;
+;;   * BitNet b1.58 (weight layer)   -- every linear runs through a ternary LINFN
+;;     (nl-llm-bitnet--run1 -> the GPU base-4 packed kernel), and the tied
+;;     embedding/head is the packed WTE (unpacked row in, packed linear out), so
+;;     no f32 weight matrix is touched during decode.
+;;   * StreamingLLM (eviction layer) -- the KV cache keeps NSINK attention-sink
+;;     slots plus a rolling WIN window, with cache-relative RoPE, so memory is
+;;     bounded at NSINK+WIN regardless of how long we generate.
+;;   * PagedAttention (storage layer) -- that bounded KV does not live in a flat
+;;     array but in a block pool addressed by a per-cache block TABLE with a
+;;     non-identity physical layout, blocks allocated on demand from a free-list.
+;;   * Speculative MTP (generation layer) -- an MTP look-ahead head drafts the
+;;     token after the greedy next; both verify in one round and a correct draft
+;;     lands two tokens per forward.  Only accepted tokens ever enter the cache,
+;;     so speculation never has to roll back the streaming ring.
+;;
+;; The composition is lossless by construction and pinned two ways in
+;; test/integrated-test.el: paged storage reproduces the flat streaming cache to
+;; f32 (the storage layer is transparent), and the speculative stream equals plain
+;; greedy on the identical ternary/streaming/paged model (the generation layer is
+;; transparent).  See examples/integrated-decode.el for a runnable demo.
+
+;;; Code:
+
+(require 'cl-lib)
+(require 'photon-tensor)
+(require 'nl-llm-arch)     ; nl-llm-rmsnorm, nl-llm-silu
+(require 'nl-llm-attn)     ; nl-llm--rope-block, nl-llm--rope-heads
+(require 'nl-llm-decode)   ; nl-llm--swiglu-b (f32 reference path)
+(require 'nl-llm-stream)   ; nl-llm--scache-slot, nl-llm-stream-block (oracle)
+(require 'nl-llm-bitnet)   ; nl-llm-bitnet--run1, -pack-wte, -unpack-row
+(require 'nl-llm-spec)     ; nl-llm-spec-argmax, nl-llm--head-argmax
+
+;; ---- paged streaming KV cache: sink+window bounded, stored behind a block table
+
+(cl-defstruct (nl-llm-spcache (:constructor nl-llm-spcache--make))
+  kpool vpool table free (seen 0) nsink win cap bs nlblk kvdim dim heads kvh)
+
+;;;###autoload
+(defun nl-llm-spcache-new (nsink win dim heads kvh bs)
+  "Paged streaming KV cache: NSINK sink + WIN window tokens (cap = NSINK+WIN),
+stored in BS-token blocks addressed by a block table.  The free-list hands out
+physical blocks in a reversed (non-identity) order, so the table indirection is
+genuinely exercised, and blocks are allocated on demand as the prefix grows."
+  (let* ((hd (/ dim heads)) (kvdim (* kvh hd)) (cap (+ nsink win))
+         (nlblk (/ (+ cap bs -1) bs))
+         (free nil))
+    (dotimes (i nlblk) (push i free))           ; free = (0 1 ... nlblk-1) -> popped reversed
+    (nl-llm-spcache--make
+     :kpool (make-vector (* nlblk bs kvdim) 0.0) :vpool (make-vector (* nlblk bs kvdim) 0.0)
+     :table (make-vector nlblk -1) :free free :seen 0
+     :nsink nsink :win win :cap cap :bs bs :nlblk nlblk :kvdim kvdim :dim dim :heads heads :kvh kvh)))
+
+(defun nl-llm-spcache-fill (cache)
+  "Number of tokens currently resident in CACHE (<= cap)."
+  (min (nl-llm-spcache-seen cache) (nl-llm-spcache-cap cache)))
+
+(defun nl-llm-spcache-used-blocks (cache)
+  "Physical blocks currently allocated (table entries that are mapped)."
+  (let ((n 0)) (dotimes (i (nl-llm-spcache-nlblk cache)) (when (>= (aref (nl-llm-spcache-table cache) i) 0) (setq n (1+ n)))) n))
+
+(defun nl-llm-spcache--base (cache slot)
+  "Base index into the K/V pool for logical SLOT, allocating its block on demand."
+  (let* ((bs (nl-llm-spcache-bs cache)) (kvdim (nl-llm-spcache-kvdim cache))
+         (lb (/ slot bs)) (off (% slot bs)) (tbl (nl-llm-spcache-table cache))
+         (phys (aref tbl lb)))
+    (when (< phys 0)
+      (setq phys (or (pop (nl-llm-spcache-free cache)) (error "nl-llm-spcache: out of blocks")))
+      (aset tbl lb phys))
+    (* (+ (* phys bs) off) kvdim)))
+
+;; ---- one integrated pre-norm block: ternary linears + paged streaming attention
+
+(defun nl-llm-integrated--blk (xrow blk cache linfn &optional rope-base)
+  "Decode one token XROW (1 x dim) through one pre-norm block.  Every linear runs
+through LINFN (XROW, weight-spec, bias-row) -> flat vector, so a ternary packed
+LINFN makes the block BitNet; the KV is stored in the paged streaming CACHE and
+attended sink+window with cache-relative RoPE (StreamingLLM + PagedAttention)."
+  (let* ((dim (nl-llm-spcache-dim cache)) (heads (nl-llm-spcache-heads cache))
+         (kvh (nl-llm-spcache-kvh cache)) (hd (/ dim heads)) (kvdim (nl-llm-spcache-kvdim cache))
+         (grp (/ heads kvh)) (nsink (nl-llm-spcache-nsink cache)) (win (nl-llm-spcache-win cache))
+         (p (nl-llm-spcache-seen cache)) (base (or rope-base 10000.0)) (scale (/ 1.0 (sqrt (float hd))))
+         (a (nl-llm-rmsnorm xrow (plist-get blk :ln1g)))
+         (qr (funcall linfn a (plist-get blk :wq) (plist-get blk :bq)))
+         (kr (funcall linfn a (plist-get blk :wk) (plist-get blk :bk)))
+         (vr (funcall linfn a (plist-get blk :wv) (plist-get blk :bv)))
+         (kc (nl-llm-spcache-kpool cache)) (vc (nl-llm-spcache-vpool cache))
+         (out (make-vector dim 0.0))
+         (slot (nl-llm--scache-slot p nsink win))
+         (start (max nsink (- p (1- win))))                ; oldest window stream pos kept
+         (qcrel (if (< p nsink) p (+ nsink (- p start))))  ; query's cache-relative position
+         (entries nil) (cbase (nl-llm-spcache--base cache slot)))
+    ;; store this token's RAW key/value at its (paged) slot
+    (let ((t0 0)) (while (< t0 kvdim)
+      (aset kc (+ cbase t0) (aref kr t0)) (aset vc (+ cbase t0) (aref vr t0)) (setq t0 (1+ t0))))
+    (setf (nl-llm-spcache-seen cache) (1+ p))
+    ;; kept entries as (paged-base . cache-relative-pos): sink first, then window, in order
+    (let ((s 0) (lim (min nsink (1+ p)))) (while (< s lim)
+      (push (cons (nl-llm-spcache--base cache s) s) entries) (setq s (1+ s))))
+    (let ((s (max nsink start))) (while (<= s p)
+      (push (cons (nl-llm-spcache--base cache (nl-llm--scache-slot s nsink win)) (+ nsink (- s start))) entries)
+      (setq s (1+ s))))
+    (setq entries (nreverse entries))
+    (nl-llm--rope-heads qr 0 heads hd qcrel base)        ; query RoPE at its cache-relative position
+    (dotimes (h heads)
+      (let* ((c0q (* h hd)) (c0k (* (/ h grp) hd)) (ne (length entries))
+             (scores (make-vector ne 0.0)) (mx -1.0e30) (e entries) (j 0))
+        (while e
+          (let* ((eb (car (car e))) (crel (cdr (car e))) (kb (+ eb c0k))
+                 (kk (make-vector hd 0.0)) (t0 0) (acc 0.0))
+            (while (< t0 hd) (aset kk t0 (aref kc (+ kb t0))) (setq t0 (1+ t0)))
+            (nl-llm--rope-block kk 0 crel hd base)
+            (setq t0 0) (while (< t0 hd) (setq acc (+ acc (* (aref qr (+ c0q t0)) (aref kk t0)))) (setq t0 (1+ t0)))
+            (let ((scv (* acc scale))) (aset scores j scv) (when (> scv mx) (setq mx scv))))
+          (setq e (cdr e) j (1+ j)))
+        (let ((sm 0.0))
+          (dotimes (jj ne) (let ((ex (exp (- (aref scores jj) mx)))) (aset scores jj ex) (setq sm (+ sm ex))))
+          (let ((t0 0)) (while (< t0 hd)
+            (let ((accv 0.0) (e2 entries) (jj 0))
+              (while e2 (let ((eb (car (car e2))))
+                (setq accv (+ accv (* (/ (aref scores jj) sm) (aref vc (+ eb c0k t0))))))
+                (setq e2 (cdr e2) jj (1+ jj)))
+              (aset out (+ c0q t0) accv))
+            (setq t0 (1+ t0)))))))
+    ;; attention out-projection + residual, then SwiGLU FFN (all via LINFN)
+    (let* ((attn (funcall linfn (photon-tensor (list 1 dim) out) (plist-get blk :wo) (plist-get blk :bo)))
+           (x1 (photon-tensor-add xrow (photon-tensor (list 1 dim) attn)))
+           (bnorm (nl-llm-rmsnorm x1 (plist-get blk :ln2g)))
+           (g (funcall linfn bnorm (plist-get blk :wg) (plist-get blk :bg)))
+           (u (funcall linfn bnorm (plist-get blk :wu) (plist-get blk :bu)))
+           (sd (photon-tensor-data (nl-llm-silu (photon-tensor (list 1 (length g)) g))))
+           (hh (make-vector (length g) 0.0)))
+      (dotimes (i (length g)) (aset hh i (* (aref sd i) (aref u i))))
+      (photon-tensor-add x1 (photon-tensor (list 1 dim)
+                                           (funcall linfn (photon-tensor (list 1 (length hh)) hh)
+                                                    (plist-get blk :wd) (plist-get blk :bd)))))))
+
+(defun nl-llm-integrated-h (token blocks caches embed-fn linfn lnfg dim &optional rope-base)
+  "Embed TOKEN (via EMBED-FN -> dim vector), run BLOCKS with paged streaming
+CACHES and ternary LINFN, return the post-final-RMSNorm hidden (1 x dim)."
+  (let* ((x (photon-tensor (list 1 dim) (funcall embed-fn token)))
+         (bl blocks) (cl caches))
+    (while bl (setq x (nl-llm-integrated--blk x (car bl) (car cl) linfn rope-base)) (setq bl (cdr bl) cl (cdr cl)))
+    (nl-llm-rmsnorm x lnfg)))
+
+;; ---- f32 reference plumbing (no GPU): exercises the paged/streaming layers only
+
+(defun nl-llm-integrated-linfn-f32 (a w b)
+  "Plain f32 linear A.W^T + B as a flat vector (LINFN for the reference path)."
+  (photon-tensor-data (photon-tensor-linear a w b)))
+
+(defun nl-llm-integrated-embed-f32 (wte dim)
+  "Return an EMBED-FN that gathers row TOKEN from the f32 WTE."
+  (let ((wd (photon-tensor-data wte)))
+    (lambda (token) (let ((v (make-vector dim 0.0)))
+                      (dotimes (j dim) (aset v j (aref wd (+ (* token dim) j)))) v))))
+
+;; ---- full ternary model: greedy + MTP-speculative greedy (GPU packed kernel)
+
+(defun nl-llm-integrated--ternary-fns (wte-spec dim)
+  "Return (EMBED-FN . LINFN) for the fully-ternary model from packed WTE-SPEC."
+  (let ((packed (nth 0 wte-spec)) (beta (nth 1 wte-spec)) (fcount (nth 2 wte-spec)))
+    (cons (lambda (token) (nl-llm-bitnet-unpack-row packed beta fcount token dim))
+          #'nl-llm-bitnet--run1)))
+
+;;;###autoload
+(defun nl-llm-integrated-greedy (prompt nsteps pblocks caches wte-spec lnfg bh dim vocab &optional rope-base)
+  "Plain greedy decode over the fully-integrated model (ternary weights + paged
+streaming KV).  Feeds PROMPT, generates NSTEPS tokens with the packed tied head.
+Returns the generated id list.  CACHES are `nl-llm-spcache' (mutated)."
+  (let* ((fns (nl-llm-integrated--ternary-fns wte-spec dim)) (embed-fn (car fns)) (linfn (cdr fns))
+         (h nil) (out nil))
+    (dolist (tk prompt) (setq h (nl-llm-integrated-h tk pblocks caches embed-fn linfn lnfg dim rope-base)))
+    (dotimes (_ nsteps)
+      (let ((g (nl-llm-spec-argmax (nl-llm-bitnet--run1 h wte-spec bh) 0 vocab)))
+        (push g out)
+        (setq h (nl-llm-integrated-h g pblocks caches embed-fn linfn lnfg dim rope-base))))
+    (nreverse out)))
+
+;;;###autoload
+(defun nl-llm-integrated-spec-greedy (prompt nsteps pblocks caches wte-spec lnfg bh w2 b2 dim vocab &optional rope-base)
+  "Self-speculative greedy decode over the fully-integrated model, with MTP head
+W2,B2 (f32, predicting the token two ahead) drafting the look-ahead token.  Output
+is EXACTLY `nl-llm-integrated-greedy'; returns (TOKENS . ROUNDS) so NSTEPS/ROUNDS
+is the mean tokens accepted per target forward (the speedup).  Only accepted
+tokens enter the cache, so the streaming ring is never rolled back."
+  (let* ((fns (nl-llm-integrated--ternary-fns wte-spec dim)) (embed-fn (car fns)) (linfn (cdr fns))
+         (h nil) (out nil) (n 0) (rounds 0))
+    (dolist (tk prompt) (setq h (nl-llm-integrated-h tk pblocks caches embed-fn linfn lnfg dim rope-base)))
+    (while (< n nsteps)
+      (setq rounds (1+ rounds))
+      (let ((t1 (nl-llm-spec-argmax (nl-llm-bitnet--run1 h wte-spec bh) 0 vocab))   ; greedy next
+            (d  (nl-llm--head-argmax h w2 b2 vocab)))                                ; MTP draft (token after t1)
+        (push t1 out) (setq n (1+ n))
+        (let* ((h1 (nl-llm-integrated-h t1 pblocks caches embed-fn linfn lnfg dim rope-base))
+               (true2 (nl-llm-spec-argmax (nl-llm-bitnet--run1 h1 wte-spec bh) 0 vocab)))
+          (if (and (= d true2) (< n nsteps))
+              (progn (push d out) (setq n (1+ n))                                    ; draft correct: keep d
+                     (setq h (nl-llm-integrated-h d pblocks caches embed-fn linfn lnfg dim rope-base)))
+            (setq h h1)))))                                                          ; reject: d never entered cache
+    (cons (nreverse out) rounds)))
+
+(provide 'nl-llm-integrated)
+;;; nl-llm-integrated.el ends here
