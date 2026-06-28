@@ -120,6 +120,16 @@ turn the model gets better at using -- and improving -- itself.
   (=test/agent-code-test.el=, =examples/agent-code-demo.el=, ~1/9 -> 100%).  The
   same loop with richer grammars + bigger test suites is how the model improves
   its real coding ability; nlga (GPU) swaps in for the CPU autograd at scale.
+  Richer reward SHIPPED: a multi-task curriculum (=nl-llm-agent-improve-tasks=),
+  each task a (spec-prompt . multi-test-case reward) -- multiple cases are what pin
+  the right program (one case can't tell =(* x 3)= from =(+ x 4)= at x=2).  The
+  model is CONDITIONED on each spec (the prompt is fed as context) and must read it
+  to synthesise the matching function; a 2-block model (depth needed to copy the
+  spec into the code) trained with a REPLAY BUFFER (keeps the curriculum balanced)
+  lifts mean success across the bank from the ~1/8 baseline
+  (=test/agent-tasks-test.el=, =examples/agent-tasks-demo.el=: 15% -> 56% over the
+  4-task bank; a tiny char model only partially generalises the conditional copy --
+  capacity/scale is exactly what P5-on-GPU buys).
 
 * Sources
 mini-swe-agent (github.com/SWE-agent/mini-swe-agent); SWE-agent ACI

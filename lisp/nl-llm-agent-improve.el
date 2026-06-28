@@ -35,50 +35,49 @@
        (while (< i n) (aset v i (* scale 2.0 (- (/ (float (mod (+ (* (1+ i) 2654435761) (* (1+ seed) 40503)) 65536)) 65536.0) 0.5))) (setq i (1+ i))) v)))))
 (defun nl-llm-agent--p5-c (n val) (photon-autograd-const (photon-tensor (list n) (make-vector n val))))
 
+(defun nl-llm-agent--p5-block (dim ff s0)
+  "One stacked-block weight plist (for `nl-llm-ag-block', MHA so kv = heads)."
+  (let ((sc (/ 1.0 (sqrt (float dim)))))
+    (list :ln1g (nl-llm-agent--p5-c dim 1.0)
+          :wq (nl-llm-agent--p5-p (list dim dim) (+ s0 1) sc) :bq (nl-llm-agent--p5-c dim 0.0)
+          :wk (nl-llm-agent--p5-p (list dim dim) (+ s0 2) sc) :bk (nl-llm-agent--p5-c dim 0.0)
+          :wv (nl-llm-agent--p5-p (list dim dim) (+ s0 3) sc) :bv (nl-llm-agent--p5-c dim 0.0)
+          :wo (nl-llm-agent--p5-p (list dim dim) (+ s0 4) sc) :bo (nl-llm-agent--p5-c dim 0.0) :ln2g (nl-llm-agent--p5-c dim 1.0)
+          :wg (nl-llm-agent--p5-p (list ff dim) (+ s0 5) sc) :bg (nl-llm-agent--p5-c ff 0.0)
+          :wu (nl-llm-agent--p5-p (list ff dim) (+ s0 6) sc) :bu (nl-llm-agent--p5-c ff 0.0)
+          :wd (nl-llm-agent--p5-p (list dim ff) (+ s0 7) sc) :bd (nl-llm-agent--p5-c dim 0.0))))
+
 ;;;###autoload
-(defun nl-llm-agent-improve-model (&optional dim ff vocab)
+(defun nl-llm-agent-improve-model (&optional dim ff vocab nblocks heads)
   "Build a small trainable char-level model (pav params) for the self-improvement
-loop.  Returns a plist with the params + dims; weights mutate in place during
-fine-tuning, so the same plist is used for both rollout and training."
-  (let* ((dim (or dim 16)) (ff (or ff 32)) (vocab (or vocab nl-llm-agent-char-vocab))
-         (sc (/ 1.0 (sqrt (float dim)))))
-    (list :wte (nl-llm-agent--p5-p (list vocab dim) 1 sc) :ln1g (nl-llm-agent--p5-c dim 1.0)
-          :wq (nl-llm-agent--p5-p (list dim dim) 2 sc) :bq (nl-llm-agent--p5-c dim 0.0)
-          :wk (nl-llm-agent--p5-p (list dim dim) 3 sc) :bk (nl-llm-agent--p5-c dim 0.0)
-          :wv (nl-llm-agent--p5-p (list dim dim) 4 sc) :bv (nl-llm-agent--p5-c dim 0.0)
-          :wo (nl-llm-agent--p5-p (list dim dim) 5 sc) :bo (nl-llm-agent--p5-c dim 0.0) :ln2g (nl-llm-agent--p5-c dim 1.0)
-          :wg (nl-llm-agent--p5-p (list ff dim) 6 sc) :bg (nl-llm-agent--p5-c ff 0.0)
-          :wu (nl-llm-agent--p5-p (list ff dim) 7 sc) :bu (nl-llm-agent--p5-c ff 0.0)
-          :wd (nl-llm-agent--p5-p (list dim ff) 8 sc) :bd (nl-llm-agent--p5-c dim 0.0)
+loop: NBLOCKS stacked GQA/SwiGLU blocks (default 2 -- enough depth to LEARN to copy
+from the spec prompt into the action, which a single layer cannot) with HEADS heads
+(default 2).  Weights mutate in place, so one plist serves both rollout and
+training.  Returns a plist of params + dims."
+  (let* ((dim (or dim 24)) (ff (or ff dim)) (vocab (or vocab nl-llm-agent-char-vocab))
+         (nblocks (or nblocks 1)) (heads (or heads 1)) (sc (/ 1.0 (sqrt (float dim)))))
+    (list :wte (nl-llm-agent--p5-p (list vocab dim) 1 sc)
+          :blocks (cl-loop for i below nblocks collect (nl-llm-agent--p5-block dim ff (* 20 (1+ i))))
           :lnfg (nl-llm-agent--p5-c dim 1.0) :wh (nl-llm-agent--p5-p (list vocab dim) 9 sc) :bh (nl-llm-agent--p5-c vocab 0.0)
-          :dim dim :ff ff :vocab vocab)))
+          :dim dim :ff ff :vocab vocab :heads heads :nblocks nblocks)))
 
 (defun nl-llm-agent--p5-params (m)
-  (mapcar (lambda (k) (plist-get m k)) '(:wte :ln1g :wq :bq :wk :bk :wv :bv :wo :bo :ln2g :wg :bg :wu :bu :wd :bd :lnfg :wh :bh)))
+  (append (list (plist-get m :wte))
+          (cl-loop for blk in (plist-get m :blocks) append
+                   (mapcar (lambda (k) (plist-get blk k))
+                           '(:ln1g :wq :bq :wk :bk :wv :bv :wo :bo :ln2g :wg :bg :wu :bu :wd :bd)))
+          (list (plist-get m :lnfg) (plist-get m :wh) (plist-get m :bh))))
 
 (defun nl-llm-agent--p5-forward (m toks &optional targets)
-  "Modern-block forward over TOKS (a list of ids).  Returns the softmax-CE loss
+  "Stacked-block forward over TOKS (a list of ids).  Returns the softmax-CE loss
 against TARGETS (a vector) if given, else the logits pav."
   (photon-autograd-reset-tape)
-  (let* ((dim (plist-get m :dim)) (sc (/ 1.0 (sqrt (float dim)))) (seq (length toks)) (heads 1)
-         (mask (let ((md (make-vector (* seq seq) 0.0)) (i 0))
-                 (while (< i seq) (let ((j (1+ i))) (while (< j seq) (aset md (+ (* i seq) j) -1.0e30) (setq j (1+ j)))) (setq i (1+ i)))
-                 (photon-autograd-const (photon-tensor (list seq seq) md))))
-         (x (photon-autograd-embedding (plist-get m :wte) toks dim))
-         (a (nl-llm-ag-rmsnorm x (plist-get m :ln1g)))
-         (q (nl-llm-ag-rope (photon-autograd-linear a (plist-get m :wq) (plist-get m :bq)) heads))
-         (k (nl-llm-ag-rope (photon-autograd-linear a (plist-get m :wk) (plist-get m :bk)) heads))
-         (v (photon-autograd-linear a (plist-get m :wv) (plist-get m :bv)))
-         (s (photon-autograd-scale (photon-autograd-matmul q (photon-autograd-transpose k)) sc))
-         (p (photon-autograd-softmax-rows (photon-autograd-add s mask)))
-         (ctx (photon-autograd-matmul p v))
-         (x1 (photon-autograd-add x (photon-autograd-linear ctx (plist-get m :wo) (plist-get m :bo))))
-         (bb (nl-llm-ag-rmsnorm x1 (plist-get m :ln2g)))
-         (mout (nl-llm-ag-swiglu bb (plist-get m :wg) (plist-get m :bg) (plist-get m :wu) (plist-get m :bu) (plist-get m :wd) (plist-get m :bd)))
-         (x2 (photon-autograd-add x1 mout))
-         (xf (nl-llm-ag-rmsnorm x2 (plist-get m :lnfg)))
-         (logits (photon-autograd-linear xf (plist-get m :wh) (plist-get m :bh))))
-    (if targets (photon-autograd-softmax-ce logits targets) logits)))
+  (let* ((dim (plist-get m :dim)) (heads (plist-get m :heads))
+         (x (photon-autograd-embedding (plist-get m :wte) toks dim)))
+    (dolist (blk (plist-get m :blocks)) (setq x (nl-llm-ag-block x blk heads heads)))
+    (let* ((xf (nl-llm-ag-rmsnorm x (plist-get m :lnfg)))
+           (logits (photon-autograd-linear xf (plist-get m :wh) (plist-get m :bh))))
+      (if targets (photon-autograd-softmax-ce logits targets) logits))))
 
 (defun nl-llm-agent--p5-last-logits (m toks)
   "Logit vector for the position AFTER TOKS (the last row of the forward)."
@@ -96,10 +95,13 @@ against TARGETS (a vector) if given, else the logits pav."
     (cl-loop for i in ids for w in ws do (setq c (+ c w)) (when (<= r c) (setq pick i) (cl-return)))
     pick))
 
-(defun nl-llm-agent-p5-rollout (m grammar temp)
+(defun nl-llm-agent-p5-rollout (m grammar temp &optional prompt)
   "Generate one action under GRAMMAR by sampling the model M's free positions at
-temperature TEMP.  Returns (EMITTED . TOKS) where TOKS is the char-id list."
-  (let ((emitted "") (toks nil))
+temperature TEMP.  If PROMPT is given it is fed as context first, so the free-slot
+choices are CONDITIONED on it (synthesis from a spec).  Returns (EMITTED . TOKS):
+EMITTED is the action text; TOKS is the PROMPT+action char-id list (the training
+sequence, so fine-tuning learns P(action | prompt))."
+  (let ((emitted "") (toks (when prompt (mapcar #'nl-llm-agent--char->id (append prompt nil)))))
     (catch 'done
       (while t
         (let ((g (funcall grammar emitted)))
@@ -147,6 +149,37 @@ the success rate over EVAL-N samples.  Returns the list of success rates (initia
           (push rate rates)
           (when trace (funcall trace (1+ r) (length succ) rate)))))
     (nreverse rates)))
+
+;; ---- richer reward: a multi-task curriculum, spec-conditioned, multi-case ----
+
+(cl-defun nl-llm-agent-improve-tasks (m grammar tasks &key (rounds 6) (rollouts 32) (lr 0.4) (epochs 2) (temp 1.0) (eval-n 12) trace)
+  "Self-improve M over a bank of TASKS (each a cons (PROMPT . REWARD-FN)): every
+round the model synthesises an action for each task CONDITIONED on the task's
+prompt, the reward (e.g. a multi-test-case grader) scores it, and the model is
+fine-tuned on all the successful prompt+action trajectories at once.  Because the
+useful skill (read the spec, fill the template) is shared, learning transfers
+across tasks.  Returns the list of MEAN success rates (initial + one per round)."
+  (cl-flet ((avg-rate ()
+              (/ (apply #'+ (mapcar (lambda (tk)
+                                      (let ((ok 0)) (dotimes (_ eval-n)
+                                        (when (>= (funcall (cdr tk) (car (nl-llm-agent-p5-rollout m grammar temp (car tk)))) 1.0) (setq ok (1+ ok))))
+                                        (/ (float ok) eval-n)))
+                                    tasks))
+                 (length tasks))))
+    ;; A replay buffer of all solutions seen so far (capped, recent-first) keeps the
+    ;; fine-tune BALANCED across tasks -- without it the model overfits whichever
+    ;; task it solved most this round and never learns the conditional mapping.
+    (let ((rates (list (avg-rate))) (replay nil) (cap 64))
+      (dotimes (r rounds)
+        (let ((ti 0))
+          (dotimes (_ rollouts)
+            (let* ((tk (nth (mod ti (length tasks)) tasks)) (roll (nl-llm-agent-p5-rollout m grammar temp (car tk))))
+              (when (>= (funcall (cdr tk) (car roll)) 1.0) (push (cdr roll) replay))
+              (setq ti (1+ ti))))
+          (when (> (length replay) cap) (setq replay (cl-subseq replay 0 cap)))
+          (when replay (nl-llm-agent-p5-finetune m replay lr epochs))
+          (let ((rate (avg-rate))) (push rate rates) (when trace (funcall trace (1+ r) (length replay) rate)))))
+      (nreverse rates))))
 
 (provide 'nl-llm-agent-improve)
 ;;; nl-llm-agent-improve.el ends here

@@ -574,6 +574,17 @@ evaluates.  ~test/agent-sandbox-test.el~ pins the denylist, the workdir
 confinement, the timeout kill and the sandbox value; the default stays permissive
 (in-process) for trusted/test use.
 
+The reward is then made *richer*: a multi-task curriculum
+(~nl-llm-agent-improve-tasks~) where each task is a (spec-prompt . multi-test-case
+reward).  Multiple test cases are what pin the right program (one case can't tell
+~(* x 3)~ from ~(+ x 4)~ at x=2), and the model is *conditioned on each spec* (the
+prompt is fed as context) so it must read the spec and synthesise the matching
+function.  A 2-block model (depth is needed to copy the spec into the code) trained
+with a *replay buffer* (keeps the curriculum balanced) lifts mean success across
+the bank from the ~1/8 baseline (~examples/agent-tasks-demo.el~: 15% -> 56% over a
+4-task bank).  A tiny char model only partially generalises the conditional copy --
+which is precisely the capacity/scale that training on the GPU (nlga) is for.
+
 *** Capstone: a real(er) run with mid-run checkpoint + resume
 
 ~examples/train-big-gpu.el~ exercises the whole stack at once at a larger scale: a
