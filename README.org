@@ -215,6 +215,20 @@ scheduled base lr to ~nlga-adam-update-t~ (it still applies the bias correction)
 ~test/gpu-sched-test.el~ trains with a warmup+cosine schedule and matches a CPU
 reference using the same per-step lr to f32 (maxrel ~8e-6).
 
+*** End-to-end: train on-device, then generate
+
+~examples/generate-gpu.el~ closes the loop: BPE-encode a passage, train a
+weight-tied stacked model on it fully on-device (gather embedding, Adam,
+warmup+cosine LR -- every weight resident), read the trained weights back, then
+autoregressively generate from a prompt and BPE-decode.  Generation is
+forward-only and reuses the CPU autograd forward (the same model the on-device
+path trained).  On a tiny model (2 blocks, dim 64) that memorises one window, it
+reproduces the learned text exactly:
+
+: prompt    : "In another momen"
+: generated : "In another moment down went Alice after it, never"
+: token match: 24/24  continuation reproduced
+
 *** Scaling: on-device vs host-driven training
 
 Per training step of one full block (RMSNorm + GQA/RoPE + SwiGLU + head, GTX
@@ -251,6 +265,7 @@ size, while on-device keeps everything resident and only moves the loss out.
 - ~examples/bench-ondevice.el~    -- on-device vs host-driven, full block, at scale
 - ~examples/train-stacked-gpu.el~ -- train a multi-block model on-device
 - ~examples/train-corpus-gpu.el~  -- on-device training over a whole corpus
+- ~examples/generate-gpu.el~      -- train on-device, then autoregressively generate
 
 * Run
 
