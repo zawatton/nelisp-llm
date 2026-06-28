@@ -12,6 +12,7 @@ test:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/autograd-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/sample-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/decode-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/dropout-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-train-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-ag-test.el
@@ -23,6 +24,7 @@ test:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-adam-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-tie-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-sched-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-clip-test.el
 
 compile:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) \

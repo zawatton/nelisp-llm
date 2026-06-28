@@ -215,6 +215,19 @@ scheduled base lr to ~nlga-adam-update-t~ (it still applies the bias correction)
 ~test/gpu-sched-test.el~ trains with a warmup+cosine schedule and matches a CPU
 reference using the same per-step lr to f32 (maxrel ~8e-6).
 
+*** Regularisation: gradient clipping and dropout
+
+Global-norm gradient clipping is on-device: after backward, ~sumsq-acc~ reduces
+every parameter gradient into one sum-of-squares slot, ~clip-scale~ computes
+scale = min(1, clip/||g||), and the SGD/Adam kernels multiply the gradient by it
+\(pass ~clip~ to ~nlga-finish~ / ~nlga-finish-adam~).  ~test/gpu-clip-test.el~
+matches a CPU global-norm clip to f32 and checks the clip actually engages.
+
+Dropout is inverted-dropout by a refreshable mask: ~nl-llm-dropout-mask~ builds a
+mask (each element 1/(1-p) with prob 1-p else 0, mean 1), and ~nlga-dropout~
+elementwise-multiplies it (gradient passes through the mask).  Refresh the mask
+per step with ~nlga-update~; ~test/dropout-test.el~ checks the mask statistics.
+
 *** End-to-end: train on-device, then generate
 
 ~examples/generate-gpu.el~ closes the loop: BPE-encode a passage, train a

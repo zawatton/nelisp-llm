@@ -169,6 +169,13 @@ RT must be a resident input created by `nlga-const' (same shape).  Use between
         (nlga--accum b (nlga--grad b c) dc n))))
     o))
 
+(defun nlga-dropout (b x mask)
+  "Apply dropout to X by elementwise-multiplying a (refreshable) MASK rt.
+MASK is a resident const built with `nl-llm-dropout-mask', refreshed each step
+via `nlga-update' (feed an all-ones mask, or omit, at eval).  Backward passes the
+gradient through the mask.  (Thin wrapper over `nlga-mul'.)"
+  (nlga-mul b x mask))
+
 (defun nlga-rope (b x heads cosr sinr spos sneg)
   "Per-head RoPE on X (M x cols) with HEADS heads; COSR/SINR are resident
 cos/sin tables (M x hd/2), SPOS/SNEG are resident [+1]/[-1] sign scalars.
@@ -455,13 +462,31 @@ Returns the ordinal of X among the batch's out slots (index into `nlga-step')."
     (nlga--d b (list 'scale (list (nlga-rt-slot x) (nlga-rt-slot one) os) (list n) (nlga--g n)))
     (prog1 (nlga-nout b) (cl-incf (nlga-nout b)))))
 
-(defun nlga-finish (b lr)
+(defun nlga--clip-scale (b clip)
+  "Return a slot holding the SGD/Adam gradient scale.  If CLIP (a positive float)
+is given, emit a global-norm clip: sum-of-squares over every parameter gradient
+into one slot, then scale = min(1, CLIP / sqrt(sumsq)).  Else a resident [1.0]
+\(no scaling).  Call after the backward thunks (grads must be final)."
+  (if (not clip)
+      (nlga--slot b (list 'res (nelisp-gpu-server-upload (vector 1.0)) 1))
+    (let ((gsq (nlga--tmp b 1))
+          (cfg (nlga--slot b (list 'res (nelisp-gpu-server-upload (vector clip)) 1)))
+          (scl (nlga--tmp b 1)))
+      (dolist (p (nlga-params b))
+        (let* ((rt (plist-get p :rt)) (n (nlga-rt-size rt)))
+          (nlga--d b (list 'sumsq-acc (list (nlga--grad b rt) gsq) (list n) 1))))
+      (nlga--d b (list 'clip-scale (list gsq cfg scl) (list 1) 1))
+      scl)))
+
+(defun nlga-finish (b lr &optional clip)
   "Run the backward thunks and emit an on-device SGD dispatch per parameter.
-LR is a resident scalar rt.  Call after the forward + loss seed are built."
+LR is a resident scalar rt; CLIP (optional positive float) enables global-norm
+gradient clipping.  Call after the forward + loss seed are built."
   (dolist (th (nlga-bwd b)) (funcall th))
-  (dolist (p (nlga-params b))
-    (let* ((rt (plist-get p :rt)) (n (nlga-rt-size rt)) (gs (nlga--grad b rt)))
-      (nlga--d b (list 'sgd (list (nlga-rt-slot rt) gs (nlga-rt-slot lr)) (list n) (nlga--g n))))))
+  (let ((sslot (nlga--clip-scale b clip)))
+    (dolist (p (nlga-params b))
+      (let* ((rt (plist-get p :rt)) (n (nlga-rt-size rt)) (gs (nlga--grad b rt)))
+        (nlga--d b (list 'sgd (list (nlga-rt-slot rt) gs (nlga-rt-slot lr) sslot) (list n) (nlga--g n)))))))
 
 (defun nlga-compile (b)
   "Compile the assembled batch into a persistent command buffer on the server.
@@ -471,15 +496,17 @@ protocol re-send / buffer alloc / descriptor rebuild.  Call after `nlga-finish'.
   (setf (nlga-compiled b)
         (nelisp-gpu-server-compile (reverse (nlga-slots b)) (reverse (nlga-disp b)))))
 
-(defun nlga-finish-adam (b lr &optional beta1 beta2 eps)
+(defun nlga-finish-adam (b lr &optional beta1 beta2 eps clip)
   "Like `nlga-finish' but with an on-device Adam optimiser.  Per-parameter first
 and second moment buffers (m, v) are kept resident and updated in place by the
 `adam' kernel; a shared resident hyperparameter buffer holds [lr_t, b1, b2, eps]
-and must be refreshed each step with `nlga-adam-update-t'.  Call after the
-forward + loss seed (before `nlga-compile')."
+and must be refreshed each step with `nlga-adam-update-t'.  CLIP (optional
+positive float) enables global-norm gradient clipping.  Call after the forward +
+loss seed (before `nlga-compile')."
   (let ((b1 (or beta1 0.9)) (b2 (or beta2 0.999)) (ep (or eps 1.0e-8)))
     (dolist (th (nlga-bwd b)) (funcall th))
-    (let* ((hh (nelisp-gpu-server-upload (vector lr b1 b2 ep)))
+    (let* ((sslot (nlga--clip-scale b clip))
+           (hh (nelisp-gpu-server-upload (vector lr b1 b2 ep)))
            (hslot (nlga--slot b (list 'res hh 4))) (mv nil))
       (dolist (p (nlga-params b))
         (let* ((rt (plist-get p :rt)) (n (nlga-rt-size rt)) (gs (nlga--grad b rt))
@@ -487,7 +514,7 @@ forward + loss seed (before `nlga-compile')."
                (vh (nelisp-gpu-server-upload (make-vector n 0.0)))
                (ms (nlga--slot b (list 'res mh n))) (vs (nlga--slot b (list 'res vh n))))
           (push mh mv) (push vh mv)
-          (nlga--d b (list 'adam (list (nlga-rt-slot rt) gs ms vs hslot) (list n) (nlga--g n)))))
+          (nlga--d b (list 'adam (list (nlga-rt-slot rt) gs ms vs hslot sslot) (list n) (nlga--g n)))))
       (setf (nlga-adam b) (list :h hh :lr lr :b1 b1 :b2 b2 :eps ep :mv mv)))))
 
 (defun nlga-adam-update-t (b tstep &optional base-lr)

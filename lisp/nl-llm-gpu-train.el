@@ -44,6 +44,7 @@ be running (see `nl-llm-gpu-enable')."
          (htgt (nelisp-gpu-server-upload (photon-tensor-data target)))
          (hlr  (nelisp-gpu-server-upload (vector lr)))
          (hin  (nelisp-gpu-server-upload (vector invn)))
+         (hone (nelisp-gpu-server-upload (vector 1.0)))   ; clip scale = 1 (no clip)
          (slots (list (list 'res hx   (* seq in))    ;0  x
                       (list 'res hw1  (* hid in))    ;1  W1   (in place)
                       (list 'res hb1  hid)           ;2  b1   (in place)
@@ -63,7 +64,8 @@ be running (see `nl-llm-gpu-enable')."
                       (cons 'tmp (* seq hid))        ;16 dh1
                       (cons 'tmp (* hid seq))        ;17 dh1^T
                       (cons 'tmp (* hid in))         ;18 dW1
-                      (cons 'tmp hid)))              ;19 db1
+                      (cons 'tmp hid)               ;19 db1
+                      (list 'res hone 1)))           ;20 clip scale (=1)
          (disps (list (list 'linear    '(0 1 2 8)  (list seq in hid)  (funcall g (* seq hid)))
                       (list 'gelu      '(8 9)      (list (* seq hid)) (funcall g (* seq hid)))
                       (list 'linear    '(9 3 4 10) (list seq hid out) (funcall g (* seq out)))
@@ -76,10 +78,10 @@ be running (see `nl-llm-gpu-enable')."
                       (list 'transpose '(16 17)    (list seq hid)     (funcall g (* seq hid)))
                       (list 'matmul    '(17 0 18)  (list hid seq in)  (funcall g (* hid in)))
                       (list 'colsum    '(16 19)    (list seq hid)     (funcall g hid))
-                      (list 'sgd       '(1 18 6)   (list (* hid in))  (funcall g (* hid in)))
-                      (list 'sgd       '(2 19 6)   (list hid)         (funcall g hid))
-                      (list 'sgd       '(3 13 6)   (list (* out hid)) (funcall g (* out hid)))
-                      (list 'sgd       '(4 14 6)   (list out)         (funcall g out))))
+                      (list 'sgd       '(1 18 6 20) (list (* hid in))  (funcall g (* hid in)))
+                      (list 'sgd       '(2 19 6 20) (list hid)         (funcall g hid))
+                      (list 'sgd       '(3 13 6 20) (list (* out hid)) (funcall g (* out hid)))
+                      (list 'sgd       '(4 14 6 20) (list out)         (funcall g out))))
          (td (photon-tensor-data target)) (losses nil) (s 0))
     (while (< s steps)
       (let* ((y (car (nelisp-gpu-server-batch slots disps)))
@@ -101,7 +103,7 @@ be running (see `nl-llm-gpu-enable')."
       (pull hb1 hid         (photon-tensor-data b1))
       (pull hw2 (* out hid) (photon-tensor-data w2))
       (pull hb2 out         (photon-tensor-data b2)))
-    (dolist (h (list hx hw1 hb1 hw2 hb2 htgt hlr hin))
+    (dolist (h (list hx hw1 hb1 hw2 hb2 htgt hlr hin hone))
       (ignore-errors (nelisp-gpu-server-free h)))
     (nreverse losses)))
 

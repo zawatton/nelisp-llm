@@ -68,5 +68,21 @@ or TOP-K = 1 reduces to greedy argmax.  Uses the global RNG -- seed with
             (setq j3 (1+ j3)))
           pick)))))
 
+;;;###autoload
+(defun nl-llm-dropout-mask (shape p)
+  "Inverted-dropout mask tensor of SHAPE: each element is 1/(1-P) with probability
+1-P, else 0, so E[mask]=1 and no train/eval scale mismatch.  Uses the global RNG
+\(seed with `(random \"...\")' for reproducibility).  Refresh per training step and
+feed it to the dropout mask rt with `nlga-update'; for eval use an all-ones mask
+\(p=0) or skip dropout."
+  (let* ((keep (- 1.0 p)) (inv (/ 1.0 keep)) (n 1))
+    (dolist (d shape) (setq n (* n d)))
+    (photon-tensor shape
+                   (let ((v (make-vector n 0.0)) (i 0))
+                     (while (< i n)
+                       (when (< (/ (float (random 1000000)) 1000000.0) keep) (aset v i inv))
+                       (setq i (1+ i)))
+                     v))))
+
 (provide 'nl-llm-block)
 ;;; nl-llm-block.el ends here
