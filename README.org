@@ -146,8 +146,15 @@ fused batch once and, per window, just refreshes the (small) one-hot inputs and
 re-submits -- every weight stays resident, nothing weight-sized moves.
 ~test/gpu-window-test.el~ checks a sliding-window run matches CPU autograd to f32
 (maxrel < 1e-7); ~examples/train-corpus-gpu.el~ trains a 2-block dim-64 model
-over thousands of windows of public-domain text on-device (avg loss 5.6 -> 4.7,
-~38 ms/window incl. the host-side one-hot build).
+over thousands of windows of public-domain text on-device (avg loss 5.6 -> 4.7).
+
+The embedding is a *gather* (~nlga-embed~): the per-window input is just seq
+token + seq target indices (the ~embed-gather~ / ~embed-bwd~ / ~ce-grad-idx~
+kernels index ~wte~ directly via a float->uint cast), not a seq x vocab one-hot.
+~test/gpu-gather-test.el~ confirms it matches CPU autograd
+(~photon-autograd-embedding~) to f32, and it cuts the corpus per-window time from
+~38 ms to ~20 ms (vocab 336).  ~wte~ is still trained on-device by the
+scatter-add backward.
 
 * Layout
 

@@ -1,10 +1,10 @@
 ;;; train-corpus-gpu.el --- on-device training over a whole corpus  -*- lexical-binding: t; -*-
 ;; Trains a stacked model over many sliding windows of a public-domain corpus,
-;; fully on-device: the fused forward+backward+SGD batch is compiled ONCE and
-;; re-submitted per window, refreshing only the (resident) one-hot token/target
-;; inputs with nlga-update -- so the per-window cost is GPU compute + a tiny
-;; input upload, with every weight resident.  Reports the loss trend and the
-;; steady-state per-window time.
+;; fully on-device.  The fused forward+backward+SGD batch is compiled ONCE and
+;; re-submitted per window; embedding is a GATHER (token indices), so per window
+;; only seq token + seq target indices are refreshed (nlga-update) -- no
+;; seq x vocab one-hot.  Every weight (embedding included) stays resident.
+;; Reports the loss trend and the steady-state per-window time.
 ;;   emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l examples/train-corpus-gpu.el
 (add-to-list 'load-path (expand-file-name "lisp"))
 (add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
@@ -19,8 +19,7 @@
     (while (< i n) (aset v i (* sc 2.0 (- (/ (float (mod (+ (* (1+ i) 2654435761) (* (1+ seed) 40503)) 65536)) 65536.0) 0.5))) (setq i (1+ i))) v))))
 (defun tc--ones (n) (photon-tensor (list n) (make-vector n 1.0)))
 (defun tc--zeros (sh) (let ((n 1)) (dolist (d sh) (setq n (* n d))) (photon-tensor sh (make-vector n 0.0))))
-(defun tc--oh (ids start seq vocab)
-  (let ((v (make-vector (* seq vocab) 0.0))) (dotimes (i seq) (aset v (+ (* i vocab) (aref ids (+ start i))) 1.0)) (photon-tensor (list seq vocab) v)))
+(defun tc--idx (ids start seq) (photon-tensor (list seq) (let ((v (make-vector seq 0.0))) (dotimes (i seq) (aset v i (float (aref ids (+ start i))))) v)))
 (defun tc--ce (ld ids start seq vocab) (let ((loss 0.0) (i 0))
   (while (< i seq) (let ((base (* i vocab)) (mx -1.0e30) (j 0) (tg (aref ids (+ start i 1))))
     (while (< j vocab) (when (> (aref ld (+ base j)) mx) (setq mx (aref ld (+ base j)))) (setq j (1+ j)))
@@ -48,24 +47,26 @@
        (mask (let ((md (make-vector (* seq seq) 0.0)) (i 0)) (while (< i seq) (let ((j (1+ i))) (while (< j seq) (aset md (+ (* i seq) j) -1.0e30) (setq j (1+ j)))) (setq i (1+ i))) (photon-tensor (list seq seq) md)))
        (b (nlga-new)))
   (cl-flet ((wp (tn) (nlga-param b tn)) (wb (bt) (let ((o nil) (kv bt)) (while kv (push (car kv) o) (push (nlga-param b (cadr kv)) o) (setq kv (cddr kv))) (nreverse o))))
-    (let* ((oh (nlga-const b (tc--oh ids 0 seq vocab))) (ohtgt (nlga-const b (tc--oh ids 1 seq vocab)))
+    (let* ((tok (nlga-const b (tc--idx ids 0 seq))) (tgt (nlga-const b (tc--idx ids 1 seq)))
            (wter (wp (tc--t (list vocab dim) 99 sc)))
            (blks (let ((l nil) (n 0)) (while (< n nblocks) (push (wb (funcall mkblk (* (1+ n) 100))) l) (setq n (1+ n))) (nreverse l)))
            (lnfgr (wp (tc--ones dim))) (whr (wp (tc--t (list vocab dim) 9 sc))) (bhr (wp (tc--zeros (list vocab))))
            (cosr (nlga-const b (car tables))) (sinr (nlga-const b (cdr tables)))
            (sposr (nlga-scalar b 1.0)) (snegr (nlga-scalar b -1.0)) (sclr (nlga-scalar b scl)) (oner (nlga-scalar b 1.0))
            (maskr (nlga-const b mask)) (lrr (nlga-scalar b lr))
-           (logits (nlga-model b oh wter blks lnfgr whr bhr heads kvh cosr sinr sposr snegr sclr maskr))
-           (lout (nlga-keep b logits oner)) (recent nil) (t0 nil) (tn nil) (first-avg nil))
-      (nlga-seed-ce b logits ohtgt) (nlga-finish b lrr) (nlga-compile b)
-      (princ (format "corpus on-device: blocks=%d dim=%d ff=%d seq=%d vocab=%d tokens=%d windows/epoch=%d\n"
+           (x (nlga-embed b tok wter)) (recent nil) (t0 nil) (tn nil) (first-avg nil) (lout nil))
+      (dolist (blk blks) (setq x (nlga-block b x blk heads kvh cosr sinr sposr snegr sclr maskr)))
+      (let* ((xf (nlga-rmsnorm b x lnfgr)) (logits (nlga-linear b xf whr bhr)))
+        (setq lout (nlga-keep b logits oner))
+        (nlga-seed-ce-idx b logits tgt) (nlga-finish b lrr) (nlga-compile b))
+      (princ (format "corpus on-device (gather embed): blocks=%d dim=%d ff=%d seq=%d vocab=%d tokens=%d windows/epoch=%d\n"
                      nblocks dim ff seq vocab ntok span))
       (let ((s 0))
         (while (< s steps)
           (when (= s 1) (setq t0 (float-time)))
-          (let ((start (% (* s 13) span)))   ; stride through the corpus
-            (nlga-update oh (tc--oh ids start seq vocab))
-            (nlga-update ohtgt (tc--oh ids (1+ start) seq vocab))
+          (let ((start (% (* s 13) span)))
+            (nlga-update tok (tc--idx ids start seq))
+            (nlga-update tgt (tc--idx ids (1+ start) seq))
             (let ((l (tc--ce (nth lout (nlga-step b)) ids start seq vocab)))
               (push l recent) (when (> (length recent) 25) (setcdr (nthcdr 24 recent) nil))
               (when (= s 24) (setq first-avg (/ (apply #'+ recent) (length recent))))

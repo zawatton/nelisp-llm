@@ -2,7 +2,7 @@
 EMACS ?= emacs
 PHOTON ?= ../nelisp-photon/lisp
 
-.PHONY: test compile clean train train-modern train-modern-full gpu-test gpu-train-test gpu-ag-test gpu-block-test gpu-moe-test gpu-stack-test gpu-window-test bench-gpu bench-gpu-train train-stacked-gpu train-corpus-gpu
+.PHONY: test compile clean train train-modern train-modern-full gpu-test gpu-train-test gpu-ag-test gpu-block-test gpu-moe-test gpu-stack-test gpu-window-test gpu-gather-test bench-gpu bench-gpu-train train-stacked-gpu train-corpus-gpu
 
 test:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/arch-test.el
@@ -17,6 +17,7 @@ test:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-moe-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-stack-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-window-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-gather-test.el
 
 compile:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) \

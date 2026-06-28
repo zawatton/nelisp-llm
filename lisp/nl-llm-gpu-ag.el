@@ -338,6 +338,23 @@ feed-forward: either (:router :brouter :experts :top-k) for MoE, or
                              (plist-get blk :wd) (plist-get blk :bd)))))
     (nlga-add b x1 ffn)))
 
+(defun nlga-embed (b tok wte)
+  "Gather embedding: x[i,:] = WTE[TOK[i],:].  TOK is a resident (seq) index rt
+\(refreshable per window via `nlga-update'), WTE a (vocab x dim) param.  Returns
+\(seq x dim).  Cheaper than one-hot @ WTE: forward is O(seq*dim) and the per-step
+input is seq indices, not a seq x vocab one-hot.  WTE is trained on-device by the
+scatter-add backward."
+  (let* ((seq (nlga-rt-rows tok)) (vocab (nlga-rt-rows wte)) (dim (nlga-rt-cols wte))
+         (os (nlga--tmp b (* seq dim))) (o (nlga-rt--make :slot os :rows seq :cols dim)))
+    (nlga--d b (list 'embed-gather (list (nlga-rt-slot tok) (nlga-rt-slot wte) os)
+                     (list seq dim) (nlga--g (* seq dim))))
+    (nlga--bwd-push b (lambda ()
+      (let ((go (nlga--grad b o)) (dw (nlga--tmp b (* vocab dim))))
+        (nlga--d b (list 'embed-bwd (list (nlga-rt-slot tok) go dw)
+                         (list seq dim vocab) (nlga--g (* vocab dim))))
+        (nlga--accum b (nlga--grad b wte) dw (* vocab dim)))))
+    o))
+
 (defun nlga-model (b onehot wte blks lnfg wh bh heads kvheads cosr sinr spos sneg scl mask)
   "Stacked model: embed (ONEHOT (seq x vocab) @ WTE (vocab x dim)) -> each block
 in BLKS -> final RMSNorm (LNFG) -> linear head (WH, BH).  Returns the logits rt.
@@ -369,6 +386,13 @@ resident parameter trained on-device by the matmul backward."
 ONEHOT is a resident (M x V) one-hot target rt."
   (let ((gl (nlga--grad b logits)) (m (nlga-rt-rows logits)) (v (nlga-rt-cols logits)))
     (nlga--d b (list 'ce-grad (list (nlga-rt-slot logits) (nlga-rt-slot onehot) gl)
+                     (list m v) (nlga--g m)))))
+
+(defun nlga-seed-ce-idx (b logits tgt)
+  "Seed LOGITS' gradient with softmax cross-entropy using a target-index rt TGT
+\(a resident (seq) buffer of target token ids), avoiding a one-hot target."
+  (let ((gl (nlga--grad b logits)) (m (nlga-rt-rows logits)) (v (nlga-rt-cols logits)))
+    (nlga--d b (list 'ce-grad-idx (list (nlga-rt-slot logits) (nlga-rt-slot tgt) gl)
                      (list m v) (nlga--g m)))))
 
 (defun nlga-seed-mse (b y target invn)
