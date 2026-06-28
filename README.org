@@ -365,7 +365,10 @@ four int8 lanes carried in two f32 halves (=lo + hi*65536=, no new dtype).  Kern
 ~bitlinear-dp4a~ (int8 activations + ternary weights) replaces =in= f32 MACs/row
 with =in/4= hardware =OpSDot=.  ~test/gpu-dp4a-test.el~ verifies it (OpSDot exact,
 matmul maxrel 9e-8) and ~examples/bench-dp4a.el~ measures *1.84x vs f32 dense,
-1.73x vs f32 ternary* on a resident-weight 1024x1024 matmul.
+1.73x vs f32 ternary* on a resident-weight 1024x1024 matmul.  ~bitlinear-dp4a-1f~
+packs four int8 lanes into ONE f32 (uploaded verbatim, bit-cast back in-kernel via
+=OpBitcast=) for 1 byte/weight (4x less than f32) *and* DP4A -- memory and compute
+together (~test/gpu-dp4a-test.el~, maxrel 9e-8).
 
 *** Paged KV cache: PagedAttention
 

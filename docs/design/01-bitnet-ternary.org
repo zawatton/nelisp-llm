@@ -36,9 +36,15 @@ f32 halves (=lo + hi*65536=, no new dtype / bitcast).  Kernel =bitlinear-dp4a=
 (int8 activations + ternary weights) does =in/4= =OpSDot= per row instead of =in=
 f32 MACs.  =test/gpu-dp4a-test.el= verifies =OpSDot= (maxdiff 0) and the matmul
 \(maxrel 9e-8); =examples/bench-dp4a.el= (weights resident) measures *1.84x vs f32
-dense, 1.73x vs f32 ternary* on a 1024x1024 matmul.  Remaining: pack 4 int8 into a
-single f32 via bitcast (vs the 2-f32 carry) for memory+compute together, and
-pack the embedding/head.
+dense, 1.73x vs f32 ternary* on a 1024x1024 matmul.
+
+Memory + compute together also lands: =bitlinear-dp4a-1f= packs four int8 lanes
+into ONE f32's 32 bits (uploaded verbatim via =nelisp-gpu-server-upload-u32=) and
+bit-casts it back to a uint32 in-kernel (compiler =bitcast-u= -> =OpBitcast=) before
+=OpSDot= -- 1 byte/weight (4x less than f32) AND DP4A, vs the 2-f32 carry's 2
+bytes/weight.  =test/gpu-dp4a-test.el= confirms it matches the CPU int8 ternary
+forward (maxrel 9e-8), i.e. the packed-bits f32 (often a NaN pattern) survives
+OpLoad + OpBitcast on the NVIDIA driver.  Remaining: pack the embedding/head.
 
 Source: "The Era of 1-bit LLMs: All Large Language Models are in 1.58 Bits"
 (Microsoft, 2024).

@@ -223,5 +223,62 @@ weights) via the bitlinear-dp4a kernel.  Returns the flat (seq*out) result."
                   (make-vector (* seq out) 0.0))
             (vector seq out (nth 3 pa)) (/ (+ (* seq out) 63) 64)))))
 
+;; --- DP4A with one f32 per 4 lanes (bitcast packing): memory + compute --------
+(defun nl-llm-bitnet--word (b0 b1 b2 b3)
+  "Pack four unsigned bytes (int8 & 255) into one little-endian uint32."
+  (logior b0 (ash b1 8) (ash b2 16) (ash b3 24)))
+
+(defun nl-llm-bitnet-pack-i8-act-1f (x)
+  "Per-row int8-quantize X (seq x in) and pack 4 lanes per uint32 (1 word/4 lanes).
+Returns (AP-U32 GAMMA NG): AP-U32 is (seq*NG) uint32 words, GAMMA (seq), NG=ceil(in/4)."
+  (let* ((sh (photon-tensor-shape x)) (seq (car sh)) (in (nth 1 sh)) (xd (photon-tensor-data x))
+         (ng (/ (+ in 3) 4)) (ap (make-vector (* seq ng) 0)) (gamma (make-vector seq 0.0)))
+    (dotimes (s seq)
+      (let ((amax 0.0))
+        (dotimes (i in) (let ((av (abs (aref xd (+ (* s in) i))))) (when (> av amax) (setq amax av))))
+        (let ((g (/ amax 127.0)))
+          (aset gamma s g)
+          (dotimes (grp ng)
+            (let ((by (make-vector 4 0)))
+              (dotimes (l 4) (let ((i (+ (* grp 4) l)))
+                (when (and (< i in) (> g 0.0))
+                  (aset by l (logand (max -127 (min 127 (round (/ (aref xd (+ (* s in) i)) g)))) 255)))))
+              (aset ap (+ (* s ng) grp) (nl-llm-bitnet--word (aref by 0) (aref by 1) (aref by 2) (aref by 3))))))))
+    (list ap gamma ng)))
+
+(defun nl-llm-bitnet-pack-i8-w-1f (w)
+  "Ternary-quantize weight W (out x in) and pack 4 lanes per uint32.
+Returns (WP-U32 BETA NG): WP-U32 is (out*NG) uint32 words."
+  (let* ((sh (photon-tensor-shape w)) (out (car sh)) (in (nth 1 sh)) (wd (photon-tensor-data w))
+         (n (* out in)) (ng (/ (+ in 3) 4)) (acc 0.0) (wp (make-vector (* out ng) 0)))
+    (dotimes (i n) (setq acc (+ acc (abs (aref wd i)))))
+    (let ((beta (/ acc (float n))))
+      (dotimes (o out)
+        (dotimes (grp ng)
+          (let ((by (make-vector 4 0)))
+            (dotimes (l 4) (let ((i (+ (* grp 4) l)))
+              (when (< i in)
+                (let ((q (if (> beta 0.0) (/ (aref wd (+ (* o in) i)) beta) 0.0)))
+                  (aset by l (logand (cond ((>= q 0.5) 1) ((<= q -0.5) -1) (t 0)) 255))))))
+            (aset wp (+ (* o ng) grp) (nl-llm-bitnet--word (aref by 0) (aref by 1) (aref by 2) (aref by 3))))))
+      (list wp beta ng))))
+
+;;;###autoload
+(defun nl-llm-bitnet-dp4a-1f-linear (x w bias)
+  "X (seq x in) . Wq^T + BIAS via hardware DP4A with ONE f32 per 4 int8 lanes
+\(bitcast packing: 1 byte/weight = 4x less than f32, plus DP4A).  Returns the flat
+\(seq*out) result.  The GPU server must be running."
+  (let* ((seq (car (photon-tensor-shape x))) (out (car (photon-tensor-shape w)))
+         (pa (nl-llm-bitnet-pack-i8-act-1f x)) (pw (nl-llm-bitnet-pack-i8-w-1f w))
+         (hap (nelisp-gpu-server-upload-u32 (nth 0 pa))) (hwp (nelisp-gpu-server-upload-u32 (nth 0 pw)))
+         (ng (nth 2 pa)))
+    ;; run2 returns only the out/inout descs (here just Y) in binding order
+    (prog1 (nth 0 (nelisp-gpu-server-run2 'bitlinear-dp4a-1f
+                   (list (list 'res hap (* seq ng)) (list 'res hwp (* out ng))
+                         (cons 'in (copy-sequence (photon-tensor-data bias))) (cons 'in (vector (nth 1 pw)))
+                         (cons 'in (nth 1 pa)) (cons 'out (* seq out)))
+                   (list seq out ng) (/ (+ (* seq out) 63) 64)))
+      (nelisp-gpu-server-free hap) (nelisp-gpu-server-free hwp))))
+
 (provide 'nl-llm-bitnet)
 ;;; nl-llm-bitnet.el ends here
