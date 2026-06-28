@@ -1,0 +1,88 @@
+#+TITLE: BitNet b1.58 -- ternary-weight quantization for nelisp-llm
+#+OPTIONS: toc:2 num:t
+#+STATUS: DRAFT
+
+* Status
+DRAFT -- concept + application design.  Not implemented.
+
+Source: "The Era of 1-bit LLMs: All Large Language Models are in 1.58 Bits"
+(Microsoft, 2024).
+
+* Motivation
+The repo's purpose is a chat-grade model that *fits a given PC*.  On a GTX 1060
+(Pascal GP106, 6 GB) the binding constraints are memory capacity / bandwidth, not
+FP32 throughput.  Ternary weights attack exactly that: weights collapse to
+{-1, 0, +1} with one per-tensor scale, so the weight footprint drops 4x (int8) to
+16x (2-bit packed), and the matmul degenerates to signed adds / skips.
+
+* Principle
+- *Weight quantization (absmean).*  For a weight tensor W:
+  : beta = mean(|W_ij|)
+  : W_q  = round(clip(W / beta, -1, +1))   in {-1, 0, +1}
+- *Activation quantization (int8, per-row absmax).*  For a row x:
+  : gamma = max(|x_i|) / 127
+  : x_q   = round(x / gamma)               in [-127, 127]
+- *Forward (BitLinear).*  y = beta * gamma * (W_q . x_q).  Because W_q is ternary
+  the inner product is a sum of +/- x_q and skips (no multiply).
+- *Quantization-aware training (QAT).*  Keep latent full-precision weights
+  =W_latent=.  Each forward quantizes them; backward uses the *straight-through
+  estimator* (STE): the quantizer is treated as identity, so the gradient flows
+  to =W_latent= unchanged.  The optimizer (Adam) updates =W_latent=, never the
+  ternary copy.  Activation quant uses an absmax-STE the same way.
+- Reported (70B, vs LLaMA): memory ~1/7.16, matmul cost ~1/71.4, energy ~1/41.2,
+  throughput ~8.9x, accuracy on par.
+
+* Where it lands here
+- The win we can *bank*: memory / bandwidth.  Resident weights move f32 -> int8
+  (4x) or 2-bit packed (16x).  GTX 1060 decode/train is bandwidth-bound, so this
+  is real even before any compute trick.
+- The win we can *chase*: Pascal GP106 supports *DP4A* (int8 4-element dot
+  product).  An int8 BitLinear kernel can use it for a genuine compute speedup --
+  this is the payoff that owning our own SPIR-V compiler unlocks.
+
+* Design
+
+** Phase A -- correctness first, no new dtype
+Goal: prove QAT converges with *zero* kernel changes.
+- Keep weights f32 but constrained to {-beta, 0, +beta}.  Existing =matmul-reg=
+  is reused unchanged.
+- New builder op =nlga-bitlinear= in =nl-llm-gpu-ag.el=:
+  - forward: =quant-absmean(W_latent)= -> ternary*beta -> existing matmul; quantize
+    the input row with absmax.
+  - backward: STE -- =dW_latent= receives the gradient computed by the existing
+    =matmul-at= weight-grad path as if the quantizer were identity; activation
+    quant likewise passes its gradient straight through.
+  - Adam updates =W_latent= (full precision) exactly as today.
+- New kernels (small, elementwise/reduce): =quant-absmean= (compute beta + emit
+  ternary*beta), =quant-act-int8= (row absmax -> scale + int8-valued floats).
+
+** Phase B -- performance
+- Store ternary weights as int8 resident buffers (new dtype path in the resident
+  buffer plumbing), or 2-bit packed for maximum memory cut.
+- New kernel =bitlinear=: ternary W (int8) x int8 activations -> int32 accum ->
+  dequant by beta*gamma.  Target DP4A for the inner product on GP106.
+- =nlga-bitlinear= switches its forward dispatch to =bitlinear= while keeping the
+  Phase A STE backward (gradients stay in f32 on =W_latent=).
+
+* Verification
+- *Op-level.*  CPU reference =BitLinear= (absmean quant + STE backward) vs GPU:
+  match the quantized forward and the =W_latent= gradient to f32
+  (maxrel < 1e-5).  Run with the CPU backend explicitly selected for the
+  reference (avoid the resident-weight staleness trap).
+- *End-to-end.*  Train a tiny model with =nlga-bitlinear= blocks; assert loss
+  decreases and that each trained weight tensor is genuinely ternary (<= 3
+  distinct magnitudes up to beta).
+- New suite: =test/gpu-bitnet-test.el= (skips cleanly without Vulkan).
+
+* Cost / risk
+- Effort: Phase A medium, Phase B medium-high (int8 dtype + DP4A kernel).
+- Risk: QAT can be unstable at tiny scale; STE clipping range and per-tensor vs
+  per-row beta need tuning.  The 2-bit packing path adds bit-twiddling in the
+  kernel.
+- Mitigation: ship Phase A first as the correctness gate; treat Phase B as a
+  separate perf change behind the same =nlga-bitlinear= API.
+
+* Open questions
+- Per-tensor vs per-output-row beta (accuracy vs simplicity).
+- Whether to quantize the tied head / embedding (=wte=) or keep it f32.
+- Packed 2-bit layout vs int8: decode-side gather complexity vs memory.

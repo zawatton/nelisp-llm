@@ -1,0 +1,44 @@
+#+TITLE: nelisp-llm Design Docs
+#+OPTIONS: toc:nil num:nil
+
+* Design docs
+
+Forward-looking designs for techniques surveyed from the literature and mapped
+onto the nelisp-llm / nelisp-gpu stack.  Each doc is /concept + application
+design/ only: principle, the kernels / data structures / call-site changes it
+needs here, how to verify it against a CPU reference to f32, and a cost / risk /
+phasing estimate.  No implementation yet -- these gate the work, they are not the
+work.
+
+| #  | Doc                                      | Status | Effort | Payoff            |
+|----+------------------------------------------+--------+--------+-------------------|
+|  1 | [[file:01-bitnet-ternary.org][BitNet b1.58 ternary quantization]]        | DRAFT  | med-hi | memory (PC-fit)   |
+|  2 | [[file:02-streaming-llm-attention-sink.org][StreamingLLM attention sink]]              | DRAFT  | low-md | bounded long ctx  |
+|  3 | [[file:03-paged-attention.org][PagedAttention KV paging]]                 | DRAFT  | med    | var-len batching  |
+|  4 | [[file:04-speculative-decoding.org][Speculative / multi-token decoding]]       | DRAFT  | high   | decode latency    |
+
+Recommended order: 1 -> 2 -> 3 -> 4.  Each technique should first clear a
+*minimal correctness MVP* (1 = f32-constrained QAT, 2 = cache-relative RoPE, 3 =
+dynamic-index gather spike, 4 = greedy-equivalence) before any performance phase.
+
+** Shared stack assets these designs build on
+
+- =nelisp-gpu= : s-expr kernel DSL -> SPIR-V compiler (=nelisp-gpu-compile.el=;
+  has =(uint X)= cast = OpConvertFToU, and =for= loops whose bound is read from a
+  resident buffer at runtime); persistent =vkserver= with resident buffers
+  (=OP_WRITE_RESIDENT=, =OP_COMPILE=, =OP_RUN_COMPILED=).
+- =lisp/nl-llm-gpu-ag.el= : resident-tensor autograd builder (=nlga-linear= over
+  =matmul-reg= / =matmul-at=, on-device Adam, fused fwd+bwd+opt batch).
+- =lisp/nl-llm-gpu-decode.el= : on-GPU KV-cache decode (=decode-rope= /
+  =cache-append= / =decode-attn= and the batched =-b= variants; runtime POS in a
+  resident buffer).
+- =lisp/nl-llm-decode.el= : CPU KV-cache decode -- the reference oracle.
+
+** Relationships
+
+- 2 (bounded window) and 3 (efficient packing) are complementary: a streaming
+  ring can live inside a paged pool.
+- 1 shrinks every weight/KV byte, so it makes the long-context budgets in 2 and 3
+  cheaper and the verify forward in 4 cheaper.
+- 4's verify step reuses the same multi-position forward machinery that the
+  batched decode in =nl-llm-gpu-decode.el= already provides.

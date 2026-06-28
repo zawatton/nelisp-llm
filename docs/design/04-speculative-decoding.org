@@ -1,0 +1,72 @@
+#+TITLE: Speculative / multi-token decoding (MTP, tree drafting)
+#+OPTIONS: toc:2 num:t
+#+STATUS: DRAFT
+
+* Status
+DRAFT -- concept + application design.  Not implemented.
+
+Sources: "Multi-Token Prediction" (Google, 2026); "JetSpec" parallel-tree
+speculative decoding (UCSD Hao AI Lab, 2026); classic speculative decoding.
+
+* Motivation
+Autoregressive decode is memory-bound: every token re-reads all weights for one
+output.  Speculative decoding amortizes that -- a cheap draft proposes k tokens,
+the big model verifies all k in a single forward, and we accept the longest
+agreed prefix.  Net speedup ~ mean accepted length, with the output distribution
+provably identical to plain sampling.
+
+* Principle
+- *Draft:* a cheap predictor proposes k candidate next tokens.
+- *Verify:* the target model scores all k positions in *one* forward pass
+  (parallel over positions, exactly like a k-length prefill).
+- *Accept:* a rejection-sampling rule accepts the longest prefix the target
+  agrees with; on rejection, resample from the adjusted residual distribution.
+  This makes the result *lossless* -- the same distribution as ordinary sampling.
+- *MTP (Google):* the draft is extra prediction heads on the target model itself
+  (predict t+2, t+3, ... from one hidden state).
+- *JetSpec:* parallel *tree* drafting + tree verification; pick the best path.
+  Reported up to 9.64x (MATH-500), 4.58x (MT-Bench).
+
+* Where it lands here
+We train our own model, so *self-speculative (MTP)* is the natural fit -- and the
+verify machinery already exists: the batched decode in =nl-llm-gpu-decode.el=
+already processes multiple tokens in one fused step.
+
+* Design (MTP, self-speculative)
+- *MTP heads.*  Add extra output projections predicting t+2, t+3 from the final
+  hidden state -- just additional =nlga-linear= heads in =nl-llm-gpu-ag.el=.
+- *Training.*  Seed extra =ce-grad-idx= losses at shifted targets (offset +2, +3)
+  alongside the existing next-token loss.  This is the "draft training" cost; it
+  fits the existing nlga loss-seeding flow.
+- *Decode loop:*
+  1. /draft/ -- from the current hidden state, the k MTP heads propose d1..dk.
+  2. /verify/ -- one k-length prefill over =[last_real, d1 .. d(k-1)]= on the
+     existing KV cache (reuse =attn-scores= / =attn-context=), giving the target
+     distribution at each of the k positions.
+  3. /accept/ -- apply the rejection rule to take the longest agreed prefix.
+  4. /commit/ -- =cache-append= the accepted tokens, advance POS, repeat.
+- *Reuse:* verify forward = our prefill path; residual resample on rejection =
+  =nl-llm-sample=.
+- *Alternative:* a separate distilled draft model -- cleaner separation but needs
+  a second model; MTP heads keep everything in one trained network.
+
+* Verification
+- *Losslessness (the crucial gate).*  Greedy is the easy first gate:
+  speculative-greedy must equal plain greedy *token for token*.  For sampling,
+  fix the seed and check the output distribution matches plain sampling
+  statistically.
+- *Speedup.*  Measure mean accepted length and wall-clock vs plain decode.
+- New suite: =test/gpu-spec-test.el= (greedy-equivalence as the hard assertion;
+  skips cleanly without Vulkan).
+
+* Cost / risk
+- Effort: highest of the four -- two parts: MTP-head training (medium, fits nlga)
+  and the verify/accept loop with *exact* rejection sampling (subtle).
+- Risk: an incorrect acceptance rule silently changes the distribution; the
+  greedy-equivalence test is the guard.  Tree drafting (JetSpec) is a later
+  enhancement once linear MTP works.
+
+* Relationship to the other docs
+- Synergy with doc 01 (BitNet): a cheaper verify forward compounds the speedup.
+- Verify reuses the multi-position forward already shared with batched decode;
+  if doc 03 (paging) lands, the verify batch can draw from the paged pool too.

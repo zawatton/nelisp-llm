@@ -359,6 +359,8 @@ size, while on-device keeps everything resident and only moves the loss out.
 - ~examples/generate-gpu.el~      -- train on-device, then autoregressively generate
 - ~examples/train-full-gpu.el~    -- full recipe: corpus + clip + dropout + sampling
 - ~examples/checkpoint-gpu.el~    -- train, save, restart, reload, generate
+- ~examples/train-big-gpu.el~     -- capstone: scaled train + mid-run checkpoint/resume + batch gen
+- ~docs/design/~                  -- forward-looking designs (BitNet, StreamingLLM, PagedAttention, speculative decode)
 
 * Run
 

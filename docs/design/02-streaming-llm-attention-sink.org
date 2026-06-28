@@ -1,0 +1,78 @@
+#+TITLE: StreamingLLM -- attention-sink bounded-memory decode
+#+OPTIONS: toc:2 num:t
+#+STATUS: DRAFT
+
+* Status
+DRAFT -- concept + application design.  Not implemented.
+
+Source: "Efficient Streaming Language Models with Attention Sinks"
+(MIT Han Lab, 2023).
+
+* Motivation
+Our KV-cache decode (=nl-llm-gpu-decode.el=) keeps every past token, so memory
+and per-step attention cost grow without bound -- a hard wall for long-running
+chat.  StreamingLLM keeps both *bounded* while preserving quality, and it lands
+on our existing decode path with minimal surgery.  This is the cheapest, highest
+-ROI item in the set.
+
+* Principle
+- A pure sliding window (keep only the last L) collapses in perplexity the moment
+  the *first* tokens are evicted.
+- Why: softmax must sum to 1, so the model dumps its surplus attention mass onto
+  the first few tokens regardless of content -- these are *attention sinks*.
+- Fix: keep the first =k_sink= tokens (e.g. 4) *permanently* + a rolling window of
+  the most recent L tokens.  Memory / compute stay fixed at =k_sink + L=, and
+  perplexity stays stable over millions of tokens.
+- *Critical subtlety:* rotary positions are assigned by *position within the
+  cache*, not the token's original absolute position.  Get this wrong and logits
+  drift.
+
+* Where it lands here
+Today =decode-attn= attends over =[0 .. pos]= of a resident cache sized
+=max_seq=, with the runtime POS read from a resident buffer.  The change is to
+turn that cache into a *ring* with a fixed sink prefix.
+
+* Design
+- *Ring cache* of capacity =C = k_sink + L=.  Two regions: fixed sink slots
+  =[0, k_sink)= (never overwritten) and rolling slots =[k_sink, C)= (overwrite
+  oldest).
+- =cache-append= -> =cache-append-ring=: target slot is
+  : t < C            -> slot = t
+  : t >= C           -> slot = k_sink + ((t - k_sink) mod L)
+  Slot math uses the existing =(uint X)= cast for the modulo.
+- =decode-attn= -> =decode-attn-stream=: loop bound becomes =min(t+1, C)= (the
+  =for= bound is already read from a resident buffer, so this is an extension of
+  the existing pattern).
+- *RoPE position handling (the hard part).*  Keys must be rotated by their
+  *cache-relative* position, not absolute t.  Two options:
+  - (a) store K un-rotated and apply RoPE at attention time from each key's
+    current cache slot index;
+  - (b) clamp the query's effective position so relative distances stay within
+    the window.
+  Option (a) maps most directly onto our kernels: =decode-attn-stream= takes the
+  cache-relative position as an argument and rotates per key.
+
+** New / changed kernels
+- =cache-append-ring= (ring slot with modulo).
+- =decode-attn-stream= (bound C, cache-relative position-aware).
+Both are small edits to existing =cache-append= / =decode-attn=.
+
+* Verification
+- *Equivalence.*  CPU reference StreamingLLM decode (ring + sink) vs GPU: match
+  per-position logits over a long run (e.g. 200 tokens, C = 4 + 16) to f32.
+- *Qualitative paper result.*  Window-only (no sink) diverges; sink+window stays
+  stable.  Reproduce this on our tiny model as a regression that asserts the
+  sink path's running loss stays bounded while the window-only path blows up.
+- New suite: =test/gpu-stream-test.el= (skips cleanly without Vulkan).
+
+* Cost / risk
+- Effort: low-medium.
+- Risk: concentrated entirely in the RoPE cache-relative position math; verify it
+  in isolation first (a single-block decode-attn-stream oracle) before wiring the
+  full model.
+
+* Open questions
+- Best =k_sink= for our tiny models (paper uses ~4; ours may differ).
+- Whether sink tokens should be the literal first tokens or a small set of
+  learned/dedicated sink slots (the paper also explores a trained sink token).
+- Interaction with the tied head and biases already in =nl-llm-decode.el=.

@@ -1,0 +1,82 @@
+#+TITLE: PagedAttention -- block-paged KV cache
+#+OPTIONS: toc:2 num:t
+#+STATUS: DRAFT
+
+* Status
+DRAFT -- concept + application design.  Not implemented.
+
+Source: "Efficient Memory Management for Large Language Model Serving with
+PagedAttention" (vLLM, 2023).
+
+* Motivation
+Our batched decode (=nl-llm-gpu-decode-batch-*=) allocates a full =max_seq= cache
+for *every* sequence in the batch, so variable-length batches waste most of their
+KV memory.  PagedAttention stores the cache in fixed-size blocks drawn from a
+shared pool, indexed per-sequence by a block table -- eliminating
+over-reservation and fragmentation, and enabling prefix sharing.  This is the
+right substrate for real batched serving.
+
+* Principle
+- KV cache is split into fixed-size *blocks* (e.g. 16 tokens each) held in a
+  pool.  Each sequence has a *block table* mapping logical block index ->
+  physical block id.
+- Blocks are allocated on demand, not reserved up front, so memory used =
+  sum of live blocks, not =batch * max_seq=.
+- Shared prefixes (beam search, common system prompts) can point at the same
+  physical block (copy-on-write).
+- The attention kernel reads K/V *indirectly* through the block table (gather via
+  a data-dependent index).
+
+* Where it lands here
+Replace the per-sequence contiguous caches in =nl-llm-gpu-decode.el='s batch path
+with a single pooled buffer + a resident block table; allocation is managed on
+the host (elisp), the GPU only reads the table.
+
+* Design
+- *KV pool* resident buffer: =N_blocks * block_size * kvdim= (one each for K and
+  V, per layer).
+- *Block table* resident int buffer: =[B * max_blocks]=, logical block ->
+  physical block id.
+- =cache-append= -> =cache-append-paged=: write at
+  : physical = table[seq, pos / block_size]
+  : offset   = pos mod block_size
+- =decode-attn= -> =decode-attn-paged=: for a sequence, walk its blocks via the
+  table and gather K/V from the pool.
+- *Host-side allocator (elisp).*  A free-block list lives in =nl-llm-gpu-decode=:
+  =decode-batch-new= builds initial tables; a step that crosses a block boundary
+  pops a free block and writes the table slot (then =OP_WRITE_RESIDENT= the
+  updated table row).  The GPU never allocates -- it only dereferences.
+
+** Compiler feasibility -- the key risk, resolve first
+=decode-attn-paged= needs a *data-dependent dynamic-index load*:
+=Kpool[table[s, b] * block_size + i]=.  We already have the =(uint X)= cast and
+runtime-bounded =for= loops, and SPIR-V supports a dynamic =OpAccessChain= index,
+but it is not yet exercised whether =nelisp-gpu-compile.el= emits it.  *First
+deliverable is a spike:* one kernel that gathers from a pool through a table
+buffer.  Everything else depends on that spike passing.
+
+** New kernels
+- =cache-append-paged= (table-lookup slot).
+- =decode-attn-paged= (table-driven block walk + K/V gather).
+
+* Verification
+- *Equivalence.*  CPU paged reference vs GPU: per-sequence logits identical to
+  contiguous decode (the existing =gpu-batch-test= oracle, re-pointed at the
+  paged path).
+- *Variable-length packing.*  A batch of differing-length sequences sharing the
+  pool; assert memory used = sum of allocated blocks (<< =B * max_seq=) and
+  logits still match per-sequence decode.
+- New suite: =test/gpu-paged-test.el= (skips cleanly without Vulkan).
+
+* Cost / risk
+- Effort: medium; can rise depending on the dynamic-index spike.
+- Risk: the compiler gather (above) is the single load-bearing unknown -- gate on
+  the spike before building tables/allocator.
+- Lower immediate payoff than StreamingLLM for a single-user tiny model, but it
+  is the correct foundation for many / variable-length sequences and prefix
+  sharing.
+
+* Relationship to StreamingLLM (doc 02)
+Complementary: a bounded streaming ring (doc 02) can live *inside* a paged pool
+-- the ring decides what to keep, paging decides how to pack it.  Sequencing 02
+before 03 lets 03 reuse a smaller, bounded per-sequence footprint.
