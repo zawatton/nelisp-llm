@@ -156,6 +156,18 @@ kernels index ~wte~ directly via a float->uint cast), not a seq x vocab one-hot.
 ~38 ms to ~20 ms (vocab 336).  ~wte~ is still trained on-device by the
 scatter-add backward.
 
+*** On-device Adam
+
+~nlga-finish-adam~ swaps the plain SGD update for Adam, fully on-device: each
+parameter's first/second moment buffers (m, v) are kept resident and updated in
+place by the ~adam~ kernel (like the weights, they never round-trip), and a
+shared resident buffer holds [lr_t, b1, b2, eps].  Because the compiled command
+buffer is fixed, the time-dependent bias correction is handled by refreshing
+lr_t = lr·sqrt(1-b2^t)/(1-b1^t) in that buffer each step via
+~nlga-adam-update-t~.  ~test/gpu-adam-test.el~ checks it matches a CPU reference
+running the same Adam update to f32 (maxrel < 1e-5); Adam reaches a much lower
+loss in the same number of steps than SGD (2.89 -> 0.64 in 8 steps here).
+
 * Layout
 
 - ~lisp/nl-llm-arch.el~     -- core primitives (RMSNorm, RoPE, SiLU, SwiGLU)

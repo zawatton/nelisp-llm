@@ -24,7 +24,7 @@
 (defsubst nlga--g (n) (/ (+ n 63) 64))
 
 (cl-defstruct (nlga (:constructor nlga--make))
-  (slots nil) (nslot 0) (disp nil) (bwd nil) (params nil) (nout 0) (compiled nil))
+  (slots nil) (nslot 0) (disp nil) (bwd nil) (params nil) (nout 0) (compiled nil) (adam nil))
 (cl-defstruct (nlga-rt (:constructor nlga-rt--make)) slot rows cols grad handle)
 (defsubst nlga-rt-size (x) (* (nlga-rt-rows x) (nlga-rt-cols x)))
 
@@ -425,6 +425,33 @@ protocol re-send / buffer alloc / descriptor rebuild.  Call after `nlga-finish'.
   (setf (nlga-compiled b)
         (nelisp-gpu-server-compile (reverse (nlga-slots b)) (reverse (nlga-disp b)))))
 
+(defun nlga-finish-adam (b lr &optional beta1 beta2 eps)
+  "Like `nlga-finish' but with an on-device Adam optimiser.  Per-parameter first
+and second moment buffers (m, v) are kept resident and updated in place by the
+`adam' kernel; a shared resident hyperparameter buffer holds [lr_t, b1, b2, eps]
+and must be refreshed each step with `nlga-adam-update-t'.  Call after the
+forward + loss seed (before `nlga-compile')."
+  (let ((b1 (or beta1 0.9)) (b2 (or beta2 0.999)) (ep (or eps 1.0e-8)))
+    (dolist (th (nlga-bwd b)) (funcall th))
+    (let* ((hh (nelisp-gpu-server-upload (vector lr b1 b2 ep)))
+           (hslot (nlga--slot b (list 'res hh 4))) (mv nil))
+      (dolist (p (nlga-params b))
+        (let* ((rt (plist-get p :rt)) (n (nlga-rt-size rt)) (gs (nlga--grad b rt))
+               (mh (nelisp-gpu-server-upload (make-vector n 0.0)))
+               (vh (nelisp-gpu-server-upload (make-vector n 0.0)))
+               (ms (nlga--slot b (list 'res mh n))) (vs (nlga--slot b (list 'res vh n))))
+          (push mh mv) (push vh mv)
+          (nlga--d b (list 'adam (list (nlga-rt-slot rt) gs ms vs hslot) (list n) (nlga--g n)))))
+      (setf (nlga-adam b) (list :h hh :lr lr :b1 b1 :b2 b2 :eps ep :mv mv)))))
+
+(defun nlga-adam-update-t (b tstep)
+  "Refresh the Adam hyperparameter buffer for 1-based timestep TSTEP:
+lr_t = lr * sqrt(1 - b2^t) / (1 - b1^t).  Call before each `nlga-step'."
+  (let* ((a (nlga-adam b)) (lr (plist-get a :lr)) (b1 (plist-get a :b1))
+         (b2 (plist-get a :b2)) (ep (plist-get a :eps))
+         (lr-t (* lr (/ (sqrt (- 1.0 (expt b2 tstep))) (- 1.0 (expt b1 tstep))))))
+    (nelisp-gpu-server-write-resident (plist-get a :h) (vector lr-t b1 b2 ep))))
+
 (defun nlga-step (b)
   "Run the assembled batch once (one training step); return the out vectors.
 Uses the compiled command buffer when `nlga-compile' has been called."
@@ -448,6 +475,10 @@ Uses the compiled command buffer when `nlga-compile' has been called."
   (when (nlga-compiled b)
     (ignore-errors (nelisp-gpu-server-free-compiled (car (nlga-compiled b))))
     (setf (nlga-compiled b) nil))
+  (when (nlga-adam b)
+    (ignore-errors (nelisp-gpu-server-free (plist-get (nlga-adam b) :h)))
+    (dolist (h (plist-get (nlga-adam b) :mv)) (ignore-errors (nelisp-gpu-server-free h)))
+    (setf (nlga-adam b) nil))
   (dolist (p (nlga-params b)) (ignore-errors (nelisp-gpu-server-free (plist-get p :handle)))))
 
 (provide 'nl-llm-gpu-ag)
