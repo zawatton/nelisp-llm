@@ -70,10 +70,17 @@
                 wspec lnfg bh dim vocab))
            (sp (nl-llm-integrated-spec-greedy prompt nsteps pblocks
                  (mapcar (lambda (_) (nl-llm-spcache-new nsink win dim heads kvh bs)) blocks)
-                 wspec lnfg bh w2 b2 dim vocab)))
+                 wspec lnfg bh w2 b2 dim vocab))
+           ;; Check 3: fused resident decode (QKV/gate|up one dispatch, weights resident)
+           (rmodel (nl-llm-integrated-resident-model blocks wte bh dim))
+           (fsp (nl-llm-integrated-fused-spec-greedy prompt nsteps rmodel
+                  (mapcar (lambda (_) (nl-llm-spcache-new nsink win dim heads kvh bs)) blocks) lnfg w2 b2)))
+      (nl-llm-integrated-free-model rmodel)
       (nl-llm-gpu-disable)
       (it--ck "speculative greedy == plain greedy (ternary)" (equal (car sp) g)
-              (format "%d toks, %d rounds = %.2f tok/forward" nsteps (cdr sp) (/ (float nsteps) (cdr sp))))))
+              (format "%d toks, %d rounds = %.2f tok/forward" nsteps (cdr sp) (/ (float nsteps) (cdr sp))))
+      (it--ck "fused resident decode == non-fused decode" (equal (car fsp) g)
+              (format "4 disp/block vs 7; %d rounds" (cdr fsp)))))
 
   (princ (format "NL-LLM-INTEGRATED %s (%d failures)\n" (if (= it--fail 0) "ALL-PASS" "HAS-FAILURES") it--fail))
   (kill-emacs (if (= it--fail 0) 0 1)))

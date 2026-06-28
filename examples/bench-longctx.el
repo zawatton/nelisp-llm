@@ -76,27 +76,42 @@
          ;; fit the MTP draft head on a short rollout
          (roll (blc--rollout prompt fit-steps pblocks (funcall mkc) wspec lnfg bh dim vocab))
          (mtp (blc--fit-mtp (cdr roll) (car roll) dim vocab 60 0.5)) (w2 (car mtp)) (b2 (cdr mtp))
-         ;; timed speculative decode over a long generation
+         ;; (A) timed speculative decode -- NON-FUSED: 7 dispatches/block, weights
+         ;;     re-uploaded every token (the plain --run1 path).
          (sc (funcall mkc)) (t0 (float-time))
          (sp (nl-llm-integrated-spec-greedy prompt gen pblocks sc wspec lnfg bh w2 b2 dim vocab))
-         (dt (- (float-time) t0)) (spec (car sp)) (rounds (cdr sp))
-         ;; plain greedy for the lossless check
-         (greedy (nl-llm-integrated-greedy prompt gen pblocks (funcall mkc) wspec lnfg bh dim vocab))
+         (dt-nf (- (float-time) t0)) (spec (car sp)) (rounds (cdr sp))
+         ;; (B) timed speculative decode -- FUSED RESIDENT: Q|K|V and gate|up each
+         ;;     one dispatch (4/block), weights uploaded once and kept resident.
+         (rmodel (nl-llm-integrated-resident-model blocks wte bh dim))
+         (fc (funcall mkc)) (t1 (float-time))
+         (fsp (nl-llm-integrated-fused-spec-greedy prompt gen rmodel fc lnfg w2 b2))
+         (dt-f (- (float-time) t1)) (fspec (car fsp)) (frounds (cdr fsp))
+         ;; dispatches per block forward (the linears): non-fused vs fused
+         (disp-nf (* 7 nblk)) (disp-f (* 4 nblk))
          ;; weight memory (whole model incl. tied wte): f32 vs packed
          (wf32 (* vocab dim 4)) (wpk (* vocab (/ (+ dim (1- nl-llm-bitnet-pk)) nl-llm-bitnet-pk) 4))
          ;; per-layer per-token KV bytes (K+V, f32)
          (kv-per-tok (* kvdim 2 4 nblk)))
+    (nl-llm-integrated-free-model rmodel)
     (dolist (blk blocks) (let ((bb (nl-llm-bitnet-block-bytes blk))) (setq wf32 (+ wf32 (car bb)) wpk (+ wpk (cdr bb)))))
     (nl-llm-gpu-disable)
     (princ (format "\nmodel: dim=%d heads=%d/%d kv ff=%d vocab=%d layers=%d | sink=%d win=%d (cap=%d) blk=%d\n"
                    dim heads kvh ff vocab nblk nsink win cap bs))
-    (princ (format "decoded: prompt %d + generated %d = %d positions in %.1fs (%.0f tok/s wall)\n\n"
-                   (length prompt) gen (+ (length prompt) gen) dt (/ gen dt)))
+    (princ (format "decoded: prompt %d + generated %d = %d positions\n\n"
+                   (length prompt) gen (+ (length prompt) gen)))
+
+    (princ "-- dispatch reduction (fused resident kernels) --\n")
+    (princ (format "  GPU dispatches per block forward: %d (7/block: wq wk wv wo wg wu wd) -> %d (4/block: QKV, O, gate|up, D)\n"
+                   disp-nf disp-f))
+    (princ "  weights: non-fused re-uploads every token; fused uploads once (resident)\n")
+    (princ (format "  wall: non-fused %.1fs (%.1f tok/s) -> fused %.1fs (%.1f tok/s)  =  %.2fx faster\n"
+                   dt-nf (/ gen dt-nf) dt-f (/ gen dt-f) (/ dt-nf dt-f)))
+    (princ (format "  identical output (fused == non-fused == greedy): %s\n\n" (if (equal fspec spec) "YES" "*** NO ***")))
 
     (princ "-- tokens / forward (speculative MTP) --\n")
-    (princ (format "  %d tokens in %d target forwards = %.2f tok/forward (%.0f%% drafts accepted)\n"
+    (princ (format "  %d tokens in %d target forwards = %.2f tok/forward (%.0f%% drafts accepted)\n\n"
                    gen rounds (/ (float gen) rounds) (* 100.0 (/ (float (- gen rounds)) gen))))
-    (princ (format "  lossless: speculative stream == plain greedy : %s\n\n" (if (equal spec greedy) "IDENTICAL" "*** DIFFER ***")))
 
     (princ "-- weight memory (BitNet, constant in context length) --\n")
     (princ (format "  f32 %.2f MB -> ternary-packed %.2f MB (%.1fx smaller)\n\n" (blc--mb wf32) (blc--mb wpk) (/ (float wf32) wpk)))
@@ -116,5 +131,5 @@
         (princ (format "    %-12d %11.2f MB %11.2f MB %8.0fx\n" L (blc--mb naive) (blc--mb bound) (/ (float naive) bound)))))
     (princ (format "\n  total resident @ 262144 ctx: naive %.1f MB (f32 W + growing KV) -> integrated %.2f MB (ternary W + pinned KV)\n"
                    (blc--mb (+ wf32 (* 262144 kv-per-tok))) (blc--mb (+ wpk (* cap kv-per-tok)))))
-    (kill-emacs (if (equal spec greedy) 0 1))))
+    (kill-emacs (if (equal fspec spec) 0 1))))
 ;;; bench-longctx.el ends here

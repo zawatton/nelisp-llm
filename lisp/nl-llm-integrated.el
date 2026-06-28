@@ -75,30 +75,24 @@ genuinely exercised, and blocks are allocated on demand as the prefix grows."
 
 ;; ---- one integrated pre-norm block: ternary linears + paged streaming attention
 
-(defun nl-llm-integrated--blk (xrow blk cache linfn &optional rope-base)
-  "Decode one token XROW (1 x dim) through one pre-norm block.  Every linear runs
-through LINFN (XROW, weight-spec, bias-row) -> flat vector, so a ternary packed
-LINFN makes the block BitNet; the KV is stored in the paged streaming CACHE and
-attended sink+window with cache-relative RoPE (StreamingLLM + PagedAttention)."
+(defun nl-llm-integrated--attn (qr kr vr cache base)
+  "Streaming sink+window paged attention for one token.  QR/KR/VR are the raw
+\(un-RoPE'd) query/key/value vectors; this stores K/V at the token's paged slot,
+attends the kept sink+window entries with cache-relative RoPE, and returns the
+attention output (dim).  Shared by the LINFN and fused-resident blocks."
   (let* ((dim (nl-llm-spcache-dim cache)) (heads (nl-llm-spcache-heads cache))
          (kvh (nl-llm-spcache-kvh cache)) (hd (/ dim heads)) (kvdim (nl-llm-spcache-kvdim cache))
          (grp (/ heads kvh)) (nsink (nl-llm-spcache-nsink cache)) (win (nl-llm-spcache-win cache))
-         (p (nl-llm-spcache-seen cache)) (base (or rope-base 10000.0)) (scale (/ 1.0 (sqrt (float hd))))
-         (a (nl-llm-rmsnorm xrow (plist-get blk :ln1g)))
-         (qr (funcall linfn a (plist-get blk :wq) (plist-get blk :bq)))
-         (kr (funcall linfn a (plist-get blk :wk) (plist-get blk :bk)))
-         (vr (funcall linfn a (plist-get blk :wv) (plist-get blk :bv)))
+         (p (nl-llm-spcache-seen cache)) (scale (/ 1.0 (sqrt (float hd))))
          (kc (nl-llm-spcache-kpool cache)) (vc (nl-llm-spcache-vpool cache))
          (out (make-vector dim 0.0))
          (slot (nl-llm--scache-slot p nsink win))
          (start (max nsink (- p (1- win))))                ; oldest window stream pos kept
          (qcrel (if (< p nsink) p (+ nsink (- p start))))  ; query's cache-relative position
          (entries nil) (cbase (nl-llm-spcache--base cache slot)))
-    ;; store this token's RAW key/value at its (paged) slot
     (let ((t0 0)) (while (< t0 kvdim)
       (aset kc (+ cbase t0) (aref kr t0)) (aset vc (+ cbase t0) (aref vr t0)) (setq t0 (1+ t0))))
     (setf (nl-llm-spcache-seen cache) (1+ p))
-    ;; kept entries as (paged-base . cache-relative-pos): sink first, then window, in order
     (let ((s 0) (lim (min nsink (1+ p)))) (while (< s lim)
       (push (cons (nl-llm-spcache--base cache s) s) entries) (setq s (1+ s))))
     (let ((s (max nsink start))) (while (<= s p)
@@ -126,7 +120,19 @@ attended sink+window with cache-relative RoPE (StreamingLLM + PagedAttention)."
                 (setq e2 (cdr e2) jj (1+ jj)))
               (aset out (+ c0q t0) accv))
             (setq t0 (1+ t0)))))))
-    ;; attention out-projection + residual, then SwiGLU FFN (all via LINFN)
+    out))
+
+(defun nl-llm-integrated--blk (xrow blk cache linfn &optional rope-base)
+  "Decode one token XROW (1 x dim) through one pre-norm block.  Every linear runs
+through LINFN (XROW, weight-spec, bias-row) -> flat vector, so a ternary packed
+LINFN makes the block BitNet; the KV is stored in the paged streaming CACHE and
+attended sink+window with cache-relative RoPE (StreamingLLM + PagedAttention)."
+  (let* ((dim (nl-llm-spcache-dim cache)) (base (or rope-base 10000.0))
+         (a (nl-llm-rmsnorm xrow (plist-get blk :ln1g)))
+         (qr (funcall linfn a (plist-get blk :wq) (plist-get blk :bq)))
+         (kr (funcall linfn a (plist-get blk :wk) (plist-get blk :bk)))
+         (vr (funcall linfn a (plist-get blk :wv) (plist-get blk :bv)))
+         (out (nl-llm-integrated--attn qr kr vr cache base)))
     (let* ((attn (funcall linfn (photon-tensor (list 1 dim) out) (plist-get blk :wo) (plist-get blk :bo)))
            (x1 (photon-tensor-add xrow (photon-tensor (list 1 dim) attn)))
            (bnorm (nl-llm-rmsnorm x1 (plist-get blk :ln2g)))
@@ -138,6 +144,93 @@ attended sink+window with cache-relative RoPE (StreamingLLM + PagedAttention)."
       (photon-tensor-add x1 (photon-tensor (list 1 dim)
                                            (funcall linfn (photon-tensor (list 1 (length hh)) hh)
                                                     (plist-get blk :wd) (plist-get blk :bd)))))))
+
+;; ---- fused resident block: 4 GPU dispatches/block (QKV, O, gate|up, D), weights
+;; uploaded once.  Same math/cache as the LINFN block, far fewer dispatches/uploads.
+
+(defun nl-llm-integrated-fused--blk (xrow rblk cache &optional rope-base)
+  "Decode one token through a fused resident block RBLK
+\(`nl-llm-bitnet-resident-block').  QKV is one dispatch, gate|up one dispatch, and
+the resident weights are not re-uploaded -- otherwise identical to
+`nl-llm-integrated--blk'."
+  (let* ((dim (nl-llm-spcache-dim cache)) (base (or rope-base 10000.0))
+         (a (nl-llm-rmsnorm xrow (plist-get rblk :ln1g)))
+         (qkvspec (plist-get rblk :qkv)) (qkv (nl-llm-bitnet--run-fused-res a qkvspec))
+         (sp (plist-get qkvspec :splits)) (dq (nth 0 sp)) (dk (nth 1 sp))
+         (qr (cl-subseq qkv 0 dq)) (kr (cl-subseq qkv dq (+ dq dk))) (vr (cl-subseq qkv (+ dq dk)))
+         (out (nl-llm-integrated--attn qr kr vr cache base)))
+    (let* ((attn (nl-llm-bitnet--run-fused-res (photon-tensor (list 1 dim) out) (plist-get rblk :o)))
+           (x1 (photon-tensor-add xrow (photon-tensor (list 1 dim) attn)))
+           (bnorm (nl-llm-rmsnorm x1 (plist-get rblk :ln2g)))
+           (guspec (plist-get rblk :gu)) (gu (nl-llm-bitnet--run-fused-res bnorm guspec))
+           (ff (nth 0 (plist-get guspec :splits)))
+           (sd (photon-tensor-data (nl-llm-silu (photon-tensor (list 1 ff) (cl-subseq gu 0 ff)))))
+           (hh (make-vector ff 0.0)))
+      (dotimes (i ff) (aset hh i (* (aref sd i) (aref gu (+ ff i)))))
+      (photon-tensor-add x1 (photon-tensor (list 1 dim)
+                                           (nl-llm-bitnet--run-fused-res (photon-tensor (list 1 ff) hh) (plist-get rblk :d)))))))
+
+;;;###autoload
+(defun nl-llm-bitnet-resident-block (blk)
+  "Build a fused resident block from f32 weight plist BLK: Q|K|V and gate|up each
+become one per-row-beta resident packed weight, O and down stay single, norms pass
+through.  Returns a plist (:ln1g :ln2g :qkv :o :gu :d) for
+`nl-llm-integrated-fused--blk'.  Free with `nl-llm-integrated-free-model'."
+  (list :ln1g (plist-get blk :ln1g) :ln2g (plist-get blk :ln2g)
+        :qkv (nl-llm-bitnet-pack-fused-res
+              (list (plist-get blk :wq) (plist-get blk :wk) (plist-get blk :wv))
+              (list (plist-get blk :bq) (plist-get blk :bk) (plist-get blk :bv)))
+        :o (nl-llm-bitnet-pack-fused-res (list (plist-get blk :wo)) (list (plist-get blk :bo)))
+        :gu (nl-llm-bitnet-pack-fused-res
+             (list (plist-get blk :wg) (plist-get blk :wu)) (list (plist-get blk :bg) (plist-get blk :bu)))
+        :d (nl-llm-bitnet-pack-fused-res (list (plist-get blk :wd)) (list (plist-get blk :bd)))))
+
+;;;###autoload
+(defun nl-llm-integrated-resident-model (blocks wte bh dim)
+  "Upload a fully-resident fused model: each block via `nl-llm-bitnet-resident-block',
+plus the packed tied embedding spec (for the embedding rows) and a resident head.
+Returns a plist (:rblocks :wte-spec :head :dim :vocab)."
+  (list :rblocks (mapcar #'nl-llm-bitnet-resident-block blocks)
+        :wte-spec (nl-llm-bitnet-pack-wte wte)
+        :head (nl-llm-bitnet-pack-fused-res (list wte) (list bh))
+        :dim dim :vocab (car (photon-tensor-shape wte))))
+
+(defun nl-llm-integrated-free-model (model)
+  "Free every resident handle held by a `nl-llm-integrated-resident-model' MODEL."
+  (dolist (rblk (plist-get model :rblocks))
+    (dolist (k '(:qkv :o :gu :d)) (nl-llm-bitnet-free-fused-res (plist-get rblk k))))
+  (nl-llm-bitnet-free-fused-res (plist-get model :head)))
+
+(defun nl-llm-integrated-fused-h (token model caches lnfg &optional rope-base)
+  "Embed TOKEN (packed-row), run the fused resident MODEL blocks with paged
+streaming CACHES, return the post-final-RMSNorm hidden (1 x dim)."
+  (let* ((ws (plist-get model :wte-spec)) (dim (plist-get model :dim))
+         (packed (nth 0 ws)) (beta (nth 1 ws)) (fcount (nth 2 ws))
+         (x (photon-tensor (list 1 dim) (nl-llm-bitnet-unpack-row packed beta fcount token dim)))
+         (bl (plist-get model :rblocks)) (cl caches))
+    (while bl (setq x (nl-llm-integrated-fused--blk x (car bl) (car cl) rope-base)) (setq bl (cdr bl) cl (cdr cl)))
+    (nl-llm-rmsnorm x lnfg)))
+
+;;;###autoload
+(defun nl-llm-integrated-fused-spec-greedy (prompt nsteps model caches lnfg w2 b2 &optional rope-base)
+  "Self-speculative greedy decode over the fused resident MODEL (MTP head W2,B2).
+Output is exactly plain greedy; returns (TOKENS . ROUNDS).  Uses 4 GPU
+dispatches/block + 1 head with no per-token weight upload."
+  (let* ((vocab (plist-get model :vocab)) (head (plist-get model :head))
+         (h nil) (out nil) (n 0) (rounds 0))
+    (dolist (tk prompt) (setq h (nl-llm-integrated-fused-h tk model caches lnfg rope-base)))
+    (while (< n nsteps)
+      (setq rounds (1+ rounds))
+      (let ((t1 (nl-llm-spec-argmax (nl-llm-bitnet--run-fused-res h head) 0 vocab))
+            (d  (nl-llm--head-argmax h w2 b2 vocab)))
+        (push t1 out) (setq n (1+ n))
+        (let* ((h1 (nl-llm-integrated-fused-h t1 model caches lnfg rope-base))
+               (true2 (nl-llm-spec-argmax (nl-llm-bitnet--run-fused-res h1 head) 0 vocab)))
+          (if (and (= d true2) (< n nsteps))
+              (progn (push d out) (setq n (1+ n))
+                     (setq h (nl-llm-integrated-fused-h d model caches lnfg rope-base)))
+            (setq h h1)))))
+    (cons (nreverse out) rounds)))
 
 (defun nl-llm-integrated-h (token blocks caches embed-fn linfn lnfg dim &optional rope-base)
   "Embed TOKEN (via EMBED-FN -> dim vector), run BLOCKS with paged streaming

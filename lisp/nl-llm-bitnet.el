@@ -199,6 +199,53 @@ Returns the (vocab) logit vector."
       (setq kv (cddr kv)))
     (cons f32 pkb)))
 
+;; --- fused resident packed linear: fewer dispatches, weights uploaded once ---
+;; Several projections that share an input dim (Q|K|V, gate|up) are packed into ONE
+;; per-row-beta weight and uploaded resident, so they run in ONE GPU dispatch with
+;; no per-token weight re-upload (the dispatch/upload cost the plain `--run1' path
+;; pays every token).  Used by the fused integrated decode (nl-llm-integrated.el).
+
+(defun nl-llm-bitnet-pack-fused-res (wlist biaslist)
+  "Pack f32 weights WLIST (all with the same input dim) into one per-row-beta
+packed weight, upload it + the per-row beta + the concatenated bias BIASLIST as
+resident buffers, and return a resident fused-linear spec (a plist with :ph :betah
+:biash :in :out :fcount :splits).  Free the handles with
+`nl-llm-bitnet-free-fused-res'."
+  (let* ((pk nl-llm-bitnet-pk) (in (nth 1 (photon-tensor-shape (car wlist))))
+         (fcount (/ (+ in pk -1) pk)) (splits nil) (out 0) (packs nil))
+    (dolist (w wlist)
+      (let ((p (nl-llm-bitnet-pack w)) (oi (car (photon-tensor-shape w))))
+        (push (cons p oi) packs) (push oi splits) (setq out (+ out oi))))
+    (setq packs (nreverse packs) splits (nreverse splits))
+    (let ((pv (make-vector (* out fcount) 0.0)) (bv (make-vector out 0.0)) (biasv (make-vector out 0.0))
+          (poff 0) (off 0) (bl biaslist))
+      (dolist (pe packs)
+        (let* ((p (car pe)) (oi (cdr pe)) (pkw (nth 0 p)) (beta (nth 1 p)) (bias (photon-tensor-data (car bl))))
+          (dotimes (k (* oi fcount)) (aset pv (+ poff k) (aref pkw k)))
+          (dotimes (r oi) (aset bv (+ off r) beta) (aset biasv (+ off r) (aref bias r)))
+          (setq poff (+ poff (* oi fcount)) off (+ off oi) bl (cdr bl))))
+      (list :ph (nelisp-gpu-server-upload pv) :betah (nelisp-gpu-server-upload bv)
+            :biash (nelisp-gpu-server-upload biasv) :in in :out out :fcount fcount :splits splits))))
+
+(defun nl-llm-bitnet-free-fused-res (spec)
+  "Free the resident handles of a fused-linear SPEC."
+  (ignore-errors (nelisp-gpu-server-free (plist-get spec :ph)))
+  (ignore-errors (nelisp-gpu-server-free (plist-get spec :betah)))
+  (ignore-errors (nelisp-gpu-server-free (plist-get spec :biash))))
+
+(defun nl-llm-bitnet--run-fused-res (xrow spec)
+  "Run the resident fused packed linear SPEC on row XROW (1 x in); return the flat
+\(out) result (caller splits it with SPEC's :splits).  ONE dispatch, no re-upload."
+  (let ((in (plist-get spec :in)) (out (plist-get spec :out)) (fcount (plist-get spec :fcount)) (pk nl-llm-bitnet-pk))
+    (car (nelisp-gpu-server-run2
+          'bitlinear-packed-v
+          (list (cons 'in (copy-sequence (photon-tensor-data xrow)))
+                (list 'res (plist-get spec :ph) (* out fcount))
+                (list 'res (plist-get spec :biash) out)
+                (list 'res (plist-get spec :betah) out)
+                (cons 'out out))
+          (vector 1 in out pk fcount) (/ (+ out 63) 64)))))
+
 ;; --- DP4A int8 path (compute win via hardware OpSDot) -----------------------
 ;; Four int8 lanes/group are carried in two f32 halves (each a 0..65535 value,
 ;; exact in f32): lo = b0 + 256*b1, hi = b2 + 256*b3, unsigned bytes b = int8&255.

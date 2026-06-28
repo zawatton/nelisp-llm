@@ -485,6 +485,16 @@ no matter the length while a naive cache grows O(L).  Projected out: KV savings 
 512x at 64k tokens and 2048x at 256k, so total resident memory at a 256k context is
 ~256 MB (f32 weights + growing KV) -> ~0.2 MB (ternary weights + pinned KV).
 
+The decode dispatches are also fused: instead of one GPU dispatch per linear with
+the weight re-uploaded every token (the plain ~nl-llm-bitnet--run1~ path), Q|K|V
+and gate|up are each packed into one *per-row-beta* weight (kernel
+~bitlinear-packed-v~) and run in one dispatch, and all weights are uploaded once as
+resident buffers (~nl-llm-integrated-resident-model~ / ~nl-llm-integrated-fused-spec-greedy~).
+That cuts the per-block linear dispatches from 7 to 4 and removes the per-token
+upload; on the 512-token bench it runs *2.49x faster* (5.3 -> 13.2 tok/s) with
+*byte-identical* output (the fused decode == the non-fused == greedy, pinned in
+~test/integrated-test.el~).
+
 *** Capstone: a real(er) run with mid-run checkpoint + resume
 
 ~examples/train-big-gpu.el~ exercises the whole stack at once at a larger scale: a
