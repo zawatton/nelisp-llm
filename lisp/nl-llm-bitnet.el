@@ -166,5 +166,62 @@ Returns the (vocab) logit vector (cf. `nl-llm-decode-step')."
       (setq kv (cddr kv)))
     (cons f32 pkb)))
 
+;; --- DP4A int8 path (compute win via hardware OpSDot) -----------------------
+;; Four int8 lanes/group are carried in two f32 halves (each a 0..65535 value,
+;; exact in f32): lo = b0 + 256*b1, hi = b2 + 256*b3, unsigned bytes b = int8&255.
+(defun nl-llm-bitnet-pack-i8-act (x)
+  "Per-row int8-quantize X (seq x in) and pack 4 lanes/group into two f32 halves.
+Returns (ALO AHI GAMMA NG); ALO/AHI are (seq x NG), GAMMA (seq), NG = ceil(in/4)."
+  (let* ((sh (photon-tensor-shape x)) (seq (car sh)) (in (nth 1 sh)) (xd (photon-tensor-data x))
+         (ng (/ (+ in 3) 4)) (alo (make-vector (* seq ng) 0.0)) (ahi (make-vector (* seq ng) 0.0))
+         (gamma (make-vector seq 0.0)))
+    (dotimes (s seq)
+      (let ((amax 0.0))
+        (dotimes (i in) (let ((av (abs (aref xd (+ (* s in) i))))) (when (> av amax) (setq amax av))))
+        (let ((g (/ amax 127.0)))
+          (aset gamma s g)
+          (dotimes (grp ng)
+            (let ((bytes (make-vector 4 0)))
+              (dotimes (l 4)
+                (let ((i (+ (* grp 4) l)))
+                  (when (and (< i in) (> g 0.0))
+                    (aset bytes l (logand (max -127 (min 127 (round (/ (aref xd (+ (* s in) i)) g)))) 255)))))
+              (aset alo (+ (* s ng) grp) (float (+ (aref bytes 0) (* 256 (aref bytes 1)))))
+              (aset ahi (+ (* s ng) grp) (float (+ (aref bytes 2) (* 256 (aref bytes 3))))))))))
+    (list alo ahi gamma ng)))
+
+(defun nl-llm-bitnet-pack-i8-w (w)
+  "Ternary-quantize weight W (out x in) and pack 4 lanes/group into two f32 halves.
+Returns (WLO WHI BETA NG); WLO/WHI are (out x NG), NG = ceil(in/4), BETA = mean|W|."
+  (let* ((sh (photon-tensor-shape w)) (out (car sh)) (in (nth 1 sh)) (wd (photon-tensor-data w))
+         (n (* out in)) (ng (/ (+ in 3) 4)) (acc 0.0)
+         (wlo (make-vector (* out ng) 0.0)) (whi (make-vector (* out ng) 0.0)))
+    (dotimes (i n) (setq acc (+ acc (abs (aref wd i)))))
+    (let ((beta (/ acc (float n))))
+      (dotimes (o out)
+        (dotimes (grp ng)
+          (let ((bytes (make-vector 4 0)))
+            (dotimes (l 4)
+              (let ((i (+ (* grp 4) l)))
+                (when (< i in)
+                  (let ((q (if (> beta 0.0) (/ (aref wd (+ (* o in) i)) beta) 0.0)))
+                    (aset bytes l (logand (cond ((>= q 0.5) 1) ((<= q -0.5) -1) (t 0)) 255))))))
+            (aset wlo (+ (* o ng) grp) (float (+ (aref bytes 0) (* 256 (aref bytes 1)))))
+            (aset whi (+ (* o ng) grp) (float (+ (aref bytes 2) (* 256 (aref bytes 3))))))))
+      (list wlo whi beta ng))))
+
+;;;###autoload
+(defun nl-llm-bitnet-dp4a-linear (x w bias)
+  "X (seq x in) . Wq^T + BIAS using hardware DP4A (int8 activations, ternary
+weights) via the bitlinear-dp4a kernel.  Returns the flat (seq*out) result."
+  (let* ((seq (car (photon-tensor-shape x))) (out (car (photon-tensor-shape w)))
+         (pa (nl-llm-bitnet-pack-i8-act x)) (pw (nl-llm-bitnet-pack-i8-w w)))
+    (nth 7 (nelisp-gpu-server-run
+            'bitlinear-dp4a
+            (list (nth 0 pa) (nth 1 pa) (nth 0 pw) (nth 1 pw)
+                  (copy-sequence (photon-tensor-data bias)) (vector (nth 2 pw)) (nth 2 pa)
+                  (make-vector (* seq out) 0.0))
+            (vector seq out (nth 3 pa)) (/ (+ (* seq out) 63) 64)))))
+
 (provide 'nl-llm-bitnet)
 ;;; nl-llm-bitnet.el ends here

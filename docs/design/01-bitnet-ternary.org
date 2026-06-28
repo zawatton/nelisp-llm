@@ -26,9 +26,19 @@ Packed weights are also wired through a *whole-model* forward
 linear is packed and run via =bitlinear-packed=, the tied head/embedding stay
 f32.  On a dim-128 / 6-block / GQA model the packed decode is bit-identical to the
 f32 ternary decode (maxrel 0) and the block-linear weight VRAM drops 8.0x
-(5760 -> 720 KB), 6.9x for the whole model including the f32 embedding.  Remaining
-for a future pass: a true int8 / DP4A path on Pascal for a compute (not just
-bandwidth) speedup, and packing the embedding/head too.
+(5760 -> 720 KB), 6.9x for the whole model including the f32 embedding.
+
+The *compute* path also lands: hardware DP4A (=VK_KHR_shader_integer_dot_product=,
+=integerDotProduct4x8BitPackedSignedAccelerated= on the GTX 1060).  The SPIR-V
+compiler gained a signed-int type, =OpSDot= (with the DotProduct capability +
+extension, emitted only when used), and =ConvertSToF=; four int8 lanes ride in two
+f32 halves (=lo + hi*65536=, no new dtype / bitcast).  Kernel =bitlinear-dp4a=
+(int8 activations + ternary weights) does =in/4= =OpSDot= per row instead of =in=
+f32 MACs.  =test/gpu-dp4a-test.el= verifies =OpSDot= (maxdiff 0) and the matmul
+\(maxrel 9e-8); =examples/bench-dp4a.el= (weights resident) measures *1.84x vs f32
+dense, 1.73x vs f32 ternary* on a 1024x1024 matmul.  Remaining: pack 4 int8 into a
+single f32 via bitcast (vs the 2-f32 carry) for memory+compute together, and
+pack the embedding/head.
 
 Source: "The Era of 1-bit LLMs: All Large Language Models are in 1.58 Bits"
 (Microsoft, 2024).

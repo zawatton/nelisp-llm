@@ -1,0 +1,70 @@
+;;; gpu-dp4a-test.el --- hardware int8 dot-product (DP4A / OpSDot) spike  -*- lexical-binding: t; -*-
+;; De-risks the compiler's OpSDot path (signed int type + DotProduct capability +
+;; SPV_KHR_integer_dot_product) and the f32-carried uint32 packing: four signed
+;; int8 lanes per uint32, carried as two 0..65535 f32 halves, dotted on the GPU.
+;; Compares against a CPU signed dot product.  Skips (exit 0) without Vulkan.
+;;   emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l test/gpu-dp4a-test.el
+(add-to-list 'load-path (expand-file-name "lisp"))
+(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+(require 'cl-lib)
+(require 'photon-tensor)
+(require 'nl-llm-gpu)
+(require 'nelisp-gpu-server)
+(require 'nl-llm-bitnet)
+
+(defvar dp--fail 0)
+(defun dp--ck (name ok &optional extra)
+  (princ (format "%-44s %s  %s\n" name (if ok "PASS" (progn (setq dp--fail (1+ dp--fail)) "FAIL")) (or extra ""))))
+(defun dp--i8 (k) "Deterministic int8 in [-127,127] from K." (- (mod (* (1+ k) 2654435761) 255) 127))
+(defun dp--u8 (v) (logand v 255))   ; int8 -> unsigned byte
+(defun dp--s8 (b) (if (>= b 128) (- b 256) b))  ; unsigned byte -> signed int8
+(defun dp--t (shape seed sc) (let ((n 1)) (dolist (d shape) (setq n (* n d)))
+  (photon-tensor shape (let ((v (make-vector n 0.0)) (i 0))
+    (while (< i n) (aset v i (* sc 2.0 (- (/ (float (mod (+ (* (1+ i) 2654435761) (* (1+ seed) 40503)) 65536)) 65536.0) 0.5))) (setq i (1+ i))) v))))
+
+(unless (nl-llm-gpu-enable)
+  (princ "NL-LLM-GPU-DP4A SKIP (no GPU server / Vulkan device)\n") (kill-emacs 0))
+
+(let* ((n 16)
+       (a (make-vector (* n 4) 0)) (b (make-vector (* n 4) 0))
+       (alo (make-vector n 0.0)) (ahi (make-vector n 0.0)) (blo (make-vector n 0.0)) (bhi (make-vector n 0.0)))
+  (dotimes (i n)
+    (dotimes (l 4)
+      (let ((av (dp--i8 (+ (* i 4) l))) (bv (dp--i8 (+ 1000 (* i 4) l))))
+        (aset a (+ (* i 4) l) av) (aset b (+ (* i 4) l) bv)))
+    (aset alo i (float (+ (dp--u8 (aref a (+ (* i 4) 0))) (* 256 (dp--u8 (aref a (+ (* i 4) 1)))))))
+    (aset ahi i (float (+ (dp--u8 (aref a (+ (* i 4) 2))) (* 256 (dp--u8 (aref a (+ (* i 4) 3)))))))
+    (aset blo i (float (+ (dp--u8 (aref b (+ (* i 4) 0))) (* 256 (dp--u8 (aref b (+ (* i 4) 1)))))))
+    (aset bhi i (float (+ (dp--u8 (aref b (+ (* i 4) 2))) (* 256 (dp--u8 (aref b (+ (* i 4) 3))))))))
+  (let* ((res (nelisp-gpu-server-run 'dp4a-dot (list alo ahi blo bhi (make-vector n 0.0))
+                                     (vector n) (/ (+ n 63) 64)))
+         (out (nth 4 res)) (ok t) (mx 0.0))
+    (dotimes (i n)
+      (let ((want 0))
+        (dotimes (l 4) (setq want (+ want (* (aref a (+ (* i 4) l)) (aref b (+ (* i 4) l))))))
+        (let ((got (round (aref out i))))
+          (setq mx (max mx (abs (- want got)))) (unless (= want got) (setq ok nil)))))
+    (dp--ck "GPU OpSDot int8x4 == CPU signed dot" ok (format "maxdiff=%.0f" mx)))
+  ;; (2) full DP4A matmul: bitlinear-dp4a == CPU int8 ternary forward
+  (let* ((seq 4) (in 17) (out 6) (sc 0.5)
+         (x (dp--t (list seq in) 1 sc)) (w (dp--t (list out in) 2 sc)) (bias (dp--t (list out) 3 0.1))
+         (bd (photon-tensor-data bias))
+         (pa (nl-llm-bitnet-pack-i8-act x)) (pw (nl-llm-bitnet-pack-i8-w w))
+         (alo2 (nth 0 pa)) (ahi2 (nth 1 pa)) (gamma (nth 2 pa)) (ng (nth 3 pa))
+         (wlo (nth 0 pw)) (whi (nth 1 pw)) (beta (nth 2 pw))
+         (gpu (nl-llm-bitnet-dp4a-linear x w bias)) (maxrel 0.0))
+    (nl-llm-gpu-disable)
+    (cl-flet ((lane (lo hi i) (let ((g (/ i 4)) (l (% i 4)))
+                                (dp--s8 (cond ((= l 0) (% (round (aref lo g)) 256)) ((= l 1) (/ (round (aref lo g)) 256))
+                                              ((= l 2) (% (round (aref hi g)) 256)) (t (/ (round (aref hi g)) 256)))))))
+      (dotimes (s seq) (dotimes (o out)
+        (let ((dot 0))
+          (dotimes (i in)
+            (let ((a8 (lane alo2 ahi2 (+ (* s ng 4) i))) (w8 (lane wlo whi (+ (* o ng 4) i))))
+              (setq dot (+ dot (* a8 w8)))))
+          (let ((want (+ (aref bd o) (* beta (aref gamma s) dot))) (got (aref gpu (+ (* s out) o))))
+            (setq maxrel (max maxrel (/ (abs (- want got)) (max 1e-3 (abs want))))))))))
+    (dp--ck "bitlinear-dp4a == CPU int8 ternary forward" (< maxrel 1e-5) (format "maxrel=%.2e" maxrel)))
+  (princ (format "NL-LLM-GPU-DP4A %s (%d failures)\n" (if (= dp--fail 0) "ALL-PASS" "HAS-FAILURES") dp--fail))
+  (kill-emacs (if (= dp--fail 0) 0 1)))
+;;; gpu-dp4a-test.el ends here

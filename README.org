@@ -357,8 +357,15 @@ packed forward equals the f32 ternary linear (maxrel 2.1e-7) at 8x less weight
 memory.  ~examples/bitnet-model.el~ wires packed weights through a whole-model
 decode: on a dim-128 / 6-block model the packed decode is bit-identical to the
 f32 ternary decode and the block-linear weight VRAM drops 8.0x (5760 -> 720 KB),
-6.9x for the whole model.  A true int8/DP4A path (compute, not just bandwidth) is
-future work (~docs/design/01-bitnet-ternary.org~).
+6.9x for the whole model.
+
+For *compute* (not just memory) the GTX 1060's hardware DP4A is used: the SPIR-V
+compiler emits =OpSDot= (signed int8x4 dot, =VK_KHR_shader_integer_dot_product=),
+four int8 lanes carried in two f32 halves (=lo + hi*65536=, no new dtype).  Kernel
+~bitlinear-dp4a~ (int8 activations + ternary weights) replaces =in= f32 MACs/row
+with =in/4= hardware =OpSDot=.  ~test/gpu-dp4a-test.el~ verifies it (OpSDot exact,
+matmul maxrel 9e-8) and ~examples/bench-dp4a.el~ measures *1.84x vs f32 dense,
+1.73x vs f32 ternary* on a resident-weight 1024x1024 matmul.
 
 *** Paged KV cache: PagedAttention
 

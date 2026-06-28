@@ -2,7 +2,7 @@
 EMACS ?= emacs
 PHOTON ?= ../nelisp-photon/lisp
 
-.PHONY: test compile clean train train-modern train-modern-full gpu-test gpu-train-test gpu-ag-test gpu-block-test gpu-moe-test gpu-stack-test gpu-window-test gpu-gather-test gpu-adam-test gpu-tie-test gpu-sched-test bench-gpu bench-gpu-train bench-ondevice train-stacked-gpu train-corpus-gpu generate-gpu train-full-gpu checkpoint-gpu train-big-gpu stream-decode spec-decode bitnet-model
+.PHONY: test compile clean train train-modern train-modern-full gpu-test gpu-train-test gpu-ag-test gpu-block-test gpu-moe-test gpu-stack-test gpu-window-test gpu-gather-test gpu-adam-test gpu-tie-test gpu-sched-test bench-gpu bench-gpu-train bench-ondevice train-stacked-gpu train-corpus-gpu generate-gpu train-full-gpu checkpoint-gpu train-big-gpu stream-decode spec-decode bitnet-model bench-dp4a
 
 test:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/arch-test.el
@@ -34,6 +34,7 @@ test:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-stream-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-bitnet-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-bitpack-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-dp4a-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-paged-spike-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-paged-test.el
 
@@ -92,6 +93,9 @@ spec-decode:
 
 bitnet-model:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l examples/bitnet-model.el
+
+bench-dp4a:
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l examples/bench-dp4a.el
 
 clean:
 	rm -f lisp/*.elc
