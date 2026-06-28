@@ -228,6 +228,17 @@ mask (each element 1/(1-p) with prob 1-p else 0, mean 1), and ~nlga-dropout~
 elementwise-multiplies it (gradient passes through the mask).  Refresh the mask
 per step with ~nlga-update~; ~test/dropout-test.el~ checks the mask statistics.
 
+*** Checkpoints (save / resume)
+
+~nl-llm-ckpt-save~ / ~nl-llm-ckpt-load~ persist a trained model -- config, step,
+and every tensor (embedding, blocks with biases, final gain, tied-head bias) --
+to a sexp file (photon-tensors are plain [shape data] vectors and floats
+round-trip exactly through prin1/read).  ~test/ckpt-test.el~ checks the round-trip
+is exact and a bad format tag is rejected; ~examples/checkpoint-gpu.el~ trains a
+model, saves it, STOPS the GPU, then reloads from disk, restarts the GPU and
+generates from the reloaded weights -- reproducing the passage 24/24, i.e. the
+model survives a full session-end / reload cycle.
+
 *** Full recipe in one run
 
 ~examples/train-full-gpu.el~ runs the whole recipe together: train a weight-tied
@@ -305,6 +316,7 @@ size, while on-device keeps everything resident and only moves the loss out.
 - ~lisp/nl-llm-block.el~    -- pre-norm block + model forward (GQA/MoE) + sampling
 - ~lisp/nl-llm-decode.el~   -- KV-cache incremental decode (CPU; biases, tied head)
 - ~lisp/nl-llm-gpu-decode.el~ -- on-GPU KV-cache decode (resident cache, runtime pos)
+- ~lisp/nl-llm-ckpt.el~      -- checkpoint save / load (config, step, all tensors)
 - ~lisp/nl-llm-autograd.el~ -- reverse-mode backward for all of the above
 - ~lisp/nl-llm-gpu.el~      -- GPU backend wiring (enable / invalidate)
 - ~lisp/nl-llm-gpu-train.el~ -- on-device (resident) training step + SGD (MLP)
@@ -319,6 +331,7 @@ size, while on-device keeps everything resident and only moves the loss out.
 - ~examples/train-corpus-gpu.el~  -- on-device training over a whole corpus
 - ~examples/generate-gpu.el~      -- train on-device, then autoregressively generate
 - ~examples/train-full-gpu.el~    -- full recipe: corpus + clip + dropout + sampling
+- ~examples/checkpoint-gpu.el~    -- train, save, restart, reload, generate
 
 * Run
 
