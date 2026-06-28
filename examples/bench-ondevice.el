@@ -1,0 +1,93 @@
+;;; bench-ondevice.el --- on-device vs host-driven training, at scale  -*- lexical-binding: t; -*-
+;; Times one training step of the SAME 1-block model (RMSNorm + GQA/RoPE +
+;; SwiGLU + LM head, cross-entropy) three ways, at growing dim/seq:
+;;   CPU        : photon-autograd (nl-llm-ag-block) on the pure-elisp backend
+;;   host GPU   : same, on the GPU backend; in-place SGD forces a weight
+;;                re-upload each step (nl-llm-gpu-invalidate)
+;;   on-device  : the resident-autograd builder (compiled batch, fused attention,
+;;                all weights resident, on-device SGD)
+;; and prints a table with the on-device speedups, to show how the advantage
+;; grows with model size.
+;;   emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l examples/bench-ondevice.el
+(add-to-list 'load-path (expand-file-name "lisp"))
+(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+(require 'cl-lib)
+(require 'photon-tensor)
+(require 'photon-autograd)
+(require 'nl-llm-autograd)
+(require 'nl-llm-gpu)
+(require 'nl-llm-gpu-ag)
+
+(defun bo--t (shape seed sc) (let ((n 1)) (dolist (d shape) (setq n (* n d)))
+  (photon-tensor shape (let ((v (make-vector n 0.0)) (i 0))
+    (while (< i n) (aset v i (* sc 2.0 (- (/ (float (mod (+ (* (1+ i) 2654435761) (* (1+ seed) 40503)) 65536)) 65536.0) 0.5))) (setq i (1+ i))) v))))
+(defun bo--ones (n) (photon-tensor (list n) (make-vector n 1.0)))
+(defun bo--zeros (sh) (let ((n 1)) (dolist (d sh) (setq n (* n d))) (photon-tensor sh (make-vector n 0.0))))
+(defun bo--cp (tn) (photon-tensor (photon-tensor-shape tn) (copy-sequence (photon-tensor-data tn))))
+(defmacro bo--ms (&rest body) `(let ((t0 (float-time))) ,@body (* 1000.0 (- (float-time) t0))))
+
+(defun bo--mkblk (dim kvdim ff sc)
+  (list :ln1g (bo--ones dim) :wq (bo--t (list dim dim) 2 sc) :bq (bo--zeros (list dim))
+        :wk (bo--t (list kvdim dim) 3 sc) :bk (bo--zeros (list kvdim))
+        :wv (bo--t (list kvdim dim) 4 sc) :bv (bo--zeros (list kvdim))
+        :wo (bo--t (list dim dim) 5 sc) :bo (bo--zeros (list dim)) :ln2g (bo--ones dim)
+        :wg (bo--t (list ff dim) 6 sc) :bg (bo--zeros (list ff))
+        :wu (bo--t (list ff dim) 7 sc) :bu (bo--zeros (list ff))
+        :wd (bo--t (list dim ff) 8 sc) :bd (bo--zeros (list dim))))
+
+;; host autograd path (cpu or gpu backend); returns ms/step over STEPS
+(defun bo--host (x0 blk0 lnfg0 wh0 bh0 heads kvh targets lr steps gpu)
+  (let* ((P (lambda (tn) (photon-autograd-const (bo--cp tn))))
+         (xc (funcall P x0))
+         (blk (let ((o nil) (kv blk0)) (while kv (push (car kv) o) (push (funcall P (cadr kv)) o) (setq kv (cddr kv))) (nreverse o)))
+         (lnfgc (funcall P lnfg0)) (whc (funcall P wh0)) (bhc (funcall P bh0))
+         (params (append (let ((o nil) (kv blk)) (while kv (push (cadr kv) o) (setq kv (cddr kv))) (nreverse o)) (list lnfgc whc bhc))))
+    (bo--ms
+     (let ((s 0)) (while (< s steps)
+       (photon-autograd-reset-tape)
+       (let* ((x2 (nl-llm-ag-block xc blk heads kvh)) (xf (nl-llm-ag-rmsnorm x2 lnfgc))
+              (logits (photon-autograd-linear xf whc bhc)) (loss (photon-autograd-softmax-ce logits targets)))
+         (photon-autograd-zero-grad params) (photon-autograd-backward loss) (photon-autograd-sgd params lr)
+         (when gpu (nl-llm-gpu-invalidate params)))
+       (setq s (1+ s)))))))
+
+;; on-device path; returns ms/step (steady state: skip step 0)
+(defun bo--ondevice (x0 blk0 lnfg0 wh0 bh0 heads kvh seq dim onehot mask tables scl lr steps)
+  (let* ((b (nlga-new)) (wb (lambda (bt) (let ((o nil) (kv bt)) (while kv (push (car kv) o) (push (nlga-param b (bo--cp (cadr kv))) o) (setq kv (cddr kv))) (nreverse o))))
+         (xr (nlga-const b (bo--cp x0))) (g0 (funcall wb blk0))
+         (lnfgr (nlga-param b (bo--cp lnfg0))) (whr (nlga-param b (bo--cp wh0))) (bhr (nlga-param b (bo--cp bh0)))
+         (cosr (nlga-const b (car tables))) (sinr (nlga-const b (cdr tables)))
+         (sp (nlga-scalar b 1.0)) (sn (nlga-scalar b -1.0)) (sc (nlga-scalar b scl)) (one (nlga-scalar b 1.0))
+         (maskr (nlga-const b mask)) (ohr (nlga-const b onehot)) (lrr (nlga-scalar b lr))
+         (x2 (nlga-block b xr g0 heads kvh cosr sinr sp sn sc maskr))
+         (xf (nlga-rmsnorm b x2 lnfgr)) (logits (nlga-linear b xf whr bhr)))
+    (nlga-keep b logits one) (nlga-seed-ce b logits ohr) (nlga-finish b lrr) (nlga-compile b)
+    (nlga-step b)                                   ; warm-up (step 0)
+    (prog1 (/ (bo--ms (let ((s 1)) (while (< s steps) (nlga-step b) (setq s (1+ s))))) (1- steps))
+      (nlga-free b))))
+
+(let ((have (nl-llm-gpu-enable)) (lr 0.05) (S 3))
+  (photon-tensor-use-cpu-backend)
+  (unless have (princ "(no GPU)\n"))
+  (princ (format "%-16s %10s %10s %12s %9s %9s\n" "config" "CPU ms" "hGPU ms" "ondev ms" "vs CPU" "vs hGPU"))
+  (dolist (cfg '((128 32 4 2) (256 32 8 4) (256 64 8 4)))
+    (let* ((dim (nth 0 cfg)) (seq (nth 1 cfg)) (heads (nth 2 cfg)) (kvh (nth 3 cfg))
+           (hd (/ dim heads)) (kvdim (* kvh hd)) (ff (* 4 dim)) (vocab 256)
+           (sc (/ 1.0 (sqrt (float dim)))) (scl (/ 1.0 (sqrt (float hd))))
+           (x (bo--t (list seq dim) 1 sc)) (blk (bo--mkblk dim kvdim ff sc))
+           (lnfg (bo--ones dim)) (wh (bo--t (list vocab dim) 9 sc)) (bh (bo--zeros (list vocab)))
+           (targets (let ((v (make-vector seq 0))) (dotimes (i seq) (aset v i (% (* (1+ i) 7) vocab))) v))
+           (onehot (let ((v (make-vector (* seq vocab) 0.0))) (dotimes (i seq) (aset v (+ (* i vocab) (aref targets i)) 1.0)) (photon-tensor (list seq vocab) v)))
+           (mask (let ((md (make-vector (* seq seq) 0.0)) (i 0)) (while (< i seq) (let ((j (1+ i))) (while (< j seq) (aset md (+ (* i seq) j) -1.0e30) (setq j (1+ j)))) (setq i (1+ i))) (photon-tensor (list seq seq) md)))
+           (tables (nl-llm-gpu-rope-tables seq hd)) (tag (format "d%d s%d h%d" dim seq heads)))
+      (photon-tensor-use-cpu-backend)
+      (let ((cpu (/ (bo--host x blk lnfg wh bh heads kvh targets lr S nil) S)))
+        (if (not have)
+            (princ (format "%-16s %10.1f %10s %12s %9s %9s\n" tag cpu "-" "-" "-" "-"))
+          (photon-tensor-use-gpu-backend)
+          (let ((hgpu (/ (bo--host x blk lnfg wh bh heads kvh targets lr S t) S)))
+            (let ((ond (bo--ondevice x blk lnfg wh bh heads kvh seq dim onehot mask tables scl lr (+ S 1))))
+              (princ (format "%-16s %10.1f %10.1f %12.1f %8.1fx %8.1fx\n" tag cpu hgpu ond (/ cpu ond) (/ hgpu ond)))))))))
+  (when have (nl-llm-gpu-disable)))
+(princ "BENCH-ONDEVICE done\n")
+;;; bench-ondevice.el ends here

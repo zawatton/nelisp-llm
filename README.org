@@ -179,6 +179,24 @@ laid out (heads*seq) x seq so the existing row-softmax applies directly),
 is constant in the number of heads instead of growing with it.  Bit-for-bit the
 same math (the block/MoE/stack tests still match CPU autograd to f32).
 
+*** Scaling: on-device vs host-driven training
+
+Per training step of one full block (RMSNorm + GQA/RoPE + SwiGLU + head, GTX
+1060, ~make bench-ondevice~), comparing the on-device stack (compiled batch,
+fused attention, all weights resident, on-device SGD) against the host-driven
+paths (photon-autograd on the CPU, and on the GPU backend with a per-step weight
+re-upload):
+
+| model          | CPU ms | host-GPU ms | on-device ms | vs CPU | vs host-GPU |
+|----------------+--------+-------------+--------------+--------+-------------|
+| dim 128 seq 32 |   7905 |        5057 |         44.4 |  178x  |   114x      |
+| dim 256 seq 32 |  29041 |       15966 |         73.1 |  397x  |   218x      |
+| dim 256 seq 64 |  57933 |       19590 |         86.5 |  670x  |   226x      |
+
+The on-device advantage *grows* with model size (178x -> 670x vs CPU): the host
+paths are dominated by elisp marshalling that scales with the weight/activation
+size, while on-device keeps everything resident and only moves the loss out.
+
 * Layout
 
 - ~lisp/nl-llm-arch.el~     -- core primitives (RMSNorm, RoPE, SiLU, SwiGLU)
@@ -193,7 +211,8 @@ same math (the block/MoE/stack tests still match CPU autograd to f32).
 - ~examples/train-modern.el~      -- train a single-head RMSNorm/RoPE/SwiGLU block
 - ~examples/train-modern-full.el~ -- train the full block (multi-head GQA + MoE)
 - ~examples/bench-gpu.el~         -- CPU vs GPU forward/training timing table
-- ~examples/bench-gpu-train.el~   -- on-device vs host-driven training timing
+- ~examples/bench-gpu-train.el~   -- on-device vs host-driven training timing (MLP)
+- ~examples/bench-ondevice.el~    -- on-device vs host-driven, full block, at scale
 - ~examples/train-stacked-gpu.el~ -- train a multi-block model on-device
 - ~examples/train-corpus-gpu.el~  -- on-device training over a whole corpus
 
