@@ -84,7 +84,7 @@
          (logits (nlga-linear b xf whr bhr))
          (lout (nlga-keep b logits oner)))
     (nlga-seed-ce b logits ohr)
-    (nlga-finish b lrr)
+    (nlga-finish b lrr) (nlga-compile b)   ; exercise the compiled (re-submit) path
     (let ((s 0))
       (while (< s steps)
         (let ((ld (nth lout (nlga-step b))))

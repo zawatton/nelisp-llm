@@ -80,7 +80,7 @@
          (maskr (nlga-const b mask)) (ohtgt (nlga-const b oh-tgt)) (lrr (nlga-scalar b lr))
          (logits (nlga-model b oh wter (list g0 g1) lnfgr whr bhr heads kvh cosr sinr sposr snegr sclr maskr))
          (lout (nlga-keep b logits oner)))
-    (nlga-seed-ce b logits ohtgt) (nlga-finish b lrr)
+    (nlga-seed-ce b logits ohtgt) (nlga-finish b lrr) (nlga-compile b)
     (let ((s 0)) (while (< s steps) (push (gs--ce (nth lout (nlga-step b)) seq vocab targets) gpu-losses) (setq s (1+ s))))
     (nlga-free b))
   (setq gpu-losses (nreverse gpu-losses))

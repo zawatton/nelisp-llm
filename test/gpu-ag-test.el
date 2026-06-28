@@ -46,7 +46,7 @@
          (h1 (nlga-linear b xr w1r b1r)) (a (nlga-gelu b h1)) (y (nlga-linear b a w2r b2r))
          (yout (nlga-keep b y oner)))
     (nlga-seed-mse b y tr invr)
-    (nlga-finish b lrr)
+    (nlga-finish b lrr) (nlga-compile b)   ; exercise the compiled (re-submit) path
     (let ((s 0))
       (while (< s steps)
         (let* ((outs (nlga-step b)) (yv (nth yout outs)) (acc 0.0) (i 0))

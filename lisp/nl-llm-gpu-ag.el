@@ -24,7 +24,7 @@
 (defsubst nlga--g (n) (/ (+ n 63) 64))
 
 (cl-defstruct (nlga (:constructor nlga--make))
-  (slots nil) (nslot 0) (disp nil) (bwd nil) (params nil) (nout 0))
+  (slots nil) (nslot 0) (disp nil) (bwd nil) (params nil) (nout 0) (compiled nil))
 (cl-defstruct (nlga-rt (:constructor nlga-rt--make)) slot rows cols grad)
 (defsubst nlga-rt-size (x) (* (nlga-rt-rows x) (nlga-rt-cols x)))
 
@@ -384,9 +384,20 @@ LR is a resident scalar rt.  Call after the forward + loss seed are built."
     (let* ((rt (plist-get p :rt)) (n (nlga-rt-size rt)) (gs (nlga--grad b rt)))
       (nlga--d b (list 'sgd (list (nlga-rt-slot rt) gs (nlga-rt-slot lr)) (list n) (nlga--g n))))))
 
+(defun nlga-compile (b)
+  "Compile the assembled batch into a persistent command buffer on the server.
+Subsequent `nlga-step' calls then just re-submit it (the graph is fixed across
+training steps; only resident weights change in place), avoiding per-step
+protocol re-send / buffer alloc / descriptor rebuild.  Call after `nlga-finish'."
+  (setf (nlga-compiled b)
+        (nelisp-gpu-server-compile (reverse (nlga-slots b)) (reverse (nlga-disp b)))))
+
 (defun nlga-step (b)
-  "Run the assembled batch once (one training step); return the out vectors."
-  (nelisp-gpu-server-batch (reverse (nlga-slots b)) (reverse (nlga-disp b))))
+  "Run the assembled batch once (one training step); return the out vectors.
+Uses the compiled command buffer when `nlga-compile' has been called."
+  (if (nlga-compiled b)
+      (nelisp-gpu-server-run-compiled (car (nlga-compiled b)) (cdr (nlga-compiled b)))
+    (nelisp-gpu-server-batch (reverse (nlga-slots b)) (reverse (nlga-disp b)))))
 
 (defun nlga-readback (b)
   "Copy each parameter's trained resident buffer back into its host tensor."
@@ -400,7 +411,10 @@ LR is a resident scalar rt.  Call after the forward + loss seed are built."
       (while (< i n) (aset dst i (aref v i)) (setq i (1+ i))))))
 
 (defun nlga-free (b)
-  "Free all resident handles uploaded for parameters."
+  "Free the compiled batch (if any) and all resident parameter handles."
+  (when (nlga-compiled b)
+    (ignore-errors (nelisp-gpu-server-free-compiled (car (nlga-compiled b))))
+    (setf (nlga-compiled b) nil))
   (dolist (p (nlga-params b)) (ignore-errors (nelisp-gpu-server-free (plist-get p :handle)))))
 
 (provide 'nl-llm-gpu-ag)

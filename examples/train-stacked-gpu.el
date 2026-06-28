@@ -58,7 +58,7 @@
            (maskr (nlga-const b mask)) (ohtgt (nlga-const b oh-tgt)) (lrr (nlga-scalar b lr))
            (logits (nlga-model b oh wter blks lnfgr whr bhr heads kvh cosr sinr sposr snegr sclr maskr))
            (lout (nlga-keep b logits oner)) (losses nil) (t0 nil) (tn nil))
-      (nlga-seed-ce b logits ohtgt) (nlga-finish b lrr)
+      (nlga-seed-ce b logits ohtgt) (nlga-finish b lrr) (nlga-compile b)
       (princ (format "stacked model on-device: blocks=%d dim=%d heads=%d kv=%d ff=%d seq=%d vocab=%d\n"
                      nblocks dim heads kvh ff seq vocab))
       (let ((s 0))

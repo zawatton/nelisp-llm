@@ -121,8 +121,21 @@ resident ~wte~, so the embedding is trained by the matmul backward), stacks N
 blocks, then RMSNorm + head.  ~test/gpu-stack-test.el~ checks a 2-block model
 (dense block + MoE block) with a trainable embedding matches the CPU autograd
 reference to f32 (maxrel < 1e-7); ~examples/train-stacked-gpu.el~ trains a
-2-block dim-64 model on public-domain text (loss 5.75 -> 0.04, ~115 ms/step on
-a GTX 1060, forward + backward + SGD all resident).
+2-block dim-64 model on public-domain text (loss 5.75 -> 0.04, forward +
+backward + SGD all resident).
+
+*** Compiled batches (record once, re-submit)
+
+During a training loop the graph (slots + dispatches) is *identical* every step
+-- only the resident weight buffers change in place.  ~nlga-compile~ records the
+whole fused command buffer once on the server (~OP_COMPILE~): it allocates the
+tmp/grad buffers once, binds the resident weights, records every dispatch with a
+GPU-side ~vkCmdFillBuffer~ zeroing of the tmp/grad buffers up front, and returns
+a handle.  Each subsequent ~nlga-step~ just re-submits that command buffer
+(~OP_RUN_COMPILED~) -- no per-step protocol re-send, buffer allocation, or
+descriptor rebuild.  This is bit-identical to the per-step batch path (max loss
+diff 0) and ~10x faster: on the 2-block dim-64 model the GPU per-step time drops
+from ~108 ms to ~11 ms on a GTX 1060.
 
 * Layout
 
