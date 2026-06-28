@@ -10,6 +10,7 @@ test:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/moe-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/block-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/autograd-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/sample-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-train-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-ag-test.el

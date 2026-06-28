@@ -44,5 +44,29 @@ MODEL holds :wte (vocab x dim), :blocks (list), :lnf (final RMSNorm gain),
     (photon-tensor-linear (nl-llm-rmsnorm x (plist-get model :lnf))
                           (plist-get model :head))))
 
+;;;###autoload
+(defun nl-llm-sample (logits base vocab &optional temp topk)
+  "Sample a token id from LOGITS[BASE .. BASE+VOCAB) with TEMP (default 1.0) and
+TOP-K (default 0 = keep all).  Temperature scales the logits, top-k keeps only
+the K largest before softmax, then a categorical draw is taken.  TEMP at/near 0
+or TOP-K = 1 reduces to greedy argmax.  Uses the global RNG -- seed with
+`(random \"...\")' for reproducibility."
+  (let* ((tp (max 1.0e-6 (or temp 1.0))) (k (or topk 0))
+         (lg (make-vector vocab 0.0)) (i 0))
+    (while (< i vocab) (aset lg i (/ (aref logits (+ base i)) tp)) (setq i (1+ i)))
+    (when (and (> k 0) (< k vocab))
+      (let* ((thresh (nth (1- k) (sort (append lg nil) #'>))) (j 0))
+        (while (< j vocab) (when (< (aref lg j) thresh) (aset lg j -1.0e30)) (setq j (1+ j)))))
+    (let ((mx -1.0e30) (j 0))
+      (while (< j vocab) (when (> (aref lg j) mx) (setq mx (aref lg j))) (setq j (1+ j)))
+      (let ((s 0.0) (j2 0))
+        (while (< j2 vocab) (aset lg j2 (exp (- (aref lg j2) mx))) (setq s (+ s (aref lg j2))) (setq j2 (1+ j2)))
+        (let ((r (* s (/ (float (random 1000000)) 1000000.0))) (acc 0.0) (j3 0) (pick (1- vocab)) (done nil))
+          (while (and (< j3 vocab) (not done))
+            (setq acc (+ acc (aref lg j3)))
+            (when (> acc r) (setq pick j3 done t))
+            (setq j3 (1+ j3)))
+          pick)))))
+
 (provide 'nl-llm-block)
 ;;; nl-llm-block.el ends here

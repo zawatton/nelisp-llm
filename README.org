@@ -225,9 +225,16 @@ forward-only and reuses the CPU autograd forward (the same model the on-device
 path trained).  On a tiny model (2 blocks, dim 64) that memorises one window, it
 reproduces the learned text exactly:
 
-: prompt    : "In another momen"
-: generated : "In another moment down went Alice after it, never"
-: token match: 24/24  continuation reproduced
+: prompt        : "In another momen"
+: greedy        : "In another moment down went Alice after it, never"
+: sampled(T0.7) : "In another moment down went Alice after it, never"
+: greedy match  : 24/24  reproduced
+
+Decoding supports both greedy (argmax) and temperature / top-k sampling
+(~nl-llm-sample~: temperature scale -> top-k mask -> softmax -> categorical draw;
+T->0 or top-k=1 reduce to greedy).  ~test/sample-test.el~ checks the sampler
+deterministically (seeded RNG): top-k restricts the support, temperature->0 is
+argmax, a peaked logit is the mode, a uniform one spreads.
 
 *** Scaling: on-device vs host-driven training
 
