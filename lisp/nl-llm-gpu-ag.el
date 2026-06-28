@@ -329,6 +329,16 @@ feed-forward: either (:router :brouter :experts :top-k) for MoE, or
                              (plist-get blk :wd) (plist-get blk :bd)))))
     (nlga-add b x1 ffn)))
 
+(defun nlga-model (b onehot wte blks lnfg wh bh heads kvheads cosr sinr spos sneg scl mask)
+  "Stacked model: embed (ONEHOT (seq x vocab) @ WTE (vocab x dim)) -> each block
+in BLKS -> final RMSNorm (LNFG) -> linear head (WH, BH).  Returns the logits rt.
+Embedding is a matmul against a one-hot token matrix, so WTE is a normal
+resident parameter trained on-device by the matmul backward."
+  (let ((x (nlga-matmul b onehot wte)))
+    (dolist (blk blks)
+      (setq x (nlga-block b x blk heads kvheads cosr sinr spos sneg scl mask)))
+    (nlga-linear b (nlga-rmsnorm b x lnfg) wh bh)))
+
 ;; RoPE cos/sin tables (seq x hd/2), row-major by (position, pair).
 (defun nl-llm-gpu-rope-tables (seq hd &optional base)
   "Return (cos-tensor . sin-tensor), each (seq x hd/2), for RoPE."

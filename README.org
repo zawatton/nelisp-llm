@@ -116,6 +116,14 @@ differentiated.  New backward kernels added for the block:
 ~rmsnorm-istd/-fwd/-dx/-dgamma~, ~rope-apply~, ~silu~ / ~silu-bwd~, ~mul~,
 ~softmax-bwd~, ~ce-grad~, and for MoE ~topk-mask~ / ~scale-rows~ / ~rowdot~.
 
+A whole stacked model trains on-device too: ~nlga-model~ embeds (a one-hot @ a
+resident ~wte~, so the embedding is trained by the matmul backward), stacks N
+blocks, then RMSNorm + head.  ~test/gpu-stack-test.el~ checks a 2-block model
+(dense block + MoE block) with a trainable embedding matches the CPU autograd
+reference to f32 (maxrel < 1e-7); ~examples/train-stacked-gpu.el~ trains a
+2-block dim-64 model on public-domain text (loss 5.75 -> 0.04, ~115 ms/step on
+a GTX 1060, forward + backward + SGD all resident).
+
 * Layout
 
 - ~lisp/nl-llm-arch.el~     -- core primitives (RMSNorm, RoPE, SiLU, SwiGLU)
@@ -131,6 +139,7 @@ differentiated.  New backward kernels added for the block:
 - ~examples/train-modern-full.el~ -- train the full block (multi-head GQA + MoE)
 - ~examples/bench-gpu.el~         -- CPU vs GPU forward/training timing table
 - ~examples/bench-gpu-train.el~   -- on-device vs host-driven training timing
+- ~examples/train-stacked-gpu.el~ -- train a multi-block model on-device
 
 * Run
 
