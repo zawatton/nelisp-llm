@@ -35,6 +35,7 @@ test:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-bitnet-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-bitpack-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-dp4a-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-bitnet-dp4a-model-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-paged-spike-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-paged-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-paged-v-test.el

@@ -368,7 +368,10 @@ matmul maxrel 9e-8) and ~examples/bench-dp4a.el~ measures *1.84x vs f32 dense,
 1.73x vs f32 ternary* on a resident-weight 1024x1024 matmul.  ~bitlinear-dp4a-1f~
 packs four int8 lanes into ONE f32 (uploaded verbatim, bit-cast back in-kernel via
 =OpBitcast=) for 1 byte/weight (4x less than f32) *and* DP4A -- memory and compute
-together (~test/gpu-dp4a-test.el~, maxrel 9e-8).
+together (~test/gpu-dp4a-test.el~, maxrel 9e-8).  ~nl-llm-bitnet-dp4a-decode-step~
+wires it through a whole-model decode (every block linear via DP4A);
+~test/gpu-bitnet-dp4a-model-test.el~ matches a CPU int8-ternary reference (maxrel
+1e-5) at 4x less block-linear weight VRAM.
 
 *** Paged KV cache: PagedAttention
 

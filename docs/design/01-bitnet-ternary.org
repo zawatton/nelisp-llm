@@ -44,7 +44,15 @@ bit-casts it back to a uint32 in-kernel (compiler =bitcast-u= -> =OpBitcast=) be
 =OpSDot= -- 1 byte/weight (4x less than f32) AND DP4A, vs the 2-f32 carry's 2
 bytes/weight.  =test/gpu-dp4a-test.el= confirms it matches the CPU int8 ternary
 forward (maxrel 9e-8), i.e. the packed-bits f32 (often a NaN pattern) survives
-OpLoad + OpBitcast on the NVIDIA driver.  Remaining: pack the embedding/head.
+OpLoad + OpBitcast on the NVIDIA driver.
+
+DP4A is also wired through a whole-model decode: =nl-llm-bitnet-dp4a-pack-block=
+uploads each block linear's 1-f32 packed weight resident once and
+=nl-llm-bitnet-dp4a-decode-step= runs every linear via =bitlinear-dp4a-1f=
+(activations int8-quantized per token).  =test/gpu-bitnet-dp4a-model-test.el=
+matches a CPU int8-activation / ternary-weight reference (reusing the shared
+=nl-llm-bitnet--blk= glue) to maxrel 1e-5 over a decode, at 4x less block-linear
+weight VRAM (1 byte/weight).  Remaining: pack the embedding/head.
 
 Source: "The Era of 1-bit LLMs: All Large Language Models are in 1.58 Bits"
 (Microsoft, 2024).

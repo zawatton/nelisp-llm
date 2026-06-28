@@ -103,25 +103,17 @@ Returns the flat (out) result vector."
                   (copy-sequence (photon-tensor-data bias)) (vector beta) (make-vector out 0.0))
             (vector 1 in out pk fcount) (/ (+ out 63) 64)))))
 
-(defun nl-llm-bitnet--swiglu (x pblk)
-  (let* ((g (nl-llm-bitnet--run1 x (plist-get pblk :wg) (plist-get pblk :bg)))
-         (u (nl-llm-bitnet--run1 x (plist-get pblk :wu) (plist-get pblk :bu)))
-         (sd (photon-tensor-data (nl-llm-silu (photon-tensor (list 1 (length g)) g))))
-         (h (make-vector (length g) 0.0)))
-    (dotimes (i (length g)) (aset h i (* (aref sd i) (aref u i))))
-    (nl-llm-bitnet--run1 (photon-tensor (list 1 (length h)) h) (plist-get pblk :wd) (plist-get pblk :bd))))
-
-;;;###autoload
-(defun nl-llm-bitnet-decode-block (xrow pblk cache &optional rope-base)
-  "Like `nl-llm-decode-block' but every linear runs through the packed
-ternary-weight kernel.  PBLK is a `nl-llm-bitnet-pack-block' result."
+(defun nl-llm-bitnet--blk (xrow pblk cache linfn &optional rope-base)
+  "One pre-norm block with every linear routed through LINFN (a fn of XROW, the
+block's weight spec, and the bias row).  Shared by the packed (`nl-llm-bitnet--run1')
+and DP4A (`nl-llm-bitnet--dp4a-run1') whole-model decoders."
   (let* ((dim (nl-llm-dcache-dim cache)) (heads (nl-llm-dcache-heads cache)) (kvh (nl-llm-dcache-kvh cache))
          (hd (/ dim heads)) (kvdim (nl-llm-dcache-kvdim cache)) (grp (/ heads kvh))
          (pos (nl-llm-dcache-len cache)) (base (or rope-base 10000.0)) (scale (/ 1.0 (sqrt (float hd))))
          (a (nl-llm-rmsnorm xrow (plist-get pblk :ln1g)))
-         (qr (nl-llm-bitnet--run1 a (plist-get pblk :wq) (plist-get pblk :bq)))
-         (kr (nl-llm-bitnet--run1 a (plist-get pblk :wk) (plist-get pblk :bk)))
-         (vr (nl-llm-bitnet--run1 a (plist-get pblk :wv) (plist-get pblk :bv)))
+         (qr (funcall linfn a (plist-get pblk :wq) (plist-get pblk :bq)))
+         (kr (funcall linfn a (plist-get pblk :wk) (plist-get pblk :bk)))
+         (vr (funcall linfn a (plist-get pblk :wv) (plist-get pblk :bv)))
          (kc (nl-llm-dcache-k cache)) (vc (nl-llm-dcache-v cache)) (out (make-vector dim 0.0)))
     (nl-llm--rope-heads qr 0 heads hd pos base)
     (nl-llm--rope-heads kr 0 kvh hd pos base)
@@ -138,11 +130,23 @@ ternary-weight kernel.  PBLK is a `nl-llm-bitnet-pack-block' result."
           (let ((t0 0)) (while (< t0 hd)
             (let ((acc 0.0) (j 0)) (while (<= j pos) (setq acc (+ acc (* (/ (aref scores j) sm) (aref vc (+ (* j kvdim) c0k t0))))) (setq j (1+ j)))
               (aset out (+ c0q t0) acc)) (setq t0 (1+ t0)))))))
-    (let* ((attn (nl-llm-bitnet--run1 (photon-tensor (list 1 dim) out) (plist-get pblk :wo) (plist-get pblk :bo)))
+    (let* ((attn (funcall linfn (photon-tensor (list 1 dim) out) (plist-get pblk :wo) (plist-get pblk :bo)))
            (x1 (photon-tensor-add xrow (photon-tensor (list 1 dim) attn)))
            (bnorm (nl-llm-rmsnorm x1 (plist-get pblk :ln2g)))
-           (sw (nl-llm-bitnet--swiglu bnorm pblk)))
-      (photon-tensor-add x1 (photon-tensor (list 1 dim) sw)))))
+           (g (funcall linfn bnorm (plist-get pblk :wg) (plist-get pblk :bg)))
+           (u (funcall linfn bnorm (plist-get pblk :wu) (plist-get pblk :bu)))
+           (sd (photon-tensor-data (nl-llm-silu (photon-tensor (list 1 (length g)) g))))
+           (hh (make-vector (length g) 0.0)))
+      (dotimes (i (length g)) (aset hh i (* (aref sd i) (aref u i))))
+      (photon-tensor-add x1 (photon-tensor (list 1 dim)
+                                           (funcall linfn (photon-tensor (list 1 (length hh)) hh)
+                                                    (plist-get pblk :wd) (plist-get pblk :bd)))))))
+
+;;;###autoload
+(defun nl-llm-bitnet-decode-block (xrow pblk cache &optional rope-base)
+  "Pre-norm block with every linear via the base-4 packed ternary kernel.  PBLK is
+a `nl-llm-bitnet-pack-block' result."
+  (nl-llm-bitnet--blk xrow pblk cache #'nl-llm-bitnet--run1 rope-base))
 
 ;;;###autoload
 (defun nl-llm-bitnet-decode-step (token pblocks caches wte lnfg bh dim &optional rope-base)
@@ -279,6 +283,59 @@ Returns (WP-U32 BETA NG): WP-U32 is (out*NG) uint32 words."
                          (cons 'in (nth 1 pa)) (cons 'out (* seq out)))
                    (list seq out ng) (/ (+ (* seq out) 63) 64)))
       (nelisp-gpu-server-free hap) (nelisp-gpu-server-free hwp))))
+
+;; --- whole-model DP4A decode (every block linear via bitlinear-dp4a-1f) -------
+(defun nl-llm-bitnet-dp4a-pack-block (blk)
+  "Pack a block's seven linear weights into the DP4A 1-f32 form and upload them
+RESIDENT (once).  Each weight key becomes (WHANDLE BETA NG IN OUT) for
+`nl-llm-bitnet--dp4a-run1'; biases and norms pass through.  Free with
+`nl-llm-bitnet-dp4a-free-blocks'."
+  (let ((o nil) (kv blk))
+    (while kv
+      (let ((key (car kv)) (val (cadr kv)))
+        (if (memq key '(:wq :wk :wv :wo :wg :wu :wd))
+            (let* ((sh (photon-tensor-shape val)) (out (car sh)) (in (nth 1 sh))
+                   (pw (nl-llm-bitnet-pack-i8-w-1f val)) (h (nelisp-gpu-server-upload-u32 (nth 0 pw))))
+              (push key o) (push (list h (nth 1 pw) (nth 2 pw) in out) o))
+          (push key o) (push val o)))
+      (setq kv (cddr kv)))
+    (nreverse o)))
+
+(defun nl-llm-bitnet-dp4a-free-blocks (pblocks)
+  "Free the resident weight handles held by DP4A-packed PBLOCKS."
+  (dolist (blk pblocks)
+    (let ((kv blk))
+      (while kv (when (memq (car kv) '(:wq :wk :wv :wo :wg :wu :wd))
+                  (ignore-errors (nelisp-gpu-server-free (car (cadr kv))))) (setq kv (cddr kv))))))
+
+(defun nl-llm-bitnet--dp4a-run1 (xrow wspec bias)
+  "One-row DP4A linear: int8-quantize XROW (1 x in), DP4A against the RESIDENT
+ternary weight in WSPEC = (WHANDLE BETA NG IN OUT).  Returns the flat (out)."
+  (let* ((whandle (nth 0 wspec)) (beta (nth 1 wspec)) (ng (nth 2 wspec)) (out (nth 4 wspec))
+         (pa (nl-llm-bitnet-pack-i8-act-1f xrow)) (hap (nelisp-gpu-server-upload-u32 (nth 0 pa))))
+    (prog1 (nth 0 (nelisp-gpu-server-run2 'bitlinear-dp4a-1f
+                   (list (list 'res hap ng) (list 'res whandle (* out ng))
+                         (cons 'in (copy-sequence (photon-tensor-data bias))) (cons 'in (vector beta))
+                         (cons 'in (nth 1 pa)) (cons 'out out))
+                   (list 1 out ng) (/ (+ out 63) 64)))
+      (nelisp-gpu-server-free hap))))
+
+;;;###autoload
+(defun nl-llm-bitnet-dp4a-decode-block (xrow pblk cache &optional rope-base)
+  "Pre-norm block with every linear via hardware DP4A (1-f32 packed int8 weights +
+int8 activations).  PBLK is a `nl-llm-bitnet-dp4a-pack-block' result."
+  (nl-llm-bitnet--blk xrow pblk cache #'nl-llm-bitnet--dp4a-run1 rope-base))
+
+;;;###autoload
+(defun nl-llm-bitnet-dp4a-decode-step (token pblocks caches wte lnfg bh dim &optional rope-base)
+  "Decode one TOKEN through DP4A-packed PBLOCKS with KV CACHES; tied head stays f32.
+Returns the (vocab) logit vector."
+  (let* ((wd (photon-tensor-data wte))
+         (x (photon-tensor (list 1 dim) (let ((v (make-vector dim 0.0)))
+                                          (dotimes (j dim) (aset v j (aref wd (+ (* token dim) j)))) v)))
+         (bl pblocks) (cl caches))
+    (while bl (setq x (nl-llm-bitnet-dp4a-decode-block x (car bl) (car cl) rope-base)) (setq bl (cdr bl) cl (cdr cl)))
+    (photon-tensor-data (photon-tensor-linear (nl-llm-rmsnorm x lnfg) wte bh))))
 
 (provide 'nl-llm-bitnet)
 ;;; nl-llm-bitnet.el ends here
