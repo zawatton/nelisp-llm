@@ -543,6 +543,17 @@ model is trained -- Phase 5 -- but the structure is guaranteed), and
 ~test/agent-model-test.el~ pins both the exact constrained generation and the
 every-step validity.
 
+*Phase 5 closes the self-improvement loop* (~nl-llm-agent-improve.el~): the model
+samples actions under the grammar, a reward keeps only its *successful* ones, and
+it is fine-tuned on its OWN wins by next-char cross-entropy (real backprop --
+photon-autograd + nl-llm-autograd, in-place weight updates), with no external
+labels.  ~examples/agent-improve-demo.el~ (toy task: emit ~(message "x")~ with x
+the target char): the success rate climbs *10% -> 18% -> 52% -> 92% -> 100%* over
+five rounds -- expert-iteration / STaR.  The same loop with a richer grammar and a
+real coding reward (do the edits make the tests pass?) is how the model improves
+its actual coding ability; nlga (GPU) swaps in for the CPU autograd at scale.  So
+the model can write Lisp to act on -- and retrain -- itself.
+
 *** Capstone: a real(er) run with mid-run checkpoint + resume
 
 ~examples/train-big-gpu.el~ exercises the whole stack at once at a larger scale: a

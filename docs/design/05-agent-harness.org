@@ -6,7 +6,11 @@ Phase 1 (harness) SHIPPED -- =lisp/nl-llm-agent.el= + =test/agent-test.el= (11/1
 + =examples/agent-demo.el=.
 Phase 4 (real model wired as policy, via constrained decoding) SHIPPED --
 =lisp/nl-llm-agent-model.el= + =test/agent-model-test.el= (6/6) +
-=examples/agent-model-demo.el=.  Phases 2/3/5 below are designed, not built.
+=examples/agent-model-demo.el=.
+Phase 5 (self-improvement loop) SHIPPED -- =lisp/nl-llm-agent-improve.el= +
+=test/agent-improve-test.el= (4/4) + =examples/agent-improve-demo.el=: a model
+trains on its OWN successful actions and its success rate climbs 10% -> 100%.
+Phases 2/3 below are designed, not built.
 
 * Why
 An LLM by itself only emits text.  What lets Claude Code / Codex *act* -- edit
@@ -89,8 +93,15 @@ turn the model gets better at using -- and improving -- itself.
   integrated decode swaps in unchanged.  =examples/agent-model-demo.el=: an
   untrained random model yields 3/3 structurally valid Elisp actions (gibberish
   content -> P5).
-- *P5*: trajectory collection + reward filtering + nlga fine-tune = the
-  self-improvement loop above.
+- *P5 (SHIPPED)*: the self-improvement loop.  Each round the model samples K
+  actions under the grammar (constrained SAMPLING), a reward keeps the successes,
+  and the model is fine-tuned on its own winning trajectories by next-char CE
+  (real backprop, photon-autograd + nl-llm-autograd, in-place weight updates).
+  =examples/agent-improve-demo.el=: success rate climbs 10% -> 18% -> 52% -> 92%
+  -> 100% with no external labels -- expert-iteration / STaR.  The same loop with
+  a richer grammar + real coding rewards (do the edits make the tests pass?) is
+  how the model improves its actual coding ability; nlga (GPU) swaps in for the
+  CPU autograd at scale.
 
 * Sources
 mini-swe-agent (github.com/SWE-agent/mini-swe-agent); SWE-agent ACI
