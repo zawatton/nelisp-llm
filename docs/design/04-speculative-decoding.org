@@ -15,7 +15,14 @@ accepts the look-ahead token whenever the true token is in head2's top-K (a
 depth-1, width-K draft tree) -- still bit-exact plain greedy, larger K -> more
 tokens/forward.  =examples/spec-decode.el= (trained head2): single-draft 1.92x,
 tree(k=4) 2.00x, lossless sampling (T0.8/top-k30) 1.78x tokens/forward.
-Remaining: a true GPU-batched tree verify (one forward over the draft tree) and
+The core of a GPU-batched tree verify lands: the =tree-attn= kernel (nelisp-gpu)
+computes, in ONE dispatch, every draft-tree node's attention over a shared context
+cache plus its ancestor chain among the nodes (parent array, sentinel = M; GQA;
+pre-RoPE'd Q/K) -- so a whole draft tree is verified in one attention pass instead
+of sequential per-node feeds.  =test/gpu-tree-attn-test.el= matches a CPU
+reference (context + walked-parent-chain mask) to f32 (maxrel 3.9e-6).  Remaining:
+wire =tree-attn= through the full multi-block decode loop (project Q/K/V + RoPE per
+node, run all blocks, head per node) for an end-to-end one-forward tree round, and
 deeper trees (more MTP heads).
 
 MTP self-speculative greedy decode lands: training adds a second look-ahead head
