@@ -89,6 +89,23 @@ no quote/backslash/newline, so the emitted Elisp always parses)."
          ((< p (+ lp n (length post))) (list :force (aref post (- p lp n))))
          (t :stop))))))
 
+(defun nl-llm-agent-grammar-template (segments)
+  "Build a grammar from SEGMENTS, a list of either a forced string or a model
+slot (:slot CHARS) (one model-chosen character from CHARS).  Generalises
+`nl-llm-agent-grammar-message' to several variable slots, e.g. synthesising a
+function with a chosen operator and constant."
+  (lambda (emitted)
+    (let ((p (length emitted)) (pos 0) (result :stop))
+      (catch 'done
+        (dolist (seg segments)
+          (if (stringp seg)
+              (let ((len (length seg)))
+                (when (< p (+ pos len)) (throw 'done (setq result (list :force (aref seg (- p pos))))))
+                (setq pos (+ pos len)))
+            (when (= p pos) (throw 'done (setq result (list :allow (cadr seg)))))
+            (setq pos (1+ pos)))))
+      result)))
+
 ;; ---- the model policy ------------------------------------------------------
 
 (defun nl-llm-agent--render (messages)

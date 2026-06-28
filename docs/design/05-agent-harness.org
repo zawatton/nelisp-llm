@@ -10,7 +10,10 @@ Phase 4 (real model wired as policy, via constrained decoding) SHIPPED --
 Phase 5 (self-improvement loop) SHIPPED -- =lisp/nl-llm-agent-improve.el= +
 =test/agent-improve-test.el= (4/4) + =examples/agent-improve-demo.el=: a model
 trains on its OWN successful actions and its success rate climbs 10% -> 100%.
-Phases 2/3 below are designed, not built.
+Phase 5 with a REAL coding reward SHIPPED -- =test/agent-code-test.el= (5/5) +
+=examples/agent-code-demo.el=: the model synthesises a function and the reward
+RUNS it against tests; code-synthesis success climbs from the ~1/9 baseline to
+100% on execution feedback alone.  Phases 2/3 below are designed, not built.
 
 * Why
 An LLM by itself only emits text.  What lets Claude Code / Codex *act* -- edit
@@ -98,10 +101,15 @@ turn the model gets better at using -- and improving -- itself.
   and the model is fine-tuned on its own winning trajectories by next-char CE
   (real backprop, photon-autograd + nl-llm-autograd, in-place weight updates).
   =examples/agent-improve-demo.el=: success rate climbs 10% -> 18% -> 52% -> 92%
-  -> 100% with no external labels -- expert-iteration / STaR.  The same loop with
-  a richer grammar + real coding rewards (do the edits make the tests pass?) is
-  how the model improves its actual coding ability; nlga (GPU) swaps in for the
-  CPU autograd at scale.
+  -> 100% with no external labels -- expert-iteration / STaR.  The reward is now
+  EXECUTION-BASED: the model synthesises =(defun f235 (x) (OP x N))= by choosing
+  the operator and constant under a multi-slot grammar
+  (=nl-llm-agent-grammar-template=), and the reward defines the function and runs
+  it against test cases (f(2)=6, f(5)=15; unique solution =(* x 3)=) -- so the
+  model learns to write code that PASSES TESTS from execution feedback alone
+  (=test/agent-code-test.el=, =examples/agent-code-demo.el=, ~1/9 -> 100%).  The
+  same loop with richer grammars + bigger test suites is how the model improves
+  its real coding ability; nlga (GPU) swaps in for the CPU autograd at scale.
 
 * Sources
 mini-swe-agent (github.com/SWE-agent/mini-swe-agent); SWE-agent ACI

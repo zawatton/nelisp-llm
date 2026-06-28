@@ -549,10 +549,18 @@ it is fine-tuned on its OWN wins by next-char cross-entropy (real backprop --
 photon-autograd + nl-llm-autograd, in-place weight updates), with no external
 labels.  ~examples/agent-improve-demo.el~ (toy task: emit ~(message "x")~ with x
 the target char): the success rate climbs *10% -> 18% -> 52% -> 92% -> 100%* over
-five rounds -- expert-iteration / STaR.  The same loop with a richer grammar and a
-real coding reward (do the edits make the tests pass?) is how the model improves
-its actual coding ability; nlga (GPU) swaps in for the CPU autograd at scale.  So
-the model can write Lisp to act on -- and retrain -- itself.
+five rounds -- expert-iteration / STaR.
+
+The reward is then made *execution-based* -- real coding, not a string match
+(~nl-llm-agent-grammar-template~ + ~examples/agent-code-demo.el~): the model
+synthesises ~(defun f235 (x) (OP x N))~ by choosing the operator and constant, and
+the reward DEFINES the function and runs it against test cases (f(2)=6, f(5)=15;
+unique solution ~(* x 3)~).  Training only on its own programs that *pass the
+tests*, the synthesis success rate climbs from the ~1/9 random baseline to 100% on
+execution feedback alone.  The same loop with richer grammars and bigger test
+suites is how the model improves its real coding ability; nlga (GPU) swaps in for
+the CPU autograd at scale.  So the model can write Lisp to act on -- and retrain --
+itself.
 
 *** Capstone: a real(er) run with mid-run checkpoint + resume
 
