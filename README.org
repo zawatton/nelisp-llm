@@ -401,9 +401,17 @@ from H2, verifies both in one target forward, and emits two tokens on a hit, one
 on a miss.  The emitted stream is *exactly* plain greedy regardless of H2 -- the
 acceptance only ever keeps =argmax(main head)= tokens -- so it is lossless by
 construction.  ~test/spec-test.el~ pins this on a random model across seeds (no
-GPU); ~examples/spec-decode.el~ trains H2 on-device and measures the speedup
-(lossless, ~1.92x tokens per forward, near the 2x ceiling for one extra head).
-Pending: a batched GPU verify, lossless sampling, and tree drafting
+GPU); ~examples/spec-decode.el~ trains H2 on-device and measures the speedup.
+
+Beyond greedy, ~nl-llm-spec-sample-decode~ does *lossless sampling*: the
+rejection rule (~nl-llm-spec-rejection~, accept w.p. min(1,p/q) else residual)
+makes the emitted token distributed *exactly* as plain temperature/top-k sampling
+regardless of the draft -- ~test/spec-test.el~ pins this statistically (output
+histogram ~ target P, max|hist-P| 0.005 over 40k draws).  ~nl-llm-spec-greedy-tree~
+adds a width-K *tree draft* (accept the look-ahead token when the true token is in
+head2's top-K) -- still bit-exact plain greedy, higher K -> more tokens/forward.
+On a trained H2: single-draft 1.92x, tree(k=4) 2.00x, lossless sampling
+(T0.8/top-k30) 1.78x tokens/forward.  A GPU-batched tree verify is future work
 (~docs/design/04-speculative-decoding.org~).
 
 *** Capstone: a real(er) run with mid-run checkpoint + resume

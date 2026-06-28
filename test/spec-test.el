@@ -33,9 +33,20 @@
            (blocks (list (funcall mkblk (* seed 100)) (funcall mkblk (* seed 200))))
            (plain (nl-llm-greedy prompt nsteps blocks wte lnfg bh heads kvh dim vocab maxseq))
            (sr (nl-llm-spec-greedy prompt nsteps blocks wte lnfg bh w2 b2 heads kvh dim vocab maxseq))
-           (spec (car sr)) (rounds (cdr sr)))
+           (tr (nl-llm-spec-greedy-tree prompt nsteps blocks wte lnfg bh w2 b2 heads kvh dim vocab maxseq 4))
+           (spec (car sr)) (rounds (cdr sr)) (tree (car tr)) (trounds (cdr tr)))
       (sp--ck (format "seed %d: speculative == plain greedy" seed) (equal spec plain)
-              (format "%d toks / %d rounds = %.2f tok/fwd" nsteps rounds (/ (float nsteps) rounds)))))
+              (format "%d toks / %d rounds = %.2f tok/fwd" nsteps rounds (/ (float nsteps) rounds)))
+      (sp--ck (format "seed %d: tree(k=4) == plain greedy" seed) (equal tree plain)
+              (format "%.2f tok/fwd (>= single %.2f)" (/ (float nsteps) trounds) (/ (float nsteps) rounds)))))
+  ;; lossless sampling: the rejection rule produces samples distributed EXACTLY as
+  ;; the target P, regardless of the draft Q (model-agnostic statistical check).
+  (let* ((v 6) (p (vector 0.30 0.25 0.20 0.15 0.07 0.03)) (q (vector 0.10 0.10 0.30 0.20 0.20 0.10))
+         (nn 40000) (cnt (make-vector v 0)) (mx 0.0))
+    (random "nl-llm-spec-rejection-seed")
+    (dotimes (_ nn) (let ((tok (nl-llm-spec-rejection p q v))) (aset cnt tok (1+ (aref cnt tok)))))
+    (dotimes (i v) (setq mx (max mx (abs (- (/ (float (aref cnt i)) nn) (aref p i))))))
+    (sp--ck "lossless sampling: rejection output ~ target P" (< mx 0.02) (format "max|hist-P|=%.3f over %d draws" mx nn)))
   (princ (format "NL-LLM-SPEC %s (%d failures)\n" (if (= sp--fail 0) "ALL-PASS" "HAS-FAILURES") sp--fail))
   (kill-emacs (if (= sp--fail 0) 0 1)))
 ;;; spec-test.el ends here

@@ -3,7 +3,20 @@
 #+STATUS: DRAFT
 
 * Status
-SHIPPED (greedy, single look-ahead head); sampling / tree / GPU-batched verify pending.
+SHIPPED -- greedy + lossless sampling + width-k tree draft; GPU-batched verify pending.
+
+Lossless *sampling* lands: =nl-llm-spec-rejection= implements the
+accept-with-prob-min(1,p/q) / residual rule so the emitted token is distributed
+EXACTLY as the target P regardless of the draft Q; =nl-llm-spec-sample-decode=
+drafts from head2 and verifies against head1 under temperature/top-k.
+=test/spec-test.el= pins the rule statistically (rejection output histogram ~ P,
+max|hist-P| 0.005 over 40k draws).  *Tree draft*: =nl-llm-spec-greedy-tree=
+accepts the look-ahead token whenever the true token is in head2's top-K (a
+depth-1, width-K draft tree) -- still bit-exact plain greedy, larger K -> more
+tokens/forward.  =examples/spec-decode.el= (trained head2): single-draft 1.92x,
+tree(k=4) 2.00x, lossless sampling (T0.8/top-k30) 1.78x tokens/forward.
+Remaining: a true GPU-batched tree verify (one forward over the draft tree) and
+deeper trees (more MTP heads).
 
 MTP self-speculative greedy decode lands: training adds a second look-ahead head
 H2 (predicts the token two ahead) via a second =nlga-seed-ce-idx= at a +2 target;
