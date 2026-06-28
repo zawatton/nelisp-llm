@@ -3,7 +3,21 @@
 #+STATUS: DRAFT
 
 * Status
-SHIPPED (synchronous decode); variable-length / free-list / prefix-sharing pending.
+SHIPPED -- synchronous + variable-length + free-list + prefix sharing.
+
+The variable-length extension lands: per-sequence positions via a LENS[s] buffer
+(kernels =decode-rope-b-v= / =cache-append-paged-v= / =decode-attn-paged-v=, each
+reading LENS[s] not a shared POS), a host block allocator with a free-list
+(=nl-llm-paged-alloc-*=: allocate on demand, =nl-llm-paged-free-seq= returns a
+sequence's private blocks, leaving shared ones), and whole-block prefix sharing
+(=nl-llm-paged-share-prefix= points a sequence's prefix logical blocks at
+another's physical blocks).  Wiring: =nl-llm-gpu-paged-v-new/-step= in
+=nl-llm-gpu-decode.el=.  =test/gpu-paged-v-test.el=: a batch of differing-length
+sequences matches per-sequence CPU decode (maxrel 1.8e-6); the free-list recycles
+freed blocks; a shared 4-token prefix adds no new blocks and the sharing
+sequence's continuation logits are bit-identical to the owner's.  Remaining:
+copy-on-write for a *partial* last prefix block (sharing now requires a whole-block
+prefix).
 
 Feasibility spike PASSED (kernels =gather-spike= / =scatter-spike=,
 =test/gpu-paged-spike-test.el=, maxdiff 0).  Full paged decode then landed:

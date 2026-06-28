@@ -325,5 +325,141 @@ the resident block table.  Returns the flat (BSZ*vocab) logits."
 (defalias 'nl-llm-gpu-paged-free 'nl-llm-gpu-decode-free
   "Free a paged decoder context (see `nl-llm-gpu-decode-free').")
 
+;; --- variable-length paged decode: per-sequence positions + free-list -------
+;; A host-side block allocator: a free-list of physical block ids, a per-sequence
+;; block table (logical -> physical, -1 = unallocated) and per-sequence lengths.
+;; Blocks are handed out on demand and returned when a sequence is freed, and a
+;; prefix can be SHARED across sequences (the shared blocks are counted once).
+(cl-defstruct (nl-llm-paged-alloc (:constructor nl-llm-paged-alloc--make))
+  free table lens nblocks bsz mbps bs)
+
+(defun nl-llm-paged-alloc-new (nblocks bsz mbps bs)
+  "Allocator over NBLOCKS physical blocks for BSZ sequences, MBPS logical blocks
+each, block size BS."
+  (let ((free nil) (i nblocks))
+    (while (> i 0) (setq i (1- i)) (push i free))   ; free = (0 1 ... nblocks-1)
+    (nl-llm-paged-alloc--make
+     :free free :table (let ((v (make-vector (* bsz mbps) -1.0))) v) :lens (make-vector bsz 0.0)
+     :nblocks nblocks :bsz bsz :mbps mbps :bs bs)))
+
+(defun nl-llm-paged-alloc-used (a)
+  "Physical blocks currently in use (allocated, not on the free-list)."
+  (- (nl-llm-paged-alloc-nblocks a) (length (nl-llm-paged-alloc-free a))))
+
+(defun nl-llm-paged-alloc--block (a)
+  (or (pop (nl-llm-paged-alloc-free a)) (error "nl-llm-paged: out of blocks")))
+
+(defun nl-llm-paged-len (a s) (truncate (aref (nl-llm-paged-alloc-lens a) s)))
+
+(defun nl-llm-paged-ensure (a s)
+  "Ensure sequence S has a physical block for its current write position; on a
+block boundary this allocates a fresh block from the free-list."
+  (let* ((mbps (nl-llm-paged-alloc-mbps a)) (bs (nl-llm-paged-alloc-bs a))
+         (tbl (nl-llm-paged-alloc-table a)) (lb (/ (nl-llm-paged-len a s) bs)) (k (+ (* s mbps) lb)))
+    (when (< (aref tbl k) 0.0) (aset tbl k (float (nl-llm-paged-alloc--block a))))))
+
+(defun nl-llm-paged-advance (a s)
+  "Record that sequence S decoded one token (length += 1)."
+  (let ((lens (nl-llm-paged-alloc-lens a))) (aset lens s (+ (aref lens s) 1.0))))
+
+(defun nl-llm-paged-free-seq (a s)
+  "Return sequence S's privately-owned blocks to the free-list and reset it.
+Blocks shared with another sequence (same physical id elsewhere in the table) are
+left for their owner; this frees only ids unique to S."
+  (let* ((mbps (nl-llm-paged-alloc-mbps a)) (tbl (nl-llm-paged-alloc-table a)) (lb 0))
+    (while (< lb mbps)
+      (let ((p (aref tbl (+ (* s mbps) lb))))
+        (when (>= p 0.0)
+          (let ((shared nil) (k 0) (n (length tbl)))
+            (while (< k n) (when (and (/= k (+ (* s mbps) lb)) (= (aref tbl k) p)) (setq shared t)) (setq k (1+ k)))
+            (unless shared (push (truncate p) (nl-llm-paged-alloc-free a))))
+          (aset tbl (+ (* s mbps) lb) -1.0)))
+      (setq lb (1+ lb)))
+    (aset (nl-llm-paged-alloc-lens a) s 0.0)))
+
+(defun nl-llm-paged-share-prefix (a dst src nprefix)
+  "Point DST's first ceil(NPREFIX/bs) logical blocks at SRC's physical blocks
+\(read-only prefix sharing) and set DST's length to NPREFIX.  NPREFIX must be a
+multiple of the block size (whole-block sharing; partial-block COW is future)."
+  (let* ((mbps (nl-llm-paged-alloc-mbps a)) (bs (nl-llm-paged-alloc-bs a)) (tbl (nl-llm-paged-alloc-table a))
+         (nb (/ nprefix bs)) (lb 0))
+    (unless (= (% nprefix bs) 0) (error "nl-llm-paged-share-prefix: NPREFIX must be a multiple of bs"))
+    (while (< lb nb) (aset tbl (+ (* dst mbps) lb) (aref tbl (+ (* src mbps) lb))) (setq lb (1+ lb)))
+    (aset (nl-llm-paged-alloc-lens a) dst (float nprefix))))
+
+(defun nl-llm-gpu--decode-block-pv (b x blk ck cv lens table sign cosr sinr heads kvh dim kvdim bsz bs mbps)
+  (let* ((a (nlga-rmsnorm b x (plist-get blk :ln1g)))
+         (q (nlga--rope-bv b (nlga-linear b a (plist-get blk :wq) (plist-get blk :bq)) cosr sinr sign lens dim heads bsz))
+         (k (nlga--rope-bv b (nlga-linear b a (plist-get blk :wk) (plist-get blk :bk)) cosr sinr sign lens kvdim kvh bsz))
+         (v (nlga-linear b a (plist-get blk :wv) (plist-get blk :bv))))
+    (nlga--d b (list 'cache-append-paged-v (list (nlga-rt-slot k) (nlga-rt-slot lens) (nlga-rt-slot table) (nlga-rt-slot ck))
+                     (list bsz kvdim bs mbps) (nlga--g (* bsz kvdim))))
+    (nlga--d b (list 'cache-append-paged-v (list (nlga-rt-slot v) (nlga-rt-slot lens) (nlga-rt-slot table) (nlga-rt-slot cv))
+                     (list bsz kvdim bs mbps) (nlga--g (* bsz kvdim))))
+    (let* ((os (nlga--tmp b (* bsz dim)))
+           (ctx (progn (nlga--d b (list 'decode-attn-paged-v
+                                        (list (nlga-rt-slot q) (nlga-rt-slot ck) (nlga-rt-slot cv) (nlga-rt-slot lens) (nlga-rt-slot table) os)
+                                        (list bsz dim heads kvh bs mbps) (nlga--g (* bsz dim))))
+                       (nlga-rt--make :slot os :rows bsz :cols dim)))
+           (attn (nlga-linear b ctx (plist-get blk :wo) (plist-get blk :bo)))
+           (x1 (nlga-add b x attn))
+           (bn (nlga-rmsnorm b x1 (plist-get blk :ln2g))))
+      (nlga-add b x1 (nlga-swiglu b bn (plist-get blk :wg) (plist-get blk :bg)
+                                  (plist-get blk :wu) (plist-get blk :bu)
+                                  (plist-get blk :wd) (plist-get blk :bd))))))
+
+(defun nlga--rope-bv (b x cosr sinr sign lens cols heads bsz)
+  "Per-sequence RoPE: B rows X, row b rotated at LENS[b]."
+  (let ((os (nlga--tmp b (* bsz cols))))
+    (nlga--d b (list 'decode-rope-b-v (list (nlga-rt-slot x) (nlga-rt-slot cosr) (nlga-rt-slot sinr)
+                                            (nlga-rt-slot sign) (nlga-rt-slot lens) os)
+                     (list bsz cols heads) (nlga--g (/ (* bsz cols) 2))))
+    (nlga-rt--make :slot os :rows bsz :cols cols)))
+
+;;;###autoload
+(defun nl-llm-gpu-paged-v-new (wte blocks lnfg bh heads kvh dim vocab nblocks bs mbps bsz tables)
+  "Variable-length PagedAttention decoder: BSZ sequences at independent positions
+over a shared pool of NBLOCKS blocks (size BS, MBPS logical/seq).  Returns a
+context for `nl-llm-gpu-paged-v-step'; pair it with a `nl-llm-paged-alloc-new'."
+  (let* ((b (nlga-new)) (kvdim (* kvh (/ dim heads))) (poolrows (* nblocks bs))
+         (tok (nlga-const b (photon-tensor (list bsz) (make-vector bsz 0.0))))
+         (lens (nlga-const b (photon-tensor (list bsz) (make-vector bsz 0.0))))
+         (table (nlga-const b (photon-tensor (list (* bsz mbps)) (make-vector (* bsz mbps) 0.0))))
+         (sign (nlga-scalar b 1.0)) (one (nlga-scalar b 1.0))
+         (wter (nlga-const b wte)) (lnfgr (nlga-const b lnfg)) (bhr (nlga-const b bh))
+         (cosr (nlga-const b (car tables))) (sinr (nlga-const b (cdr tables)))
+         (bconsts (mapcar (lambda (blk) (nl-llm-gpu--block-consts b blk)) blocks))
+         (pools (mapcar (lambda (_) (cons (nl-llm-gpu--cache b poolrows kvdim)
+                                          (nl-llm-gpu--cache b poolrows kvdim))) blocks))
+         (x (nlga-embed b tok wter)) (bl bconsts) (cl pools))
+    (while bl
+      (setq x (nl-llm-gpu--decode-block-pv b x (car bl) (car (car cl)) (cdr (car cl))
+                                           lens table sign cosr sinr heads kvh dim kvdim bsz bs mbps))
+      (setq bl (cdr bl) cl (cdr cl)))
+    (let ((lout (nlga-keep b (nlga-linear b (nlga-rmsnorm b x lnfgr) wter bhr) one)))
+      (nlga-compile b)
+      (list :b b :tok tok :lens lens :table table :lout lout :bsz bsz :vocab vocab))))
+
+;;;###autoload
+(defun nl-llm-gpu-paged-v-step (ctx alloc tokens)
+  "Decode one token per sequence with per-sequence positions.  TOKENS is a vector
+of BSZ ids.  ALLOC supplies the current per-sequence lengths and block table
+\(refresh ALLOC -- ensure blocks, share prefixes -- before calling).  Returns the
+flat (BSZ*vocab) logits.  Advancing lengths after the step is the caller's job
+\(`nl-llm-paged-advance')."
+  (let ((bsz (plist-get ctx :bsz)))
+    (nlga-update (plist-get ctx :tok)
+                 (photon-tensor (list bsz) (let ((v (make-vector bsz 0.0)))
+                                             (dotimes (i bsz) (aset v i (float (aref tokens i)))) v)))
+    (nlga-update (plist-get ctx :lens) (photon-tensor (list bsz) (copy-sequence (nl-llm-paged-alloc-lens alloc))))
+    (nlga-update (plist-get ctx :table) (photon-tensor (list (* bsz (nl-llm-paged-alloc-mbps alloc)))
+                                                       (let ((tb (copy-sequence (nl-llm-paged-alloc-table alloc))))
+                                                         (dotimes (i (length tb)) (when (< (aref tb i) 0.0) (aset tb i 0.0))) tb)))
+    (nth (plist-get ctx :lout) (nlga-step (plist-get ctx :b)))))
+
+;;;###autoload
+(defalias 'nl-llm-gpu-paged-v-free 'nl-llm-gpu-decode-free
+  "Free a variable-length paged decoder context.")
+
 (provide 'nl-llm-gpu-decode)
 ;;; nl-llm-gpu-decode.el ends here

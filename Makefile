@@ -37,6 +37,7 @@ test:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-dp4a-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-paged-spike-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-paged-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-paged-v-test.el
 
 compile:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) \

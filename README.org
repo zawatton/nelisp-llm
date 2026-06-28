@@ -380,8 +380,16 @@ pool through the table (a data-dependent dynamic index, first de-risked by
 The physical layout is interleaved (=phys = logical*B + seq=), so the table
 indirection is exercised for real.  ~test/gpu-paged-test.el~ matches the CPU
 per-sequence decode to f32 (maxrel 8.1e-6) and checks the on-demand block count.
-Decode is synchronous here; per-sequence lengths, a free-list and prefix sharing
-are the next step (~docs/design/03-paged-attention.org~).
+
+The variable-length path (~nl-llm-gpu-paged-v-new~ / ~-step~ + a
+~nl-llm-paged-alloc~) gives each sequence its own position (a =LENS[s]= buffer
+read by ~decode-rope-b-v~ / ~cache-append-paged-v~ / ~decode-attn-paged-v~), a
+host *free-list* that recycles a finished sequence's blocks, and whole-block
+*prefix sharing* (several sequences point their prompt blocks at one physical
+copy).  ~test/gpu-paged-v-test.el~: a batch of differing-length sequences matches
+per-sequence CPU decode (maxrel 1.8e-6), freed blocks are reused, and a shared
+prefix adds no blocks while the sharer's continuation is bit-identical to the
+owner's (~docs/design/03-paged-attention.org~).
 
 *** Faster decode: self-speculative (MTP) generation
 
