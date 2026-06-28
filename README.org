@@ -196,6 +196,16 @@ parameter ever is reused: the first write is direct, later ones accumulate.)
 Activation gradients, which do fan out, keep the accumulate path.  The 2-block
 batch drops further to 198 dispatches; per-step ~17 ms.
 
+*** Weight tying (head = wte^T)
+
+Because ~nlga-linear~ computes x·W^T, the LM head can share the embedding matrix
+simply by passing the embedding ~wte~ as the head's weight -- no separate output
+matrix.  ~wte~ is then used twice (gather embedding + head), so its gradient is
+accumulated from both backward passes; the ~gwritten~ fan-out path handles this
+exactly (the first contribution writes the grad, the second vadds).
+~test/gpu-tie-test.el~ trains a tied model on-device and matches the CPU autograd
+reference (which ties the same ~wte~ pav) to f32 (maxrel ~9e-8).
+
 *** Scaling: on-device vs host-driven training
 
 Per training step of one full block (RMSNorm + GQA/RoPE + SwiGLU + head, GTX
