@@ -562,6 +562,18 @@ suites is how the model improves its real coding ability; nlga (GPU) swaps in fo
 the CPU autograd at scale.  So the model can write Lisp to act on -- and retrain --
 itself.
 
+Because a self-improving agent runs untrusted, model-written code, the harness has
+a *sandbox + permission gate* (~nl-llm-agent-safe-permissions~): Elisp runs in an
+isolated ~emacs -Q --batch~ subprocess with a wall-clock timeout (no hang, no
+host-state corruption), and destructive forms (a denylist), shells, and edits that
+resolve outside the workdir are *refused before they run*.
+~examples/agent-sandbox-demo.el~ feeds the agent a string of malicious actions
+(delete-file, ~rm -rf /~, an out-of-workdir edit, an infinite loop) and every one
+is contained -- the host filesystem is untouched -- while a legitimate action still
+evaluates.  ~test/agent-sandbox-test.el~ pins the denylist, the workdir
+confinement, the timeout kill and the sandbox value; the default stays permissive
+(in-process) for trusted/test use.
+
 *** Capstone: a real(er) run with mid-run checkpoint + resume
 
 ~examples/train-big-gpu.el~ exercises the whole stack at once at a larger scale: a

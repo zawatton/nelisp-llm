@@ -130,12 +130,71 @@ result that does not parse is discarded.  Returns (OK . MESSAGE)."
                     (progn (with-temp-file file (insert new)) (cons t (format "edit applied to %s" path)))))))))))))
 
 (defun nl-llm-agent--eval-elisp (code)
-  "Evaluate CODE (one or more forms) capturing the value or the error as a string.
-NOTE: evaluates in-process; production should sandbox via `emacs --batch'."
+  "Evaluate CODE (one or more forms) IN-PROCESS, capturing the value or error.
+Fast but unsafe; use the sandbox (`nl-llm-agent-safe-permissions') for untrusted
+policies."
   (condition-case err
       (let ((forms (car (read-from-string (concat "(progn\n" code "\n)")))))
         (format "%S" (eval forms t)))
     (error (format "ERROR: %S" err))))
+
+;; ---- sandboxing + permission gating (P2) -----------------------------------
+;; Untrusted model output should not run in, or be able to harm, the host session.
+;; The sandbox runs Elisp in an isolated `emacs -Q --batch' subprocess with a wall
+;; clock timeout (no hang, no host-state corruption, crashes contained); the
+;; permission gate refuses destructive forms (denylist), shells, and edits outside
+;; the workdir BEFORE anything runs.
+
+(defconst nl-llm-agent-default-denylist
+  '("delete-file" "delete-directory" "shell-command" "shell-command-to-string"
+    "call-process" "call-process-region" "start-process" "make-process"
+    "write-region" "rename-file" "copy-file" "make-symbolic-link" "set-file-modes"
+    "kill-emacs" "server-start" "url-retrieve" "browse-url" "async-shell-command")
+  "Symbols an agent's Elisp may not reference under a gated permission set.")
+
+;;;###autoload
+(defun nl-llm-agent-safe-permissions (&optional timeout)
+  "Permissions for UNTRUSTED policies: sandboxed Elisp (subprocess + TIMEOUT, def
+5s), no shell, edits confined to the workdir, destructive forms denied."
+  (list :eval 'sandbox :eval-timeout (or timeout 5) :shell nil :confine-edits t
+        :denylist nl-llm-agent-default-denylist))
+
+;;;###autoload
+(defun nl-llm-agent-permissive-permissions ()
+  "Permissions for TRUSTED use: in-process Elisp, shell allowed, no confinement.
+The default, for backward compatibility."
+  (list :eval 'in-process :shell t :confine-edits nil :denylist nil))
+
+(defun nl-llm-agent--denylisted (code denylist)
+  "Return the first DENYLIST symbol referenced in CODE, or nil."
+  (cl-find-if (lambda (s) (string-match-p (concat "\\_<" (regexp-quote s) "\\_>") code)) denylist))
+
+(defun nl-llm-agent--path-confined-p (path workdir)
+  "Non-nil if PATH resolves inside WORKDIR."
+  (string-prefix-p (file-name-as-directory (expand-file-name workdir))
+                   (expand-file-name path workdir)))
+
+(defun nl-llm-agent--eval-elisp-sandbox (code timeout)
+  "Evaluate CODE in an isolated `emacs -Q --batch' subprocess with a TIMEOUT
+\(seconds).  The host session is untouched; an infinite loop is killed, not hung."
+  (let ((tmp (make-temp-file "nl-agent-sb-" nil ".el"))
+        (emacs (or (and (boundp 'invocation-name)
+                        (expand-file-name invocation-name invocation-directory))
+                   (executable-find "emacs") "emacs")))
+    (unwind-protect
+        (progn
+          (with-temp-file tmp
+            (insert "(prin1 (condition-case e (progn\n" code "\n) (error (format \"ERROR: %S\" e))))\n"))
+          (with-temp-buffer
+            (let* ((tcmd (executable-find "timeout"))
+                   (prog (or tcmd emacs))
+                   (args (if tcmd (list (number-to-string timeout) emacs "-Q" "--batch" "-l" tmp)
+                           (list "-Q" "--batch" "-l" tmp)))
+                   (status (apply #'call-process prog nil t nil args)))
+              (cond ((and tcmd (eq status 124)) "ERROR: timed out")
+                    ((not (equal status 0)) (format "ERROR: subprocess exit %s" status))
+                    (t (nl-llm-agent--truncate (string-trim (buffer-string)) 2000))))))
+      (ignore-errors (delete-file tmp)))))
 
 (defun nl-llm-agent--shell (cmd workdir)
   "Run shell CMD in WORKDIR; return a short [exit N] + output observation."
@@ -148,30 +207,46 @@ NOTE: evaluates in-process; production should sandbox via `emacs --batch'."
 (defun nl-llm-agent--truncate (s n)
   (if (<= (length s) n) s (concat (substring s 0 n) (format "\n... [truncated %d chars]" (- (length s) n)))))
 
-(defun nl-llm-agent--observe (action workdir)
-  "Execute ACTION; return (STATUS . OBSERVATION) where STATUS is one of
-done/continue/none and OBSERVATION is the text fed back to the policy."
+(defun nl-llm-agent--observe (action workdir perms)
+  "Execute ACTION under PERMS; return (STATUS . OBSERVATION) where STATUS is one of
+done/continue/none.  PERMS gates execution: denylisted Elisp, shells, and edits
+outside WORKDIR are refused before anything runs; Elisp runs sandboxed or
+in-process per PERMS' :eval."
   (pcase action
-    (`(elisp ,code) (cons 'continue (concat "OBSERVATION:\n" (nl-llm-agent--eval-elisp code))))
-    (`(shell ,cmd)  (cons 'continue (concat "OBSERVATION:\n" (nl-llm-agent--shell cmd workdir))))
+    (`(elisp ,code)
+     (let ((deny (and (plist-get perms :denylist) (nl-llm-agent--denylisted code (plist-get perms :denylist)))))
+       (cons 'continue
+             (cond ((null (plist-get perms :eval)) "OBSERVATION: DENIED -- Elisp evaluation is not permitted")
+                   (deny (format "OBSERVATION: DENIED -- forbidden operation `%s'" deny))
+                   ((eq (plist-get perms :eval) 'sandbox)
+                    (concat "OBSERVATION:\n" (nl-llm-agent--eval-elisp-sandbox code (or (plist-get perms :eval-timeout) 5))))
+                   (t (concat "OBSERVATION:\n" (nl-llm-agent--eval-elisp code)))))))
+    (`(shell ,cmd)
+     (cons 'continue (if (plist-get perms :shell)
+                         (concat "OBSERVATION:\n" (nl-llm-agent--shell cmd workdir))
+                       "OBSERVATION: DENIED -- shell is not permitted")))
     (`(edit ,path ,search ,replace)
-     (let ((r (nl-llm-agent--apply-edit path search replace workdir)))
-       (cons 'continue (concat "OBSERVATION: " (cdr r)))))
+     (cons 'continue
+           (if (and (plist-get perms :confine-edits) (not (nl-llm-agent--path-confined-p path workdir)))
+               (format "OBSERVATION: DENIED -- edit outside the workdir (%s)" path)
+             (concat "OBSERVATION: " (cdr (nl-llm-agent--apply-edit path search replace workdir))))))
     (`(done ,answer) (cons 'done answer))
     (_ (cons 'none "OBSERVATION: no recognized action found. Emit exactly one action block."))))
 
 ;; ---- the agent loop --------------------------------------------------------
 
 ;;;###autoload
-(cl-defun nl-llm-agent-run (task policy &key (max-steps 12) (workdir default-directory) system trace)
+(cl-defun nl-llm-agent-run (task policy &key (max-steps 12) (workdir default-directory) system trace permissions)
   "Run the agent on TASK using POLICY (a function MESSAGES -> assistant-text).
 MESSAGES is the linear history as a list of (ROLE . CONTENT) in order.  Each step
-the policy emits one action, which is executed; the OBSERVATION is appended and
-the loop repeats until DONE or MAX-STEPS.  TRACE, if set, is called with
-\(STEP ROLE CONTENT) for each turn.  Returns a plist
-\(:status done/limit :steps N :result STRING :messages LIST)."
+the policy emits one action, which is executed under PERMISSIONS (default
+`nl-llm-agent-permissive-permissions'; pass `nl-llm-agent-safe-permissions' for
+untrusted policies); the OBSERVATION is appended and the loop repeats until DONE or
+MAX-STEPS.  TRACE, if set, is called with (STEP ROLE CONTENT) for each turn.
+Returns a plist (:status done/limit :steps N :result STRING :messages LIST)."
   (let ((messages (list (cons 'system (or system nl-llm-agent-system-prompt))
                         (cons 'user (concat "TASK: " task))))
+        (perms (or permissions (nl-llm-agent-permissive-permissions)))
         (step 0) (status 'limit) (result nil))
     (when trace (funcall trace 0 'user task))
     (while (< step max-steps)
@@ -180,7 +255,7 @@ the loop repeats until DONE or MAX-STEPS.  TRACE, if set, is called with
              (action (nl-llm-agent--parse out)))
         (setq messages (append messages (list (cons 'assistant out))))
         (when trace (funcall trace step 'assistant out))
-        (let ((res (nl-llm-agent--observe action workdir)))
+        (let ((res (nl-llm-agent--observe action workdir perms)))
           (when trace (funcall trace step 'observation (cdr res)))
           (cond
            ((eq (car res) 'done) (setq status 'done result (cdr res) step (1+ max-steps)))

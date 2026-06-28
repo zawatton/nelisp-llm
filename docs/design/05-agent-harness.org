@@ -13,7 +13,12 @@ trains on its OWN successful actions and its success rate climbs 10% -> 100%.
 Phase 5 with a REAL coding reward SHIPPED -- =test/agent-code-test.el= (5/5) +
 =examples/agent-code-demo.el=: the model synthesises a function and the reward
 RUNS it against tests; code-synthesis success climbs from the ~1/9 baseline to
-100% on execution feedback alone.  Phases 2/3 below are designed, not built.
+100% on execution feedback alone.
+Phase 2 (sandboxing + permission gating) SHIPPED -- =test/agent-sandbox-test.el=
+\(11/11) + =examples/agent-sandbox-demo.el=: untrusted Elisp runs in an isolated
+subprocess with a timeout, and destructive forms / shells / out-of-workdir edits
+are refused before they run.  (Fuzzy edit application is the remaining P2 item.)
+Phase 3 below is designed, not built.
 
 * Why
 An LLM by itself only emits text.  What lets Claude Code / Codex *act* -- edit
@@ -83,8 +88,13 @@ turn the model gets better at using -- and improving -- itself.
 * Phasing
 - *P1 (SHIPPED)*: harness -- loop, Elisp/edit/shell/done actions, SEARCH/REPLACE +
   linter guardrail, scripted-policy tests, cheap repo map.
-- *P2*: sandboxing (=emacs --batch= for eval; resource/time limits), fuzzy edit
-  application, per-tool permission gating.
+- *P2 (SHIPPED, fuzzy edits pending)*: sandboxing + permission gating.  Untrusted
+  Elisp runs in an isolated =emacs -Q --batch= subprocess with a wall-clock
+  timeout (=nl-llm-agent--eval-elisp-sandbox=: no hang, no host-state corruption,
+  crashes contained).  A permission set (=nl-llm-agent-safe-permissions=) refuses,
+  before anything runs, destructive forms (denylist), shells, and edits resolving
+  outside the workdir.  Default stays permissive (in-process) for trusted/test use.
+  Remaining: fuzzy SEARCH/REPLACE application (diff-match-patch-style).
 - *P3*: tree-sitter repo map + PageRank ranking; feed only ranked context.
 - *P4 (SHIPPED)*: nelisp-llm generation wired as the POLICY.  A char tokenizer
   (vocab 96) + a CONSTRAINED decoder: a grammar says which characters are legal at
