@@ -168,6 +168,17 @@ lr_t = lr·sqrt(1-b2^t)/(1-b1^t) in that buffer each step via
 running the same Adam update to f32 (maxrel < 1e-5); Adam reaches a much lower
 loss in the same number of steps than SGD (2.89 -> 0.64 in 8 steps here).
 
+*** Fused multi-head attention
+
+The attention core no longer loops over heads in elisp emitting O(heads)
+dispatches.  ~nlga-gqa~ now computes all heads in a single dispatch per stage:
+~attn-scores~ (Q·K^T with the 1/sqrt(hd) scale and causal mask folded in, output
+laid out (heads*seq) x seq so the existing row-softmax applies directly),
+~attn-context~ (the P·V context), and matching batched backward kernels
+(~attn-sc-dq/dk~, ~attn-ctx-dp/dv~) -- so the per-block attention dispatch count
+is constant in the number of heads instead of growing with it.  Bit-for-bit the
+same math (the block/MoE/stack tests still match CPU autograd to f32).
+
 * Layout
 
 - ~lisp/nl-llm-arch.el~     -- core primitives (RMSNorm, RoPE, SiLU, SwiGLU)

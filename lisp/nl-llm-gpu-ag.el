@@ -275,24 +275,48 @@ selection is held constant -- straight-through, no gradient to LOGITS)."
     (nlga-rt--make :slot os :rows m :cols e)))
 
 ;; --- composite: GQA attention + SwiGLU FFN + MoE + full block --------
-(defun nlga-gqa (b x wq bq wk bk wv bv wo bo heads kvheads cosr sinr spos sneg scl mask)
-  "Autograd causal GQA over X (seq x dim).  COSR/SINR RoPE tables, SPOS/SNEG
-sign scalars, SCL the 1/sqrt(hd) scalar, MASK an additive (seq x seq) causal
-mask -- all resident consts.  KVHEADS divides HEADS."
-  (let* ((dim (nlga-rt-cols x)) (hd (/ dim heads)) (grp (/ heads kvheads))
+(defun nlga-attn-scores (b q k seq dim heads kvheads)
+  "Fused causal scaled scores for all heads at once: S laid out
+\(heads*seq x seq), S[h,i,j] = (1/sqrt(hd))<q_i^h,k_j^kv> with -inf for j>i."
+  (let* ((kvdim (nlga-rt-cols k)) (ss (* heads (* seq seq)))
+         (os (nlga--tmp b ss)) (o (nlga-rt--make :slot os :rows (* heads seq) :cols seq)))
+    (nlga--d b (list 'attn-scores (list (nlga-rt-slot q) (nlga-rt-slot k) os)
+                     (list seq dim heads kvheads) (nlga--g ss)))
+    (nlga--bwd-push b (lambda ()
+      (let ((gs (nlga--grad b o)) (dq (nlga--tmp b (* seq dim))) (dk (nlga--tmp b (* seq kvdim))))
+        (nlga--d b (list 'attn-sc-dq (list gs (nlga-rt-slot k) dq) (list seq dim heads kvheads) (nlga--g (* seq dim))))
+        (nlga--accum b (nlga--grad b q) dq (* seq dim))
+        (nlga--d b (list 'attn-sc-dk (list gs (nlga-rt-slot q) dk) (list seq dim heads kvheads) (nlga--g (* seq kvdim))))
+        (nlga--accum b (nlga--grad b k) dk (* seq kvdim)))))
+    o))
+
+(defun nlga-attn-context (b p v seq dim heads kvheads)
+  "Fused per-head context: C (seq x dim), C[i,h*hd+t] = sum_j P[h,i,j] V[j,kv]."
+  (let* ((kvdim (nlga-rt-cols v)) (os (nlga--tmp b (* seq dim)))
+         (o (nlga-rt--make :slot os :rows seq :cols dim)))
+    (nlga--d b (list 'attn-context (list (nlga-rt-slot p) (nlga-rt-slot v) os)
+                     (list seq dim heads kvheads) (nlga--g (* seq dim))))
+    (nlga--bwd-push b (lambda ()
+      (let ((gc (nlga--grad b o)) (dp (nlga--tmp b (* heads (* seq seq)))) (dv (nlga--tmp b (* seq kvdim))))
+        (nlga--d b (list 'attn-ctx-dp (list gc (nlga-rt-slot v) dp) (list seq dim heads kvheads) (nlga--g (* heads (* seq seq)))))
+        (nlga--accum b (nlga--grad b p) dp (* heads (* seq seq)))
+        (nlga--d b (list 'attn-ctx-dv (list gc (nlga-rt-slot p) dv) (list seq dim heads kvheads) (nlga--g (* seq kvdim))))
+        (nlga--accum b (nlga--grad b v) dv (* seq kvdim)))))
+    o))
+
+(defun nlga-gqa (b x wq bq wk bk wv bv wo bo heads kvheads cosr sinr spos sneg _scl _mask)
+  "Autograd causal GQA over X (seq x dim), fused: all heads are computed in a
+single dispatch per stage (scores / softmax / context) -- the scale and causal
+mask are folded into the scores kernel, so the per-head loop (and its O(heads)
+dispatches) is gone.  COSR/SINR are RoPE tables, SPOS/SNEG sign scalars.  The
+old SCL/MASK args are accepted for API compatibility but unused."
+  (let* ((seq (nlga-rt-rows x)) (dim (nlga-rt-cols x))
          (q (nlga-rope b (nlga-linear b x wq bq) heads cosr sinr spos sneg))
          (k (nlga-rope b (nlga-linear b x wk bk) kvheads cosr sinr spos sneg))
-         (v (nlga-linear b x wv bv)) (ctxs nil) (h 0))
-    (while (< h heads)
-      (let* ((qh (nlga-slice-cols b q (* h hd) hd))
-             (kvc (* (/ h grp) hd))
-             (kh (nlga-slice-cols b k kvc hd))
-             (vh (nlga-slice-cols b v kvc hd))
-             (s (nlga-scale b (nlga-matmul b qh (nlga-transpose b kh)) scl))
-             (p (nlga-softmax b (nlga-add b s mask))))
-        (push (nlga-matmul b p vh) ctxs))
-      (setq h (1+ h)))
-    (nlga-linear b (nlga-concat-cols b (nreverse ctxs)) wo bo)))
+         (v (nlga-linear b x wv bv))
+         (p (nlga-softmax b (nlga-attn-scores b q k seq dim heads kvheads)))
+         (ctx (nlga-attn-context b p v seq dim heads kvheads)))
+    (nlga-linear b ctx wo bo)))
 
 (defun nlga-swiglu (b x wg bg wu bu wd bd)
   "SwiGLU FFN: (silu(X.Wg^T+bg) (*) (X.Wu^T+bu)) . Wd^T + bd."
