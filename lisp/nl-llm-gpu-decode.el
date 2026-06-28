@@ -243,5 +243,87 @@ Call once per position, in order; the ring cache is updated in place."
 (defalias 'nl-llm-gpu-stream-free 'nl-llm-gpu-decode-free
   "Free a streaming decoder context (see `nl-llm-gpu-decode-free').")
 
+;; --- PagedAttention: block-paged KV pool + per-sequence block table ----
+;; B sequences share one resident KV POOL of fixed-size blocks per layer; a
+;; layer-independent block TABLE (B x mbps, logical block -> physical block id)
+;; is filled on demand by a host allocator, so blocks are assigned only as
+;; positions cross block boundaries.  Decode is synchronous (shared POS) and
+;; produces logits identical to the contiguous batch decode (docs/design/03).
+(defun nl-llm-gpu--cache-append-paged (b src pos table pool kvdim bsz bs mbps)
+  (nlga--d b (list 'cache-append-paged
+                   (list (nlga-rt-slot src) (nlga-rt-slot pos) (nlga-rt-slot table) (nlga-rt-slot pool))
+                   (list bsz kvdim bs mbps) (nlga--g (* bsz kvdim)))))
+
+(defun nl-llm-gpu--attn-paged (b q ck cv pos table dim heads kvh bsz bs mbps)
+  (let ((os (nlga--tmp b (* bsz dim))))
+    (nlga--d b (list 'decode-attn-paged
+                     (list (nlga-rt-slot q) (nlga-rt-slot ck) (nlga-rt-slot cv) (nlga-rt-slot pos) (nlga-rt-slot table) os)
+                     (list bsz dim heads kvh bs mbps) (nlga--g (* bsz dim))))
+    (nlga-rt--make :slot os :rows bsz :cols dim)))
+
+(defun nl-llm-gpu--decode-block-paged (b x blk ck cv pos table sign cosr sinr heads kvh dim kvdim bsz bs mbps)
+  (let* ((a (nlga-rmsnorm b x (plist-get blk :ln1g)))
+         (q (nl-llm-gpu--rope-b b (nlga-linear b a (plist-get blk :wq) (plist-get blk :bq)) cosr sinr sign pos dim heads bsz))
+         (k (nl-llm-gpu--rope-b b (nlga-linear b a (plist-get blk :wk) (plist-get blk :bk)) cosr sinr sign pos kvdim kvh bsz))
+         (v (nlga-linear b a (plist-get blk :wv) (plist-get blk :bv))))
+    (nl-llm-gpu--cache-append-paged b k pos table ck kvdim bsz bs mbps)
+    (nl-llm-gpu--cache-append-paged b v pos table cv kvdim bsz bs mbps)
+    (let* ((ctx (nl-llm-gpu--attn-paged b q ck cv pos table dim heads kvh bsz bs mbps))
+           (attn (nlga-linear b ctx (plist-get blk :wo) (plist-get blk :bo)))
+           (x1 (nlga-add b x attn))
+           (bn (nlga-rmsnorm b x1 (plist-get blk :ln2g))))
+      (nlga-add b x1 (nlga-swiglu b bn (plist-get blk :wg) (plist-get blk :bg)
+                                  (plist-get blk :wu) (plist-get blk :bu)
+                                  (plist-get blk :wd) (plist-get blk :bd))))))
+
+;;;###autoload
+(defun nl-llm-gpu-paged-new (wte blocks lnfg bh heads kvh dim vocab bs mbps bsz tables)
+  "On-GPU PagedAttention batch decoder for BSZ sequences.  KV lives in a shared
+per-layer block POOL (block size BS, MBPS blocks per sequence, so max length
+BS*MBPS); a host allocator fills the block table on demand.  TABLES = (cos . sin)
+RoPE tables with >= BS*MBPS rows.  Returns a context for `nl-llm-gpu-paged-step'."
+  (let* ((b (nlga-new)) (kvdim (* kvh (/ dim heads))) (poolrows (* bsz mbps bs))
+         (tok (nlga-const b (photon-tensor (list bsz) (make-vector bsz 0.0))))
+         (pos (nlga-const b (photon-tensor '(1) (vector 0.0))))
+         (table (nlga-const b (photon-tensor (list (* bsz mbps)) (make-vector (* bsz mbps) 0.0))))
+         (sign (nlga-scalar b 1.0)) (one (nlga-scalar b 1.0))
+         (wter (nlga-const b wte)) (lnfgr (nlga-const b lnfg)) (bhr (nlga-const b bh))
+         (cosr (nlga-const b (car tables))) (sinr (nlga-const b (cdr tables)))
+         (bconsts (mapcar (lambda (blk) (nl-llm-gpu--block-consts b blk)) blocks))
+         (pools (mapcar (lambda (_) (cons (nl-llm-gpu--cache b poolrows kvdim)
+                                          (nl-llm-gpu--cache b poolrows kvdim))) blocks))
+         (x (nlga-embed b tok wter)) (bl bconsts) (cl pools))
+    (while bl
+      (setq x (nl-llm-gpu--decode-block-paged b x (car bl) (car (car cl)) (cdr (car cl))
+                                              pos table sign cosr sinr heads kvh dim kvdim bsz bs mbps))
+      (setq bl (cdr bl) cl (cdr cl)))
+    (let ((lout (nlga-keep b (nlga-linear b (nlga-rmsnorm b x lnfgr) wter bhr) one)))
+      (nlga-compile b)
+      (list :b b :tok tok :pos pos :table table :lout lout
+            :bsz bsz :vocab vocab :bs bs :mbps mbps :nblocks 0))))
+
+;;;###autoload
+(defun nl-llm-gpu-paged-step (ctx tokens pos)
+  "Decode one token per sequence at shared position POS on the paged decoder.
+TOKENS is a vector of BSZ ids.  On a block boundary the host allocator assigns
+BSZ fresh physical blocks (interleaved: phys = logical*BSZ + seq) and rewrites
+the resident block table.  Returns the flat (BSZ*vocab) logits."
+  (let* ((bsz (plist-get ctx :bsz)) (bs (plist-get ctx :bs)) (mbps (plist-get ctx :mbps)))
+    (when (= (% pos bs) 0)                          ; crossed into a new logical block
+      (let* ((lb (/ pos bs)) (tab (make-vector (* bsz mbps) 0.0)))
+        (dotimes (l (1+ lb)) (dotimes (s bsz)        ; on-demand: phys = l*bsz + s (interleaved)
+          (aset tab (+ (* s mbps) l) (float (+ (* l bsz) s)))))
+        (nlga-update (plist-get ctx :table) (photon-tensor (list (* bsz mbps)) tab))
+        (plist-put ctx :nblocks (* (1+ lb) bsz))))
+    (nlga-update (plist-get ctx :tok)
+                 (photon-tensor (list bsz) (let ((v (make-vector bsz 0.0)))
+                                             (dotimes (i bsz) (aset v i (float (aref tokens i)))) v)))
+    (nlga-update (plist-get ctx :pos) (photon-tensor '(1) (vector (float pos))))
+    (nth (plist-get ctx :lout) (nlga-step (plist-get ctx :b)))))
+
+;;;###autoload
+(defalias 'nl-llm-gpu-paged-free 'nl-llm-gpu-decode-free
+  "Free a paged decoder context (see `nl-llm-gpu-decode-free').")
+
 (provide 'nl-llm-gpu-decode)
 ;;; nl-llm-gpu-decode.el ends here

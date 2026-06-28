@@ -348,6 +348,22 @@ the trained latent weight quantizes to a genuinely ternary set.  This is Phase A
 (ternary weights, full-precision activations); int8 activations + the packed/DP4A
 kernel are Phase B (~docs/design/01-bitnet-ternary.org~).
 
+*** Paged KV cache: PagedAttention
+
+~nl-llm-gpu-paged-new~ / ~-step~ decode B sequences whose KV lives in a shared
+per-layer *pool* of fixed-size blocks (vLLM PagedAttention).  A layer-independent
+block *table* (B x blocks-per-seq) maps each sequence's logical block to a
+physical block id, and a host allocator hands out blocks *on demand* as positions
+cross block boundaries -- so memory is reserved per used block, not B x max_seq up
+front.  The =cache-append-paged= and =decode-attn-paged= kernels read/write the
+pool through the table (a data-dependent dynamic index, first de-risked by
+~test/gpu-paged-spike-test.el~ -- gather + scatter through a permuted table, exact).
+The physical layout is interleaved (=phys = logical*B + seq=), so the table
+indirection is exercised for real.  ~test/gpu-paged-test.el~ matches the CPU
+per-sequence decode to f32 (maxrel 8.1e-6) and checks the on-demand block count.
+Decode is synchronous here; per-sequence lengths, a free-list and prefix sharing
+are the next step (~docs/design/03-paged-attention.org~).
+
 *** Capstone: a real(er) run with mid-run checkpoint + resume
 
 ~examples/train-big-gpu.el~ exercises the whole stack at once at a larger scale: a
