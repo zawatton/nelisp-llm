@@ -27,8 +27,20 @@ through every block in ONE fused batch -- per-node Q/K/V + per-node RoPE
 (=decode-rope-b-v=) + =tree-attn= + SwiGLU, head per node -- yielding every node's
 next-token logits in one forward.  =test/gpu-tree-verify-test.el= matches decoding
 each node's full root->node path with the CPU decoder (a depth-2 tree, maxrel
-7.8e-6).  Remaining: deeper trees (more MTP heads) and folding the verify into the
-sampling/greedy decode loop end to end.
+7.8e-6).
+
+Deep trees lands too: training carries several MTP heads (head2..head4), and
+=nl-llm-gpu-spec-chain-decode= drafts a depth-D chain from one hidden, verifies
+the whole chain in one =nl-llm-gpu-tree-verify= forward, accepts the longest
+greedy-matching prefix and emits accepted + 1 bonus token -- still bit-exact plain
+greedy.  =test/gpu-spec-chain-test.el= pins losslessness on a random model;
+=examples/spec-chain.el= (trained head2/3/4) shows tokens/forward rising with
+depth: 2.86 (D=2), 4.00 (D=3), 5.00 (D=4), all lossless.  This needed two leak
+fixes: =nlga-free= now frees every resident handle (not just params) so the
+per-round verify builders don't leak, and the vkserver reuses freed resident slots
+(was monotonic, capped at 1024).  Remaining: a persistent (compile-once) tree
+verify that keeps the model weights resident, and folding the verify into the
+sampling decode loop.
 
 MTP self-speculative greedy decode lands: training adds a second look-ahead head
 H2 (predicts the token two ahead) via a second =nlga-seed-ce-idx= at a +2 target;

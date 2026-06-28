@@ -625,15 +625,18 @@ Uses the compiled command buffer when `nlga-compile' has been called."
       (while (< i n) (aset dst i (aref v i)) (setq i (1+ i))))))
 
 (defun nlga-free (b)
-  "Free the compiled batch (if any) and all resident parameter handles."
+  "Free the compiled batch (if any) and EVERY resident handle this builder
+uploaded -- params, consts, KV caches and the optimiser m/v/hyperparam buffers --
+each exactly once (all live as `res' slots).  Essential for builders that are
+created and freed repeatedly (e.g. per-round tree verify), and fixes a latent
+const/cache leak in the build-once decoders too."
   (when (nlga-compiled b)
     (ignore-errors (nelisp-gpu-server-free-compiled (car (nlga-compiled b))))
     (setf (nlga-compiled b) nil))
-  (when (nlga-adam b)
-    (ignore-errors (nelisp-gpu-server-free (plist-get (nlga-adam b) :h)))
-    (dolist (h (plist-get (nlga-adam b) :mv)) (ignore-errors (nelisp-gpu-server-free h)))
-    (setf (nlga-adam b) nil))
-  (dolist (p (nlga-params b)) (ignore-errors (nelisp-gpu-server-free (plist-get p :handle)))))
+  (setf (nlga-adam b) nil)
+  (dolist (s (nlga-slots b))
+    (when (eq (car-safe s) 'res) (ignore-errors (nelisp-gpu-server-free (nth 1 s)))))
+  (setf (nlga-slots b) nil))
 
 (provide 'nl-llm-gpu-ag)
 ;;; nl-llm-gpu-ag.el ends here

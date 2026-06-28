@@ -15,6 +15,8 @@
 (require 'photon-tensor)
 (require 'nl-llm-gpu)      ; server + bin path
 (require 'nl-llm-gpu-ag)   ; builder: nlga ops, slots, compile/step
+(require 'nl-llm-decode)   ; CPU dcache / decode-step / decode-h (context prefill)
+(require 'nl-llm-spec)     ; argmax helpers for chain-draft speculative decode
 
 (defun nl-llm-gpu--block-consts (b blk)
   "Wrap a block tensor plist BLK into a plist of resident const rts."
@@ -525,6 +527,31 @@ each node attends the shared context plus its ancestor chain (tree-attn).  TABLE
           (dotimes (i m) (push (let ((v (make-vector vocab 0.0)))
                                  (dotimes (j vocab) (aset v j (aref flat (+ (* i vocab) j)))) v) res))
           (nreverse res))))))
+
+;;;###autoload
+(defun nl-llm-gpu-spec-chain-decode (prompt nsteps blocks wte lnfg bh mtp-heads heads kvh dim vocab maxseq tables maxdepth)
+  "Chain-draft speculative decode with multiple MTP heads + GPU tree verify.
+MTP-HEADS is a list of (W . B) for head2, head3, ...; the draft depth is
+1 + (length MTP-HEADS).  Each round drafts a depth-long chain from the current
+hidden (head_k drafts the token k ahead), verifies the whole chain in ONE
+`nl-llm-gpu-tree-verify' forward, accepts the longest greedily-matching prefix and
+emits accepted + 1 bonus token.  Returns (TOKENS . FORWARDS); TOKENS is exactly
+plain greedy (lossless) and length(TOKENS)/FORWARDS is the mean tokens per verify."
+  (let* ((depth (1+ (length mtp-heads))) (acc (append prompt nil)) (out nil) (forwards 0))
+    (while (< (length out) nsteps)
+      (setq forwards (1+ forwards))
+      (let* ((cdc (mapcar (lambda (_) (nl-llm-dcache-new maxseq dim heads kvh)) blocks)) (h nil) (L (length acc)))
+        (dolist (tk acc) (setq h (nl-llm-decode-h tk blocks cdc wte lnfg dim)))   ; hidden of last accepted token
+        (let* ((drafts (cons (nl-llm--head-argmax h wte bh vocab)                 ; head1 (tied) + MTP heads
+                             (mapcar (lambda (wb) (nl-llm--head-argmax h (car wb) (cdr wb) vocab)) mtp-heads)))
+               (parents (let ((p nil) (k 0)) (while (< k depth) (push (float (if (= k 0) depth (1- k))) p) (setq k (1+ k))) (nreverse p)))
+               (positions (let ((p nil) (k 0)) (while (< k depth) (push (+ L k) p) (setq k (1+ k))) (nreverse p)))
+               (pa (nl-llm-gpu-tree-verify blocks wte lnfg bh heads kvh dim vocab acc drafts parents positions tables maxdepth))
+               (a 1))                                                             ; node0 (= argmax head1) always accepted
+          (while (and (< a depth) (= (nth a drafts) (nl-llm-spec-argmax (nth (1- a) pa) 0 vocab))) (setq a (1+ a)))
+          (let ((emit (append (cl-subseq drafts 0 a) (list (nl-llm-spec-argmax (nth (1- a) pa) 0 vocab)))))
+            (dolist (tk emit) (when (< (length out) nsteps) (push tk out) (setq acc (append acc (list tk)))))))))
+    (cons (nreverse out) forwards)))
 
 (provide 'nl-llm-gpu-decode)
 ;;; nl-llm-gpu-decode.el ends here
