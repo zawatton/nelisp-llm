@@ -37,6 +37,40 @@ Training data: fully-open corpora only -- The Pile (EleutherAI), FineWeb /
 FineWeb-Edu, or Dolma -- so the whole pipeline (data + code + weights) stays
 reproducible.
 
+* GPU acceleration
+
+The heavy linear algebra runs on the GPU via the sibling ~nelisp-gpu~
+(SPIR-V/Vulkan) backend, reusing ~photon-tensor-gpu~'s function-cell swap, so
+the modern block runs on the GPU unchanged.  ~nl-llm-gpu-enable~ starts the
+persistent vkserver and routes ~photon-tensor~ matmul/linear/softmax through
+the GPU kernels; both the forward projections / expert FFNs and the attention
+score/context matmuls (in the autograd path) are accelerated.
+
+Weights are kept *resident* on the GPU (uploaded once, referenced by handle).
+For training, the in-place SGD step mutates weights the resident cache cannot
+see, so ~nl-llm-gpu-invalidate~ must be called after each step to refresh the
+GPU copies; ~test/gpu-test.el~ verifies this end-to-end (and that the GPU
+forward matches the CPU result, and that the GQA+MoE block actually trains on
+the GPU).
+
+Measured on a GeForce GTX 1060 (one block, seq 16, ff = 4·dim, ~make bench-gpu~):
+
+| size     | op      | CPU ms | GPU ms | speedup |
+|----------+---------+--------+--------+---------|
+| dim 64   | infer   |    367 |     73 |   5.0x  |
+| dim 128  | infer   |   1213 |    131 |   9.3x  |
+| dim 256  | infer   |   4460 |    261 |  17.1x  |
+| dim 64   | train   |   1224 |   1360 |   0.9x  |
+| dim 128  | train   |   4125 |   4234 |   1.0x  |
+| dim 256  | train   |  15329 |  14551 |   1.1x  |
+
+Inference is a large, *scaling* win (residency amortises the weight upload over
+every token).  Training is currently break-even: in-place SGD forces the
+(mutated) weights to be re-encoded and re-uploaded every step, and the elisp
+float marshalling eats the GPU compute gain.  The next step for training is to
+keep weights + optimiser state resident and update them on-device, so they
+never round-trip.
+
 * Layout
 
 - ~lisp/nl-llm-arch.el~     -- core primitives (RMSNorm, RoPE, SiLU, SwiGLU)
@@ -44,15 +78,18 @@ reproducible.
 - ~lisp/nl-llm-moe.el~      -- top-k sparse mixture-of-experts FFN
 - ~lisp/nl-llm-block.el~    -- pre-norm block + model forward (GQA/MoE)
 - ~lisp/nl-llm-autograd.el~ -- reverse-mode backward for all of the above
-- ~test/*-test.el~          -- correctness + numerical gradient checks
+- ~lisp/nl-llm-gpu.el~      -- GPU backend wiring (enable / invalidate)
+- ~test/*-test.el~          -- correctness + numerical gradient checks (incl. gpu-test)
 - ~examples/train-modern.el~      -- train a single-head RMSNorm/RoPE/SwiGLU block
 - ~examples/train-modern-full.el~ -- train the full block (multi-head GQA + MoE)
+- ~examples/bench-gpu.el~         -- CPU vs GPU timing table
 
 * Run
 
 #+begin_src sh
-make test                 # all correctness + gradient-check suites
+make test                 # all correctness + gradient-check suites (incl. GPU)
 make train-modern-full    # train the full GQA + MoE block on open data
+make bench-gpu            # CPU vs GPU timing table (needs a Vulkan device)
 #+end_src
 
 or directly:
