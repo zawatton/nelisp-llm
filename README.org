@@ -303,6 +303,28 @@ B new tokens per step (B-row projections + ~decode-rope-b~ / ~cache-append-b~ /
 ~decode-attn-b~ kernels, shared position).  ~test/gpu-batch-test.el~ checks each
 sequence's logits match decoding it alone (maxrel ~8e-6).
 
+*** Bounded-memory decode: StreamingLLM attention sinks
+
+~nl-llm-stream.el~ bounds the KV cache for arbitrarily long generation (Xiao et
+al. 2023).  A pure sliding window collapses once the first tokens are evicted,
+because softmax dumps its surplus probability mass onto the first few tokens --
+the /attention sinks/.  Keeping =nsink= initial tokens permanently plus a rolling
+window of the last =win= tokens bounds the cache at =nsink+win= entries while
+preserving quality.  The one subtlety is RoPE: cached keys are rotated by their
+/cache-relative/ position (rank in the kept set), not their absolute stream
+position, so every relative distance the query sees stays in distribution.  We
+store raw keys and rotate at attention time.
+
+When the cap is never reached this reduces *exactly* to ~nl-llm-decode~:
+~test/stream-test.el~ checks (a) cap>=len gives bit-identical logits to the plain
+KV decode (maxdiff 0), (b) the cache stays bounded with sink slots pinned, and
+(c) under period-=win= input the logits repeat with period =win= (bit-identical),
+pinning the cache-relative RoPE + ring indexing.  ~examples/stream-decode.el~
+trains a model and compares full vs sink+window vs window-only decode at an equal
+cache budget (the sink benefit is a learned effect, hence the training step).
+This is also the CPU reference oracle for the planned GPU streaming decode
+(~docs/design/02-streaming-llm-attention-sink.org~).
+
 *** Capstone: a real(er) run with mid-run checkpoint + resume
 
 ~examples/train-big-gpu.el~ exercises the whole stack at once at a larger scale: a
@@ -342,6 +364,7 @@ size, while on-device keeps everything resident and only moves the loss out.
 - ~lisp/nl-llm-moe.el~      -- top-k sparse mixture-of-experts FFN
 - ~lisp/nl-llm-block.el~    -- pre-norm block + model forward (GQA/MoE) + sampling
 - ~lisp/nl-llm-decode.el~   -- KV-cache incremental decode (CPU; biases, tied head)
+- ~lisp/nl-llm-stream.el~   -- StreamingLLM bounded decode (attention sink + window, CPU)
 - ~lisp/nl-llm-gpu-decode.el~ -- on-GPU KV-cache decode (resident cache, runtime pos)
 - ~lisp/nl-llm-ckpt.el~      -- checkpoint save / load (config, step, all tensors)
 - ~lisp/nl-llm-autograd.el~ -- reverse-mode backward for all of the above
