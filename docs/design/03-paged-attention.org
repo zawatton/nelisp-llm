@@ -3,7 +3,17 @@
 #+STATUS: DRAFT
 
 * Status
-DRAFT -- concept + application design.  Not implemented.
+DRAFT -- design + *feasibility spike PASSED*.  Full implementation not started.
+
+The one load-bearing unknown (the compiler emitting a data-dependent dynamic
+index = =POOL[uint(TABLE[blk])*bs + off]=) is now de-risked: kernels
+=gather-spike= / =scatter-spike= (nelisp-gpu) and =test/gpu-paged-spike-test.el=
+exercise both the attention-read (gather) and cache-append (scatter) addressing
+through a block table and match a CPU computation exactly (maxdiff 0).  The
+compiler handles table-indirected gather/scatter, so the paged kernels below are
+implementable.  Remaining: =cache-append-paged= / =decode-attn-paged=, the
+resident pool + block-table buffers, and the host-side (elisp) free-block
+allocator.
 
 Source: "Efficient Memory Management for Large Language Model Serving with
 PagedAttention" (vLLM, 2023).
