@@ -39,6 +39,7 @@ test:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-paged-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-paged-v-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-tree-attn-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-tree-verify-test.el
 
 compile:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) \

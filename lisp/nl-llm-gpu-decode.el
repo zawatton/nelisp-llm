@@ -461,5 +461,70 @@ flat (BSZ*vocab) logits.  Advancing lengths after the step is the caller's job
 (defalias 'nl-llm-gpu-paged-v-free 'nl-llm-gpu-decode-free
   "Free a variable-length paged decoder context.")
 
+;; --- end-to-end tree verify: a whole draft tree in one fused forward ---------
+;; Decode the accepted context (CPU prefill) to get each block's K/V cache, then
+;; run all M tree nodes through every block in one nlga batch -- per-node Q/K/V +
+;; per-node RoPE + tree-attn (context + ancestor mask) + SwiGLU -- and a head per
+;; node, so one forward yields the next-token logits at every tree node.
+(defun nl-llm-gpu--head-vec (src n)
+  (let ((v (make-vector n 0.0))) (dotimes (i n) (aset v i (aref src i))) v))
+
+(defun nl-llm-gpu--tree-attn (b q ck cv nk nv parent lenb dim heads kvh m maxdepth)
+  (let ((os (nlga--tmp b (* m dim))))
+    (nlga--d b (list 'tree-attn (list (nlga-rt-slot q) (nlga-rt-slot ck) (nlga-rt-slot cv)
+                                      (nlga-rt-slot nk) (nlga-rt-slot nv) (nlga-rt-slot parent) (nlga-rt-slot lenb) os)
+                     (list m dim heads kvh maxdepth) (nlga--g (* m dim))))
+    (nlga-rt--make :slot os :rows m :cols dim)))
+
+(defun nl-llm-gpu--tree-block (b x blk ckb cvb parent lenb sign cosr sinr posns heads kvh dim kvdim m maxdepth)
+  (let* ((a (nlga-rmsnorm b x (plist-get blk :ln1g)))
+         (q (nlga--rope-bv b (nlga-linear b a (plist-get blk :wq) (plist-get blk :bq)) cosr sinr sign posns dim heads m))
+         (k (nlga--rope-bv b (nlga-linear b a (plist-get blk :wk) (plist-get blk :bk)) cosr sinr sign posns kvdim kvh m))
+         (v (nlga-linear b a (plist-get blk :wv) (plist-get blk :bv)))
+         (ctx (nl-llm-gpu--tree-attn b q ckb cvb k v parent lenb dim heads kvh m maxdepth))
+         (attn (nlga-linear b ctx (plist-get blk :wo) (plist-get blk :bo)))
+         (x1 (nlga-add b x attn))
+         (bn (nlga-rmsnorm b x1 (plist-get blk :ln2g))))
+    (nlga-add b x1 (nlga-swiglu b bn (plist-get blk :wg) (plist-get blk :bg)
+                                (plist-get blk :wu) (plist-get blk :bu)
+                                (plist-get blk :wd) (plist-get blk :bd)))))
+
+;;;###autoload
+(defun nl-llm-gpu-tree-verify (blocks wte lnfg bh heads kvh dim vocab ctx-tokens nodes parents positions tables maxdepth)
+  "One-forward tree verify.  CTX-TOKENS is the accepted sequence; NODES is a list
+of M draft-tree token ids with PARENTS (parent index per node, sentinel = M for a
+root) and per-node POSITIONS.  Returns a list of M (vocab) logit vectors -- the
+next-token logits at every tree node -- computed in a single fused GPU batch where
+each node attends the shared context plus its ancestor chain (tree-attn).  TABLES
+= (cos . sin) with > max(POSITIONS) rows.  The server must be running."
+  (let* ((m (length nodes)) (kvdim (* kvh (/ dim heads))) (L (length ctx-tokens))
+         (cdc (mapcar (lambda (_) (nl-llm-dcache-new (max 1 L) dim heads kvh)) blocks)))
+    (dolist (tk ctx-tokens) (nl-llm-decode-step tk blocks cdc wte lnfg bh dim))  ; CPU prefill -> per-block K/V
+    (let* ((b (nlga-new))
+           (tok (nlga-const b (photon-tensor (list m) (let ((v (make-vector m 0.0)) (i 0))
+                                                        (dolist (tk nodes) (aset v i (float tk)) (setq i (1+ i))) v))))
+           (posns (nlga-const b (photon-tensor (list m) (apply #'vector (mapcar #'float positions)))))
+           (parent (nlga-const b (photon-tensor (list m) (apply #'vector (mapcar #'float parents)))))
+           (lenb (nlga-const b (photon-tensor '(1) (vector (float L)))))
+           (sign (nlga-scalar b 1.0)) (one (nlga-scalar b 1.0))
+           (wter (nlga-const b wte)) (lnfgr (nlga-const b lnfg)) (bhr (nlga-const b bh))
+           (cosr (nlga-const b (car tables))) (sinr (nlga-const b (cdr tables)))
+           (bconsts (mapcar (lambda (blk) (nl-llm-gpu--block-consts b blk)) blocks))
+           (cks (mapcar (lambda (dc)
+                          (cons (nlga-const b (photon-tensor (list L kvdim) (nl-llm-gpu--head-vec (nl-llm-dcache-k dc) (* L kvdim))))
+                                (nlga-const b (photon-tensor (list L kvdim) (nl-llm-gpu--head-vec (nl-llm-dcache-v dc) (* L kvdim)))))) cdc))
+           (x (nlga-embed b tok wter)) (bl bconsts) (cl cks))
+      (while bl
+        (setq x (nl-llm-gpu--tree-block b x (car bl) (car (car cl)) (cdr (car cl))
+                                        parent lenb sign cosr sinr posns heads kvh dim kvdim m maxdepth))
+        (setq bl (cdr bl) cl (cdr cl)))
+      (let ((lout (nlga-keep b (nlga-linear b (nlga-rmsnorm b x lnfgr) wter bhr) one)))
+        (nlga-compile b)
+        (let ((flat (nth lout (nlga-step b))) (res nil))
+          (nlga-free b)
+          (dotimes (i m) (push (let ((v (make-vector vocab 0.0)))
+                                 (dotimes (j vocab) (aset v j (aref flat (+ (* i vocab) j)))) v) res))
+          (nreverse res))))))
+
 (provide 'nl-llm-gpu-decode)
 ;;; nl-llm-gpu-decode.el ends here

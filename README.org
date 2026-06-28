@@ -414,8 +414,12 @@ On a trained H2: single-draft 1.92x, tree(k=4) 2.00x, lossless sampling
 (T0.8/top-k30) 1.78x tokens/forward.  The core of a GPU-batched tree verify is in
 place too: the ~tree-attn~ kernel computes every draft-tree node's attention over
 a shared context cache + its ancestor chain in ONE dispatch
-(~test/gpu-tree-attn-test.el~, maxrel 3.9e-6); wiring it through the whole decode
-loop is the remaining step (~docs/design/04-speculative-decoding.org~).
+(~test/gpu-tree-attn-test.el~, maxrel 3.9e-6), and ~nl-llm-gpu-tree-verify~ wires
+it through the whole decode loop -- accepted context prefill, then all M tree nodes
+through every block (per-node Q/K/V + RoPE + tree-attn + SwiGLU + head) in ONE
+fused forward, yielding every node's next-token logits.  ~test/gpu-tree-verify-test.el~
+matches decoding each node's full path on the CPU (depth-2 tree, maxrel 7.8e-6)
+(~docs/design/04-speculative-decoding.org~).
 
 *** Capstone: a real(er) run with mid-run checkpoint + resume
 

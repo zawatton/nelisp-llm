@@ -20,10 +20,15 @@ computes, in ONE dispatch, every draft-tree node's attention over a shared conte
 cache plus its ancestor chain among the nodes (parent array, sentinel = M; GQA;
 pre-RoPE'd Q/K) -- so a whole draft tree is verified in one attention pass instead
 of sequential per-node feeds.  =test/gpu-tree-attn-test.el= matches a CPU
-reference (context + walked-parent-chain mask) to f32 (maxrel 3.9e-6).  Remaining:
-wire =tree-attn= through the full multi-block decode loop (project Q/K/V + RoPE per
-node, run all blocks, head per node) for an end-to-end one-forward tree round, and
-deeper trees (more MTP heads).
+reference (context + walked-parent-chain mask) to f32 (maxrel 3.9e-6).  And it is
+now wired through the *whole* decode loop: =nl-llm-gpu-tree-verify= decodes the
+accepted context (CPU prefill -> per-block K/V), then runs all M draft-tree nodes
+through every block in ONE fused batch -- per-node Q/K/V + per-node RoPE
+(=decode-rope-b-v=) + =tree-attn= + SwiGLU, head per node -- yielding every node's
+next-token logits in one forward.  =test/gpu-tree-verify-test.el= matches decoding
+each node's full root->node path with the CPU decoder (a depth-2 tree, maxrel
+7.8e-6).  Remaining: deeper trees (more MTP heads) and folding the verify into the
+sampling/greedy decode loop end to end.
 
 MTP self-speculative greedy decode lands: training adds a second look-ahead head
 H2 (predicts the token two ahead) via a second =nlga-seed-ce-idx= at a +2 target;
