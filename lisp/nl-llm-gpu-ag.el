@@ -1,0 +1,353 @@
+;;; nl-llm-gpu-ag.el --- resident-tensor autograd: build on-device train steps  -*- lexical-binding: t; -*-
+
+;; A thin deferred-execution autograd whose tensors live on the GPU.  Each op
+;; emitter appends its forward dispatch(es) to a fused command buffer and
+;; records a backward thunk; calling the thunks in reverse emits the backward
+;; dispatches, accumulating gradients into per-tensor resident grad slots; a
+;; final pass emits an on-device `sgd' dispatch per parameter.  The whole
+;; forward + backward + SGD then runs as ONE batch per step with the weights
+;; (and the optimiser update) resident on the GPU -- no weight round-trips.
+;;
+;; This generalises the hand-wired MLP trainer (nl-llm-gpu-train.el): a model
+;; is expressed once with the op emitters and is trained on-device automatically.
+;;
+;; Conventions: a resident tensor (`nlga-rt') is (slot rows cols grad); 2D row
+;; major; a "vector" (bias, gain) is rows=n cols=1.  Gradients ACCUMULATE
+;; (vadd into a zeroed tmp slot) so fan-out / residuals are correct.
+
+;;; Code:
+
+(require 'cl-lib)
+(require 'photon-tensor)
+(require 'nl-llm-gpu)   ; nelisp-gpu-server + bin path
+
+(defsubst nlga--g (n) (/ (+ n 63) 64))
+
+(cl-defstruct (nlga (:constructor nlga--make))
+  (slots nil) (nslot 0) (disp nil) (bwd nil) (params nil) (nout 0))
+(cl-defstruct (nlga-rt (:constructor nlga-rt--make)) slot rows cols grad)
+(defsubst nlga-rt-size (x) (* (nlga-rt-rows x) (nlga-rt-cols x)))
+
+(defun nlga-new () (nlga--make))
+
+(defun nlga--slot (b spec)
+  "Append SPEC to B's slot list; return its index."
+  (push spec (nlga-slots b)) (prog1 (nlga-nslot b) (cl-incf (nlga-nslot b))))
+(defun nlga--res (b vec) (nlga--slot b (list 'res (nelisp-gpu-server-upload vec) (length vec))))
+(defun nlga--tmp (b n) (nlga--slot b (cons 'tmp n)))
+(defun nlga--out (b n) (nlga--slot b (cons 'out n)))
+(defun nlga--d (b d) (push d (nlga-disp b)))
+
+(defun nlga--grad (b x)
+  "Resident grad slot for rt X (a zeroed tmp), allocated on first use."
+  (or (nlga-rt-grad x) (setf (nlga-rt-grad x) (nlga--tmp b (nlga-rt-size x)))))
+(defun nlga--accum (b dst-grad src-slot n)
+  "Accumulate SRC-SLOT into grad slot DST-GRAD in place (vadd)."
+  (nlga--d b (list 'vadd (list dst-grad src-slot dst-grad) (list n) (nlga--g n))))
+;; backward thunks are stored most-recent-first; running them in stored order
+;; is reverse-chronological = correct backprop order.
+(defun nlga--bwd-push (b thunk) (push thunk (nlga-bwd b)))
+
+;; --- leaves ----------------------------------------------------------
+(defun nlga-const (b tensor)
+  "Upload TENSOR resident as a non-trainable input; return an rt."
+  (let ((sh (photon-tensor-shape tensor)))
+    (nlga-rt--make :slot (nlga--res b (photon-tensor-data tensor))
+                   :rows (car sh) :cols (or (nth 1 sh) 1))))
+(defun nlga-param (b tensor)
+  "Upload TENSOR resident as a trainable parameter (records it for SGD)."
+  (let* ((sh (photon-tensor-shape tensor)) (data (photon-tensor-data tensor))
+         (h (nelisp-gpu-server-upload data))
+         (slot (nlga--slot b (list 'res h (length data))))
+         (rt (nlga-rt--make :slot slot :rows (car sh) :cols (or (nth 1 sh) 1))))
+    (push (list :rt rt :tensor tensor :handle h) (nlga-params b))
+    rt))
+(defun nlga-scalar (b v) "Resident 1-element rt holding V." (nlga-const b (photon-tensor '(1) (vector v))))
+
+;; --- ops -------------------------------------------------------------
+(defun nlga-linear (b x w bias)
+  "Affine Y = X (seq x in) . W^T (W out x in) + BIAS (out)."
+  (let* ((seq (nlga-rt-rows x)) (in (nlga-rt-cols x)) (out (nlga-rt-rows w))
+         (ys (nlga--tmp b (* seq out))) (y (nlga-rt--make :slot ys :rows seq :cols out)))
+    (nlga--d b (list 'linear (list (nlga-rt-slot x) (nlga-rt-slot w) (nlga-rt-slot bias) ys)
+                     (list seq in out) (nlga--g (* seq out))))
+    (nlga--bwd-push b
+      (lambda ()
+        (let ((gy (nlga--grad b y)))
+          ;; dx = gy . W
+          (let ((dx (nlga--tmp b (* seq in))))
+            (nlga--d b (list 'matmul (list gy (nlga-rt-slot w) dx) (list seq out in) (nlga--g (* seq in))))
+            (nlga--accum b (nlga--grad b x) dx (* seq in)))
+          ;; dW = gy^T . x
+          (let ((gyt (nlga--tmp b (* out seq))) (dw (nlga--tmp b (* out in))))
+            (nlga--d b (list 'transpose (list gy gyt) (list seq out) (nlga--g (* seq out))))
+            (nlga--d b (list 'matmul (list gyt (nlga-rt-slot x) dw) (list out seq in) (nlga--g (* out in))))
+            (nlga--accum b (nlga--grad b w) dw (* out in)))
+          ;; db = colsum(gy)
+          (let ((db (nlga--tmp b out)))
+            (nlga--d b (list 'colsum (list gy db) (list seq out) (nlga--g out)))
+            (nlga--accum b (nlga--grad b bias) db out)))))
+    y))
+
+(defun nlga-gelu (b x)
+  (let* ((n (nlga-rt-size x)) (os (nlga--tmp b n))
+         (o (nlga-rt--make :slot os :rows (nlga-rt-rows x) :cols (nlga-rt-cols x))))
+    (nlga--d b (list 'gelu (list (nlga-rt-slot x) os) (list n) (nlga--g n)))
+    (nlga--bwd-push b (lambda ()
+      (let ((go (nlga--grad b o)) (dx (nlga--tmp b n)))
+        (nlga--d b (list 'gelu-bwd (list go (nlga-rt-slot x) dx) (list n) (nlga--g n)))
+        (nlga--accum b (nlga--grad b x) dx n))))
+    o))
+
+(defun nlga-add (b a c)
+  "Elementwise A + C (same shape); gradient flows to both."
+  (let* ((n (nlga-rt-size a)) (os (nlga--tmp b n))
+         (o (nlga-rt--make :slot os :rows (nlga-rt-rows a) :cols (nlga-rt-cols a))))
+    (nlga--d b (list 'vadd (list (nlga-rt-slot a) (nlga-rt-slot c) os) (list n) (nlga--g n)))
+    (nlga--bwd-push b (lambda ()
+      (let ((go (nlga--grad b o)))
+        (nlga--accum b (nlga--grad b a) go n)
+        (nlga--accum b (nlga--grad b c) go n))))
+    o))
+
+(defun nlga-rmsnorm (b x gamma)
+  "Row-wise RMSNorm of X (M x N) with trainable GAMMA (N)."
+  (let* ((m (nlga-rt-rows x)) (n (nlga-rt-cols x)) (istd (nlga--tmp b m))
+         (os (nlga--tmp b (* m n))) (o (nlga-rt--make :slot os :rows m :cols n)))
+    (nlga--d b (list 'rmsnorm-istd (list (nlga-rt-slot x) istd) (list m n) (nlga--g m)))
+    (nlga--d b (list 'rmsnorm-fwd (list (nlga-rt-slot x) istd (nlga-rt-slot gamma) os)
+                     (list m n) (nlga--g (* m n))))
+    (nlga--bwd-push b (lambda ()
+      (let ((go (nlga--grad b o)) (dx (nlga--tmp b (* m n))) (dg (nlga--tmp b n)))
+        (nlga--d b (list 'rmsnorm-dx (list go (nlga-rt-slot x) istd (nlga-rt-slot gamma) dx)
+                         (list m n) (nlga--g m)))
+        (nlga--accum b (nlga--grad b x) dx (* m n))
+        (nlga--d b (list 'rmsnorm-dgamma (list go (nlga-rt-slot x) istd dg) (list m n) (nlga--g n)))
+        (nlga--accum b (nlga--grad b gamma) dg n))))
+    o))
+
+(defun nlga-silu (b x)
+  (let* ((n (nlga-rt-size x)) (os (nlga--tmp b n))
+         (o (nlga-rt--make :slot os :rows (nlga-rt-rows x) :cols (nlga-rt-cols x))))
+    (nlga--d b (list 'silu (list (nlga-rt-slot x) os) (list n) (nlga--g n)))
+    (nlga--bwd-push b (lambda ()
+      (let ((go (nlga--grad b o)) (dx (nlga--tmp b n)))
+        (nlga--d b (list 'silu-bwd (list go (nlga-rt-slot x) dx) (list n) (nlga--g n)))
+        (nlga--accum b (nlga--grad b x) dx n))))
+    o))
+
+(defun nlga-mul (b a c)
+  "Elementwise product of same-shape A and C."
+  (let* ((n (nlga-rt-size a)) (os (nlga--tmp b n))
+         (o (nlga-rt--make :slot os :rows (nlga-rt-rows a) :cols (nlga-rt-cols a))))
+    (nlga--d b (list 'mul (list (nlga-rt-slot a) (nlga-rt-slot c) os) (list n) (nlga--g n)))
+    (nlga--bwd-push b (lambda ()
+      (let ((go (nlga--grad b o)) (da (nlga--tmp b n)) (dc (nlga--tmp b n)))
+        (nlga--d b (list 'mul (list go (nlga-rt-slot c) da) (list n) (nlga--g n)))
+        (nlga--accum b (nlga--grad b a) da n)
+        (nlga--d b (list 'mul (list go (nlga-rt-slot a) dc) (list n) (nlga--g n)))
+        (nlga--accum b (nlga--grad b c) dc n))))
+    o))
+
+(defun nlga-rope (b x heads cosr sinr spos sneg)
+  "Per-head RoPE on X (M x cols) with HEADS heads; COSR/SINR are resident
+cos/sin tables (M x hd/2), SPOS/SNEG are resident [+1]/[-1] sign scalars.
+RoPE is orthogonal so the backward is the inverse rotation (SNEG)."
+  (let* ((m (nlga-rt-rows x)) (cols (nlga-rt-cols x)) (total (/ (* m cols) 2))
+         (os (nlga--tmp b (* m cols))) (o (nlga-rt--make :slot os :rows m :cols cols)))
+    (nlga--d b (list 'rope-apply (list (nlga-rt-slot x) (nlga-rt-slot cosr) (nlga-rt-slot sinr)
+                                       (nlga-rt-slot spos) os)
+                     (list m cols heads) (nlga--g total)))
+    (nlga--bwd-push b (lambda ()
+      (let ((go (nlga--grad b o)) (dx (nlga--tmp b (* m cols))))
+        (nlga--d b (list 'rope-apply (list go (nlga-rt-slot cosr) (nlga-rt-slot sinr)
+                                           (nlga-rt-slot sneg) dx)
+                         (list m cols heads) (nlga--g total)))
+        (nlga--accum b (nlga--grad b x) dx (* m cols)))))
+    o))
+
+(defun nlga-transpose (b x)
+  (let* ((m (nlga-rt-rows x)) (n (nlga-rt-cols x)) (os (nlga--tmp b (* m n)))
+         (o (nlga-rt--make :slot os :rows n :cols m)))
+    (nlga--d b (list 'transpose (list (nlga-rt-slot x) os) (list m n) (nlga--g (* m n))))
+    (nlga--bwd-push b (lambda ()
+      (let ((go (nlga--grad b o)) (dx (nlga--tmp b (* m n))))
+        (nlga--d b (list 'transpose (list go dx) (list n m) (nlga--g (* m n))))
+        (nlga--accum b (nlga--grad b x) dx (* m n)))))
+    o))
+
+(defun nlga-matmul (b a c)
+  "Matmul A (M x K) by C (K x N)."
+  (let* ((mm (nlga-rt-rows a)) (kk (nlga-rt-cols a)) (nn (nlga-rt-cols c))
+         (os (nlga--tmp b (* mm nn))) (o (nlga-rt--make :slot os :rows mm :cols nn)))
+    (nlga--d b (list 'matmul (list (nlga-rt-slot a) (nlga-rt-slot c) os) (list mm kk nn) (nlga--g (* mm nn))))
+    (nlga--bwd-push b (lambda ()
+      (let ((go (nlga--grad b o)))
+        ;; dA = go (M x N) . C^T (N x K)
+        (let ((ct (nlga--tmp b (* kk nn))) (da (nlga--tmp b (* mm kk))))
+          (nlga--d b (list 'transpose (list (nlga-rt-slot c) ct) (list kk nn) (nlga--g (* kk nn))))
+          (nlga--d b (list 'matmul (list go ct da) (list mm nn kk) (nlga--g (* mm kk))))
+          (nlga--accum b (nlga--grad b a) da (* mm kk)))
+        ;; dC = A^T (K x M) . go (M x N)
+        (let ((at (nlga--tmp b (* mm kk))) (dc (nlga--tmp b (* kk nn))))
+          (nlga--d b (list 'transpose (list (nlga-rt-slot a) at) (list mm kk) (nlga--g (* mm kk))))
+          (nlga--d b (list 'matmul (list at go dc) (list kk mm nn) (nlga--g (* kk nn))))
+          (nlga--accum b (nlga--grad b c) dc (* kk nn))))))
+    o))
+
+(defun nlga-scale (b x s)
+  "Scale X by resident scalar S ([s])."
+  (let* ((n (nlga-rt-size x)) (os (nlga--tmp b n))
+         (o (nlga-rt--make :slot os :rows (nlga-rt-rows x) :cols (nlga-rt-cols x))))
+    (nlga--d b (list 'scale (list (nlga-rt-slot x) (nlga-rt-slot s) os) (list n) (nlga--g n)))
+    (nlga--bwd-push b (lambda ()
+      (let ((go (nlga--grad b o)) (dx (nlga--tmp b n)))
+        (nlga--d b (list 'scale (list go (nlga-rt-slot s) dx) (list n) (nlga--g n)))
+        (nlga--accum b (nlga--grad b x) dx n))))
+    o))
+
+(defun nlga-softmax (b x)
+  "Row-wise softmax of X (M x N)."
+  (let* ((m (nlga-rt-rows x)) (n (nlga-rt-cols x)) (os (nlga--tmp b (* m n)))
+         (o (nlga-rt--make :slot os :rows m :cols n)))
+    (nlga--d b (list 'softmax (list (nlga-rt-slot x) os) (list m n) (nlga--g m)))
+    (nlga--bwd-push b (lambda ()
+      (let ((go (nlga--grad b o)) (ds (nlga--tmp b (* m n))))
+        (nlga--d b (list 'softmax-bwd (list os go ds) (list m n) (nlga--g m)))
+        (nlga--accum b (nlga--grad b x) ds (* m n)))))
+    o))
+
+(defun nlga-slice-cols (b x c0 w)
+  "Extract W columns from X (seq x dim) starting at C0 -> (seq x W)."
+  (let* ((seq (nlga-rt-rows x)) (dim (nlga-rt-cols x)) (os (nlga--tmp b (* seq w)))
+         (o (nlga-rt--make :slot os :rows seq :cols w)))
+    (nlga--d b (list 'slice-cols (list (nlga-rt-slot x) os) (list seq dim w c0) (nlga--g (* seq w))))
+    (nlga--bwd-push b (lambda ()
+      (let ((go (nlga--grad b o)) (dx (nlga--tmp b (* seq dim))))
+        (nlga--d b (list 'set-cols (list dx go) (list seq dim w c0) (nlga--g (* seq w))))
+        (nlga--accum b (nlga--grad b x) dx (* seq dim)))))
+    o))
+
+(defun nlga-concat-cols (b rts)
+  "Column-concatenate a list of (seq x wi) rts into (seq x sum wi)."
+  (let* ((seq (nlga-rt-rows (car rts))) (dim (apply #'+ (mapcar #'nlga-rt-cols rts)))
+         (os (nlga--tmp b (* seq dim))) (o (nlga-rt--make :slot os :rows seq :cols dim)) (c0 0))
+    (dolist (r rts)
+      (let ((w (nlga-rt-cols r)))
+        (nlga--d b (list 'set-cols (list os (nlga-rt-slot r)) (list seq dim w c0) (nlga--g (* seq w))))
+        (setq c0 (+ c0 w))))
+    (nlga--bwd-push b (lambda ()
+      (let ((go (nlga--grad b o)) (c 0))
+        (dolist (r rts)
+          (let ((w (nlga-rt-cols r)) (sl (nlga--tmp b (* seq (nlga-rt-cols r)))))
+            (nlga--d b (list 'slice-cols (list go sl) (list seq dim w c) (nlga--g (* seq w))))
+            (nlga--accum b (nlga--grad b r) sl (* seq w))
+            (setq c (+ c w)))))))
+    o))
+
+;; --- composite: GQA attention + SwiGLU FFN + full block --------------
+(defun nlga-gqa (b x wq bq wk bk wv bv wo bo heads kvheads cosr sinr spos sneg scl mask)
+  "Autograd causal GQA over X (seq x dim).  COSR/SINR RoPE tables, SPOS/SNEG
+sign scalars, SCL the 1/sqrt(hd) scalar, MASK an additive (seq x seq) causal
+mask -- all resident consts.  KVHEADS divides HEADS."
+  (let* ((dim (nlga-rt-cols x)) (hd (/ dim heads)) (grp (/ heads kvheads))
+         (q (nlga-rope b (nlga-linear b x wq bq) heads cosr sinr spos sneg))
+         (k (nlga-rope b (nlga-linear b x wk bk) kvheads cosr sinr spos sneg))
+         (v (nlga-linear b x wv bv)) (ctxs nil) (h 0))
+    (while (< h heads)
+      (let* ((qh (nlga-slice-cols b q (* h hd) hd))
+             (kvc (* (/ h grp) hd))
+             (kh (nlga-slice-cols b k kvc hd))
+             (vh (nlga-slice-cols b v kvc hd))
+             (s (nlga-scale b (nlga-matmul b qh (nlga-transpose b kh)) scl))
+             (p (nlga-softmax b (nlga-add b s mask))))
+        (push (nlga-matmul b p vh) ctxs))
+      (setq h (1+ h)))
+    (nlga-linear b (nlga-concat-cols b (nreverse ctxs)) wo bo)))
+
+(defun nlga-swiglu (b x wg bg wu bu wd bd)
+  "SwiGLU FFN: (silu(X.Wg^T+bg) (*) (X.Wu^T+bu)) . Wd^T + bd."
+  (nlga-linear b (nlga-mul b (nlga-silu b (nlga-linear b x wg bg))
+                          (nlga-linear b x wu bu)) wd bd))
+
+(defun nlga-block (b x blk heads kvheads cosr sinr spos sneg scl mask)
+  "Full pre-norm modern block (RMSNorm + GQA/RoPE + SwiGLU) on X (seq x dim).
+BLK is a plist of param rts: :ln1g :wq :bq :wk :bk :wv :bv :wo :bo :ln2g
+:wg :bg :wu :bu :wd :bd."
+  (let* ((x1 (nlga-add b x (nlga-gqa b (nlga-rmsnorm b x (plist-get blk :ln1g))
+                                    (plist-get blk :wq) (plist-get blk :bq)
+                                    (plist-get blk :wk) (plist-get blk :bk)
+                                    (plist-get blk :wv) (plist-get blk :bv)
+                                    (plist-get blk :wo) (plist-get blk :bo)
+                                    heads kvheads cosr sinr spos sneg scl mask))))
+    (nlga-add b x1 (nlga-swiglu b (nlga-rmsnorm b x1 (plist-get blk :ln2g))
+                                (plist-get blk :wg) (plist-get blk :bg)
+                                (plist-get blk :wu) (plist-get blk :bu)
+                                (plist-get blk :wd) (plist-get blk :bd)))))
+
+;; RoPE cos/sin tables (seq x hd/2), row-major by (position, pair).
+(defun nl-llm-gpu-rope-tables (seq hd &optional base)
+  "Return (cos-tensor . sin-tensor), each (seq x hd/2), for RoPE."
+  (let* ((half (/ hd 2)) (bb (or base 10000.0))
+         (co (make-vector (* seq half) 0.0)) (si (make-vector (* seq half) 0.0)) (p 0))
+    (while (< p seq)
+      (let ((m 0))
+        (while (< m half)
+          (let ((theta (/ (float p) (expt bb (/ (* 2.0 m) (float hd))))))
+            (aset co (+ (* p half) m) (cos theta))
+            (aset si (+ (* p half) m) (sin theta)))
+          (setq m (1+ m))))
+      (setq p (1+ p)))
+    (cons (photon-tensor (list seq half) co) (photon-tensor (list seq half) si))))
+
+;; --- loss seeds ------------------------------------------------------
+(defun nlga-seed-ce (b logits onehot)
+  "Seed LOGITS' gradient with softmax cross-entropy: (softmax - ONEHOT)/M.
+ONEHOT is a resident (M x V) one-hot target rt."
+  (let ((gl (nlga--grad b logits)) (m (nlga-rt-rows logits)) (v (nlga-rt-cols logits)))
+    (nlga--d b (list 'ce-grad (list (nlga-rt-slot logits) (nlga-rt-slot onehot) gl)
+                     (list m v) (nlga--g m)))))
+
+(defun nlga-seed-mse (b y target invn)
+  "Seed Y's gradient with (Y - TARGET) * INVN (MSE); TARGET, INVN are rt."
+  (let ((gy (nlga--grad b y)) (n (nlga-rt-size y)))
+    (nlga--d b (list 'sub-scale (list (nlga-rt-slot y) (nlga-rt-slot target) (nlga-rt-slot invn) gy)
+                     (list n) (nlga--g n)))))
+
+;; --- finalize / run --------------------------------------------------
+(defun nlga-keep (b x one)
+  "Mark rt X to be returned from the batch; ONE is a resident [1.0] rt.
+Returns the ordinal of X among the batch's out slots (index into `nlga-step')."
+  (let ((n (nlga-rt-size x)) (os (nlga--out b (nlga-rt-size x))))
+    (nlga--d b (list 'scale (list (nlga-rt-slot x) (nlga-rt-slot one) os) (list n) (nlga--g n)))
+    (prog1 (nlga-nout b) (cl-incf (nlga-nout b)))))
+
+(defun nlga-finish (b lr)
+  "Run the backward thunks and emit an on-device SGD dispatch per parameter.
+LR is a resident scalar rt.  Call after the forward + loss seed are built."
+  (dolist (th (nlga-bwd b)) (funcall th))
+  (dolist (p (nlga-params b))
+    (let* ((rt (plist-get p :rt)) (n (nlga-rt-size rt)) (gs (nlga--grad b rt)))
+      (nlga--d b (list 'sgd (list (nlga-rt-slot rt) gs (nlga-rt-slot lr)) (list n) (nlga--g n))))))
+
+(defun nlga-step (b)
+  "Run the assembled batch once (one training step); return the out vectors."
+  (nelisp-gpu-server-batch (reverse (nlga-slots b)) (reverse (nlga-disp b))))
+
+(defun nlga-readback (b)
+  "Copy each parameter's trained resident buffer back into its host tensor."
+  (dolist (p (nlga-params b))
+    (let* ((rt (plist-get p :rt)) (n (nlga-rt-size rt)) (h (plist-get p :handle))
+           (dst (photon-tensor-data (plist-get p :tensor)))
+           (v (car (nelisp-gpu-server-run2
+                    'scale (list (list 'res h n) (cons 'in (vector 1.0)) (cons 'out n))
+                    (list n) (nlga--g n))))
+           (i 0))
+      (while (< i n) (aset dst i (aref v i)) (setq i (1+ i))))))
+
+(defun nlga-free (b)
+  "Free all resident handles uploaded for parameters."
+  (dolist (p (nlga-params b)) (ignore-errors (nelisp-gpu-server-free (plist-get p :handle)))))
+
+(provide 'nl-llm-gpu-ag)
+;;; nl-llm-gpu-ag.el ends here

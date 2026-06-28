@@ -48,6 +48,7 @@
        (w2c (photon-autograd-const (gt--copy W2))) (b2c (photon-autograd-const (gt--copy b2)))
        (params (list w1c b1c w2c b2c)) (td (photon-tensor-data target))
        (cpu-losses nil))
+  (photon-tensor-use-cpu-backend)   ; reference must run on the CPU backend
   (let ((s 0))
     (while (< s steps)
       (photon-autograd-reset-tape)

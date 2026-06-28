@@ -92,10 +92,25 @@ steady state via differencing; ~make bench-gpu-train~):
 
 Keeping the parameters resident and updating them on-device turns training from
 break-even into a 90-320x win that *grows* with model size, because the per-step
-cost is now GPU compute + a tiny command, not elisp weight marshalling.  The
-on-device step is currently wired for the 2-layer MLP (the FFN shape); extending
-the same fused-batch pattern to the full GQA + MoE block is mechanical
-follow-on work.
+cost is now GPU compute + a tiny command, not elisp weight marshalling.
+
+*** Resident-autograd builder: the full block on-device
+
+To go beyond the hand-wired MLP, ~nl-llm-gpu-ag.el~ is a small deferred autograd
+whose tensors live on the GPU: each op emitter appends its forward dispatch and
+records a backward thunk; running the thunks in reverse emits the backward
+dispatches (accumulating gradients into resident grad slots) and a final pass
+emits an on-device ~sgd~ per parameter -- the whole forward + backward + SGD is
+ONE fused batch per step with the weights resident.  A model is expressed once
+(~nlga-linear~ / ~rmsnorm~ / ~rope~ / ~gqa~ / ~swiglu~ / ~softmax~ / ...) and is
+trained on-device automatically.
+
+The full modern *dense* block -- RMSNorm + grouped-query attention with RoPE +
+SwiGLU + an LM head with cross-entropy -- trains entirely on-device this way;
+~test/gpu-block-test.el~ checks its loss trajectory matches the CPU autograd
+reference (~nl-llm-ag-block~) to f32 precision (maxrel < 1e-7).  New backward
+kernels added for this: ~rmsnorm-istd/-fwd/-dx/-dgamma~, ~rope-apply~, ~silu~ /
+~silu-bwd~, ~mul~, ~softmax-bwd~, ~ce-grad~.
 
 * Layout
 
@@ -105,7 +120,8 @@ follow-on work.
 - ~lisp/nl-llm-block.el~    -- pre-norm block + model forward (GQA/MoE)
 - ~lisp/nl-llm-autograd.el~ -- reverse-mode backward for all of the above
 - ~lisp/nl-llm-gpu.el~      -- GPU backend wiring (enable / invalidate)
-- ~lisp/nl-llm-gpu-train.el~ -- on-device (resident) training step + SGD
+- ~lisp/nl-llm-gpu-train.el~ -- on-device (resident) training step + SGD (MLP)
+- ~lisp/nl-llm-gpu-ag.el~    -- resident-tensor autograd builder (full block on-device)
 - ~test/*-test.el~          -- correctness + gradient checks (incl. gpu, gpu-train)
 - ~examples/train-modern.el~      -- train a single-head RMSNorm/RoPE/SwiGLU block
 - ~examples/train-modern-full.el~ -- train the full block (multi-head GQA + MoE)
