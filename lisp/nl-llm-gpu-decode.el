@@ -174,5 +174,74 @@ are at [s*vocab .. (s+1)*vocab)."
     (nlga-update (plist-get ctx :pos) (photon-tensor '(1) (vector (float pos))))
     (nth (plist-get ctx :lout) (nlga-step (plist-get ctx :b)))))
 
+;; --- StreamingLLM bounded decode: sink + window, cache-relative RoPE ----
+;; Keys/values are stored RAW in a cap=(nsink+win) ring cache; the attention
+;; kernel rotates the query by its cache-relative position and each key by its
+;; cache-relative rank, so memory stays bounded at cap while relative offsets
+;; stay in distribution.  CPU oracle: nl-llm-stream (docs/design/02).
+(defun nl-llm-gpu--cache-append-ring (b src pos cache kvdim nsink win)
+  "Append SRC (1 x kvdim, RAW) into the ring CACHE at the slot for POS[0]."
+  (nlga--d b (list 'cache-append-ring (list (nlga-rt-slot src) (nlga-rt-slot pos) (nlga-rt-slot cache))
+                   (list kvdim nsink win) (nlga--g kvdim))))
+
+(defun nl-llm-gpu--attn-stream (b q ck cv pos cosr sinr dim heads kvh nsink win)
+  "Cache-relative-RoPE single-query attention over the ring CK/CV; ctx (1 x dim)."
+  (let ((os (nlga--tmp b dim)))
+    (nlga--d b (list 'decode-attn-stream
+                     (list (nlga-rt-slot q) (nlga-rt-slot ck) (nlga-rt-slot cv) (nlga-rt-slot pos)
+                           (nlga-rt-slot cosr) (nlga-rt-slot sinr) os)
+                     (list dim heads kvh nsink win) (nlga--g dim)))
+    (nlga-rt--make :slot os :rows 1 :cols dim)))
+
+(defun nl-llm-gpu--decode-block-stream (b x blk ck cv pos cosr sinr heads kvh dim kvdim nsink win)
+  (let* ((a (nlga-rmsnorm b x (plist-get blk :ln1g)))
+         (q (nlga-linear b a (plist-get blk :wq) (plist-get blk :bq)))   ; RAW; rotated in attn
+         (k (nlga-linear b a (plist-get blk :wk) (plist-get blk :bk)))   ; RAW; rotated in attn
+         (v (nlga-linear b a (plist-get blk :wv) (plist-get blk :bv))))
+    (nl-llm-gpu--cache-append-ring b k pos ck kvdim nsink win)
+    (nl-llm-gpu--cache-append-ring b v pos cv kvdim nsink win)
+    (let* ((ctx (nl-llm-gpu--attn-stream b q ck cv pos cosr sinr dim heads kvh nsink win))
+           (attn (nlga-linear b ctx (plist-get blk :wo) (plist-get blk :bo)))
+           (x1 (nlga-add b x attn))
+           (bn (nlga-rmsnorm b x1 (plist-get blk :ln2g))))
+      (nlga-add b x1 (nlga-swiglu b bn (plist-get blk :wg) (plist-get blk :bg)
+                                  (plist-get blk :wu) (plist-get blk :bu)
+                                  (plist-get blk :wd) (plist-get blk :bd))))))
+
+;;;###autoload
+(defun nl-llm-gpu-stream-new (wte blocks lnfg bh heads kvh dim vocab nsink win tables)
+  "On-GPU StreamingLLM decoder: KV cache bounded at NSINK+WIN with cache-relative
+RoPE.  Same model as `nl-llm-gpu-decode-new'; TABLES = (cos . sin) RoPE tables
+with at least NSINK+WIN rows.  Returns a context for `nl-llm-gpu-stream-step'."
+  (let* ((b (nlga-new)) (kvdim (* kvh (/ dim heads))) (cap (+ nsink win))
+         (tok (nlga-const b (photon-tensor '(1) (vector 0.0))))
+         (pos (nlga-const b (photon-tensor '(1) (vector 0.0))))
+         (one (nlga-scalar b 1.0))
+         (wter (nlga-const b wte)) (lnfgr (nlga-const b lnfg)) (bhr (nlga-const b bh))
+         (cosr (nlga-const b (car tables))) (sinr (nlga-const b (cdr tables)))
+         (bconsts (mapcar (lambda (blk) (nl-llm-gpu--block-consts b blk)) blocks))
+         (caches (mapcar (lambda (_) (cons (nl-llm-gpu--cache b cap kvdim)
+                                           (nl-llm-gpu--cache b cap kvdim))) blocks))
+         (x (nlga-embed b tok wter)) (bl bconsts) (cl caches))
+    (while bl
+      (setq x (nl-llm-gpu--decode-block-stream b x (car bl) (car (car cl)) (cdr (car cl))
+                                               pos cosr sinr heads kvh dim kvdim nsink win))
+      (setq bl (cdr bl) cl (cdr cl)))
+    (let ((lout (nlga-keep b (nlga-linear b (nlga-rmsnorm b x lnfgr) wter bhr) one)))
+      (nlga-compile b)
+      (list :b b :tok tok :pos pos :lout lout))))
+
+;;;###autoload
+(defun nl-llm-gpu-stream-step (ctx token pos)
+  "Decode TOKEN at absolute stream position POS on the GPU (bounded cache).
+Call once per position, in order; the ring cache is updated in place."
+  (nlga-update (plist-get ctx :tok) (photon-tensor '(1) (vector (float token))))
+  (nlga-update (plist-get ctx :pos) (photon-tensor '(1) (vector (float pos))))
+  (nth (plist-get ctx :lout) (nlga-step (plist-get ctx :b))))
+
+;;;###autoload
+(defalias 'nl-llm-gpu-stream-free 'nl-llm-gpu-decode-free
+  "Free a streaming decoder context (see `nl-llm-gpu-decode-free').")
+
 (provide 'nl-llm-gpu-decode)
 ;;; nl-llm-gpu-decode.el ends here

@@ -322,8 +322,16 @@ KV decode (maxdiff 0), (b) the cache stays bounded with sink slots pinned, and
 pinning the cache-relative RoPE + ring indexing.  ~examples/stream-decode.el~
 trains a model and compares full vs sink+window vs window-only decode at an equal
 cache budget (the sink benefit is a learned effect, hence the training step).
-This is also the CPU reference oracle for the planned GPU streaming decode
-(~docs/design/02-streaming-llm-attention-sink.org~).
+
+The same scheme runs on the GPU (~nl-llm-gpu-stream-new~ / ~-step~): keys/values
+are stored RAW in a cap=(nsink+win) ring cache, and one fused kernel
+(~decode-attn-stream~) rotates the query by its cache-relative position and each
+key by its cache-relative rank at attention time, deriving the ring slot, window
+offset and cache-relative positions in-kernel from the resident POS -- so the
+command buffer is compiled once and the cache stays bounded forever.
+~cache-append-ring~ writes raw projections at the ring slot.
+~test/gpu-stream-test.el~ matches the on-GPU decode to the CPU oracle to f32
+(maxrel ~1e-5 under eviction; ~4e-5 vs full decode when the cap is never reached).
 
 *** Capstone: a real(er) run with mid-run checkpoint + resume
 

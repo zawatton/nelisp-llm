@@ -3,7 +3,13 @@
 #+STATUS: DRAFT
 
 * Status
-DRAFT -- concept + application design.  Not implemented.
+SHIPPED.  CPU reference (=lisp/nl-llm-stream.el=, =test/stream-test.el=) and the
+on-GPU path (=lisp/nl-llm-gpu-decode.el= : =nl-llm-gpu-stream-new/-step=, kernels
+=cache-append-ring= / =decode-attn-stream= in nelisp-gpu, =test/gpu-stream-test.el=)
+both land and verify to f32.  Implemented as designed below; the only change from
+the sketch is that the query is *not* pre-rotated -- both query and key are RoPE'd
+inside =decode-attn-stream= by their cache-relative positions (the cleanest form
+of option (a)), so no separate q-rope dispatch or QPOS buffer is needed.
 
 Source: "Efficient Streaming Language Models with Attention Sinks"
 (MIT Han Lab, 2023).
