@@ -236,6 +236,13 @@ T->0 or top-k=1 reduce to greedy).  ~test/sample-test.el~ checks the sampler
 deterministically (seeded RNG): top-k restricts the support, temperature->0 is
 argmax, a peaked logit is the mode, a uniform one spreads.
 
+Decoding uses a KV cache (~nl-llm-decode~): each block keeps a key/value cache
+and only the new token's projections + attention over the cache are computed per
+step, so generating token t costs ~O(dim^2 + t·hd) instead of re-running the
+whole O(t^2) prefill every step.  The cache path supports biases and the tied
+head and is verified position-for-position against the prefill forward
+(~test/decode-test.el~, maxdiff ~1e-15).
+
 *** Scaling: on-device vs host-driven training
 
 Per training step of one full block (RMSNorm + GQA/RoPE + SwiGLU + head, GTX
@@ -259,7 +266,8 @@ size, while on-device keeps everything resident and only moves the loss out.
 - ~lisp/nl-llm-arch.el~     -- core primitives (RMSNorm, RoPE, SiLU, SwiGLU)
 - ~lisp/nl-llm-attn.el~     -- RoPE causal MHA/GQA + KV-cache decode
 - ~lisp/nl-llm-moe.el~      -- top-k sparse mixture-of-experts FFN
-- ~lisp/nl-llm-block.el~    -- pre-norm block + model forward (GQA/MoE)
+- ~lisp/nl-llm-block.el~    -- pre-norm block + model forward (GQA/MoE) + sampling
+- ~lisp/nl-llm-decode.el~   -- KV-cache incremental decode (with biases, tied head)
 - ~lisp/nl-llm-autograd.el~ -- reverse-mode backward for all of the above
 - ~lisp/nl-llm-gpu.el~      -- GPU backend wiring (enable / invalidate)
 - ~lisp/nl-llm-gpu-train.el~ -- on-device (resident) training step + SGD (MLP)

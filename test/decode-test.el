@@ -1,0 +1,52 @@
+;;; decode-test.el --- KV-cache decode == prefill forward  -*- lexical-binding: t; -*-
+;; Checks the incremental KV-cache decoder (nl-llm-decode) produces the same
+;; per-position logits as the full prefill forward (nl-llm-ag-block + tied head),
+;; so generation is O(len)/step without changing the model.  Pure CPU.
+;;   emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l test/decode-test.el
+(add-to-list 'load-path (expand-file-name "lisp"))
+(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+(require 'cl-lib)
+(require 'photon-tensor)
+(require 'photon-autograd)
+(require 'nl-llm-autograd)
+(require 'nl-llm-decode)
+
+(defvar dc--fail 0)
+(defun dc--ck (name ok &optional extra)
+  (princ (format "%-44s %s  %s\n" name (if ok "PASS" (progn (setq dc--fail (1+ dc--fail)) "FAIL")) (or extra ""))))
+(defun dc--t (shape seed sc) (let ((n 1)) (dolist (d shape) (setq n (* n d)))
+  (photon-tensor shape (let ((v (make-vector n 0.0)) (i 0))
+    (while (< i n) (aset v i (* sc 2.0 (- (/ (float (mod (+ (* (1+ i) 2654435761) (* (1+ seed) 40503)) 65536)) 65536.0) 0.5))) (setq i (1+ i))) v))))
+(defun dc--ones (n) (photon-tensor (list n) (make-vector n 1.0)))
+
+(let* ((seq 8) (dim 16) (heads 4) (kvh 2) (ff 24) (vocab 12) (hd (/ dim heads)) (kvdim (* kvh hd))
+       (sc 0.4) (tokens (vector 0 3 1 4 2 5 3 6)) (toklist (append tokens nil))
+       (wte (dc--t (list vocab dim) 1 sc)) (lnfg (dc--ones dim)) (bh (dc--t (list vocab) 19 0.1))
+       (mkblk (lambda (s0) (list :ln1g (dc--ones dim) :wq (dc--t (list dim dim) (+ s0 1) sc) :bq (dc--t (list dim) (+ s0 11) 0.1)
+                                 :wk (dc--t (list kvdim dim) (+ s0 2) sc) :bk (dc--t (list kvdim) (+ s0 12) 0.1)
+                                 :wv (dc--t (list kvdim dim) (+ s0 3) sc) :bv (dc--t (list kvdim) (+ s0 13) 0.1)
+                                 :wo (dc--t (list dim dim) (+ s0 4) sc) :bo (dc--t (list dim) (+ s0 14) 0.1) :ln2g (dc--ones dim)
+                                 :wg (dc--t (list ff dim) (+ s0 5) sc) :bg (dc--t (list ff) (+ s0 15) 0.1)
+                                 :wu (dc--t (list ff dim) (+ s0 6) sc) :bu (dc--t (list ff) (+ s0 16) 0.1)
+                                 :wd (dc--t (list dim ff) (+ s0 7) sc) :bd (dc--t (list dim) (+ s0 17) 0.1))))
+       (blocks (list (funcall mkblk 100) (funcall mkblk 200))))
+  ;; prefill forward (nl-llm-ag-block + tied head)
+  (photon-autograd-reset-tape)
+  (let* ((P (lambda (tn) (photon-autograd-const tn)))
+         (wtep (funcall P wte)) (lnfgp (funcall P lnfg)) (bhp (funcall P bh))
+         (bpavs (mapcar (lambda (bt) (let ((o nil) (kv bt)) (while kv (push (car kv) o) (push (funcall P (cadr kv)) o) (setq kv (cddr kv))) (nreverse o))) blocks))
+         (x (photon-autograd-embedding wtep toklist dim)))
+    (dolist (bp bpavs) (setq x (nl-llm-ag-block x bp heads kvh)))
+    (let* ((xf (nl-llm-ag-rmsnorm x lnfgp)) (logits (photon-autograd-linear xf wtep bhp))
+           (pd (photon-tensor-data (pav-value logits)))
+           ;; decode forward
+           (caches (mapcar (lambda (_) (nl-llm-dcache-new seq dim heads kvh)) blocks))
+           (maxd 0.0) (p 0))
+      (while (< p seq)
+        (let ((dd (nl-llm-decode-step (aref tokens p) blocks caches wte lnfg bh dim)) (j 0))
+          (while (< j vocab) (setq maxd (max maxd (abs (- (aref pd (+ (* p vocab) j)) (aref dd j))))) (setq j (1+ j))))
+        (setq p (1+ p)))
+      (dc--ck "KV-cache decode == prefill (all positions)" (< maxd 1e-4) (format "maxdiff=%.2e" maxd)))))
+(princ (format "NL-LLM-DECODE %s (%d failures)\n" (if (= dc--fail 0) "ALL-PASS" "HAS-FAILURES") dc--fail))
+(kill-emacs (if (= dc--fail 0) 0 1))
+;;; decode-test.el ends here
