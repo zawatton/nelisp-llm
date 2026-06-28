@@ -75,17 +75,18 @@
     (nlga-readback b) (nlga-free b))
   (princ (format "trained in %.0fs; decoding (depth 2/3/4)...\n" (- (float-time) t0)))
   (let* ((maxseq 96) (ngen 40) (start 200) (maxdepth 8)
+         (dtables (nl-llm-gpu-rope-tables maxseq hd))      ; decode context grows past the training seq -> size RoPE to maxseq
          (prompt (let ((p nil)) (dotimes (i 6) (push (aref ids (+ start i)) p)) (nreverse p)))
          (plain (nl-llm-greedy prompt ngen blks wte lnfg bh heads kvh dim vocab maxseq))
          (allh (list (cons w2 b2) (cons w3 b3) (cons w4 b4))))
     (dolist (depth '(2 3 4))
       (let* ((mtp (cl-subseq allh 0 (1- depth)))
-             (cr (nl-llm-gpu-spec-chain-decode prompt ngen blks wte lnfg bh mtp heads kvh dim vocab maxseq tables maxdepth))
+             (cr (nl-llm-gpu-spec-chain-decode prompt ngen blks wte lnfg bh mtp heads kvh dim vocab maxseq dtables maxdepth))
              (chain (car cr)) (forwards (cdr cr)))
         (princ (format "  depth %d : %.2f tok/fwd  (%d toks / %d verifies)  lossless=%s\n"
                        depth (/ (float ngen) forwards) ngen forwards (if (equal chain plain) "YES" "NO!!")))))
     (random "spec-chain-sample-seed")
-    (let* ((ss (nl-llm-gpu-spec-chain-sample-decode prompt ngen blks wte lnfg bh allh heads kvh dim vocab maxseq tables maxdepth 0.8 30))
+    (let* ((ss (nl-llm-gpu-spec-chain-sample-decode prompt ngen blks wte lnfg bh allh heads kvh dim vocab maxseq dtables maxdepth 0.8 30))
            (sf (cdr ss)))
       (princ (format "  sampling (depth 4, T0.8/top-k30, lossless): %.2f tok/fwd  (%d toks / %d verifies)\n"
                      (/ (float ngen) sf) ngen sf)))

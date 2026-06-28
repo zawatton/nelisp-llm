@@ -565,24 +565,24 @@ hidden (head_k drafts the token k ahead), verifies the whole chain in ONE
 `nl-llm-gpu-tree-verify' forward, accepts the longest greedily-matching prefix and
 emits accepted + 1 bonus token.  Returns (TOKENS . FORWARDS); TOKENS is exactly
 plain greedy (lossless) and length(TOKENS)/FORWARDS is the mean tokens per verify."
-  (let* ((depth (1+ (length mtp-heads))) (acc (append prompt nil)) (out nil) (forwards 0)
-         (maxctx (+ (length prompt) nsteps 1))
-         (vctx (nl-llm-gpu-tree-verify-new blocks wte lnfg bh heads kvh dim vocab maxctx depth tables maxdepth)))
+  (let* ((depth (1+ (length mtp-heads))) (out nil) (forwards 0)
+         (maxctx (+ (length prompt) nsteps depth 1))
+         (vctx (nl-llm-gpu-tree-verify-new blocks wte lnfg bh heads kvh dim vocab maxctx depth tables maxdepth))
+         (cdc (mapcar (lambda (_) (nl-llm-dcache-new maxctx dim heads kvh)) blocks)) (h nil) (l 0))
+    (dolist (tk prompt) (setq h (nl-llm-decode-h tk blocks cdc wte lnfg dim)) (setq l (1+ l)))  ; prompt prefill once; KV stays resident
     (while (< (length out) nsteps)
       (setq forwards (1+ forwards))
-      ;; ONE CPU prefill per round: fills the per-block KV cache AND returns the
-      ;; last hidden for drafting.  The GPU verify reuses the resident weights.
-      (let* ((cdc (mapcar (lambda (_) (nl-llm-dcache-new maxctx dim heads kvh)) blocks)) (h nil) (l (length acc)))
-        (dolist (tk acc) (setq h (nl-llm-decode-h tk blocks cdc wte lnfg dim)))
-        (let* ((drafts (cons (nl-llm--head-argmax h wte bh vocab)                 ; head1 (tied) + MTP heads
-                             (mapcar (lambda (wb) (nl-llm--head-argmax h (car wb) (cdr wb) vocab)) mtp-heads)))
-               (parents (let ((p nil) (k 0)) (while (< k depth) (push (float (if (= k 0) depth (1- k))) p) (setq k (1+ k))) (nreverse p)))
-               (positions (let ((p nil) (k 0)) (while (< k depth) (push (+ l k) p) (setq k (1+ k))) (nreverse p)))
-               (pa (nl-llm-gpu-tree-verify-step vctx cdc l drafts parents positions))
-               (a 1))                                                             ; node0 (= argmax head1) always accepted
-          (while (and (< a depth) (= (nth a drafts) (nl-llm-spec-argmax (nth (1- a) pa) 0 vocab))) (setq a (1+ a)))
-          (let ((emit (append (cl-subseq drafts 0 a) (list (nl-llm-spec-argmax (nth (1- a) pa) 0 vocab)))))
-            (dolist (tk emit) (when (< (length out) nsteps) (push tk out) (setq acc (append acc (list tk)))))))))
+      (let* ((drafts (cons (nl-llm--head-argmax h wte bh vocab)                 ; head1 (tied) + MTP heads
+                           (mapcar (lambda (wb) (nl-llm--head-argmax h (car wb) (cdr wb) vocab)) mtp-heads)))
+             (parents (let ((p nil) (k 0)) (while (< k depth) (push (float (if (= k 0) depth (1- k))) p) (setq k (1+ k))) (nreverse p)))
+             (positions (let ((p nil) (k 0)) (while (< k depth) (push (+ l k) p) (setq k (1+ k))) (nreverse p)))
+             (pa (nl-llm-gpu-tree-verify-step vctx cdc l drafts parents positions))
+             (a 1))                                                             ; node0 (= argmax head1) always accepted
+        (while (and (< a depth) (= (nth a drafts) (nl-llm-spec-argmax (nth (1- a) pa) 0 vocab))) (setq a (1+ a)))
+        (let ((emit (append (cl-subseq drafts 0 a) (list (nl-llm-spec-argmax (nth (1- a) pa) 0 vocab)))))
+          (dolist (tk emit)                                                     ; append accepted tokens' KV incrementally (no re-prefill)
+            (when (< (length out) nsteps)
+              (setq h (nl-llm-decode-h tk blocks cdc wte lnfg dim)) (push tk out) (setq l (1+ l)))))))
     (nl-llm-gpu-tree-verify-free vctx)
     (cons (nreverse out) forwards)))
 
@@ -595,31 +595,33 @@ the chain in one tree-verify forward, and accepts each draft by the rejection ru
 so every emitted token is distributed EXACTLY as plain sampling, regardless of the
 heads.  Stops at the first reject (emitting its residual); emits a bonus if all
 accept.  Returns (TOKENS . FORWARDS)."
-  (let* ((depth (1+ (length mtp-heads))) (acc (append prompt nil)) (out nil) (forwards 0)
-         (maxctx (+ (length prompt) nsteps 1))
-         (vctx (nl-llm-gpu-tree-verify-new blocks wte lnfg bh heads kvh dim vocab maxctx depth tables maxdepth)))
+  (let* ((depth (1+ (length mtp-heads))) (out nil) (forwards 0)
+         (maxctx (+ (length prompt) nsteps depth 1))
+         (vctx (nl-llm-gpu-tree-verify-new blocks wte lnfg bh heads kvh dim vocab maxctx depth tables maxdepth))
+         (cdc (mapcar (lambda (_) (nl-llm-dcache-new maxctx dim heads kvh)) blocks)) (h nil) (l 0))
+    (dolist (tk prompt) (setq h (nl-llm-decode-h tk blocks cdc wte lnfg dim)) (setq l (1+ l)))  ; prompt prefill once; KV stays resident
     (while (< (length out) nsteps)
       (setq forwards (1+ forwards))
-      (let* ((cdc (mapcar (lambda (_) (nl-llm-dcache-new maxctx dim heads kvh)) blocks)) (h nil) (l (length acc)))
-        (dolist (tk acc) (setq h (nl-llm-decode-h tk blocks cdc wte lnfg dim)))
-        (let* ((p0 (nl-llm-spec-probs (photon-tensor-data (photon-tensor-linear h wte bh)) 0 vocab temp topk))
-               (t1 (nl-llm-spec--cat p0 vocab))
-               (qs (mapcar (lambda (wb) (nl-llm-spec-probs (photon-tensor-data (photon-tensor-linear h (car wb) (cdr wb))) 0 vocab temp topk)) mtp-heads))
-               (dks (mapcar (lambda (q) (nl-llm-spec--cat q vocab)) qs))
-               (drafts (cons t1 dks))
-               (parents (let ((p nil) (k 0)) (while (< k depth) (push (float (if (= k 0) depth (1- k))) p) (setq k (1+ k))) (nreverse p)))
-               (positions (let ((p nil) (k 0)) (while (< k depth) (push (+ l k) p) (setq k (1+ k))) (nreverse p)))
-               (pa (nl-llm-gpu-tree-verify-step vctx cdc l drafts parents positions))
-               (emit (list t1)) (j 1) (stopped nil))
-          (while (and (< j depth) (not stopped))
-            (let* ((target (nl-llm-spec-probs (nth (1- j) pa) 0 vocab temp topk))
-                   (rj (nl-llm-spec-rejection-d target (nth (1- j) qs) (nth j drafts) vocab)))
-              (push (car rj) emit)
-              (unless (cdr rj) (setq stopped t)))
-            (setq j (1+ j)))
-          (unless stopped
-            (push (nl-llm-spec--cat (nl-llm-spec-probs (nth (1- depth) pa) 0 vocab temp topk) vocab) emit))
-          (dolist (tk (nreverse emit)) (when (< (length out) nsteps) (push tk out) (setq acc (append acc (list tk))))))))
+      (let* ((p0 (nl-llm-spec-probs (photon-tensor-data (photon-tensor-linear h wte bh)) 0 vocab temp topk))
+             (t1 (nl-llm-spec--cat p0 vocab))
+             (qs (mapcar (lambda (wb) (nl-llm-spec-probs (photon-tensor-data (photon-tensor-linear h (car wb) (cdr wb))) 0 vocab temp topk)) mtp-heads))
+             (dks (mapcar (lambda (q) (nl-llm-spec--cat q vocab)) qs))
+             (drafts (cons t1 dks))
+             (parents (let ((p nil) (k 0)) (while (< k depth) (push (float (if (= k 0) depth (1- k))) p) (setq k (1+ k))) (nreverse p)))
+             (positions (let ((p nil) (k 0)) (while (< k depth) (push (+ l k) p) (setq k (1+ k))) (nreverse p)))
+             (pa (nl-llm-gpu-tree-verify-step vctx cdc l drafts parents positions))
+             (emit (list t1)) (j 1) (stopped nil))
+        (while (and (< j depth) (not stopped))
+          (let* ((target (nl-llm-spec-probs (nth (1- j) pa) 0 vocab temp topk))
+                 (rj (nl-llm-spec-rejection-d target (nth (1- j) qs) (nth j drafts) vocab)))
+            (push (car rj) emit)
+            (unless (cdr rj) (setq stopped t)))
+          (setq j (1+ j)))
+        (unless stopped
+          (push (nl-llm-spec--cat (nl-llm-spec-probs (nth (1- depth) pa) 0 vocab temp topk) vocab) emit))
+        (dolist (tk (nreverse emit))                                            ; append accepted tokens' KV incrementally
+          (when (< (length out) nsteps)
+            (setq h (nl-llm-decode-h tk blocks cdc wte lnfg dim)) (push tk out) (setq l (1+ l))))))
     (nl-llm-gpu-tree-verify-free vctx)
     (cons (nreverse out) forwards)))
 
