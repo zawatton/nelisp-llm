@@ -505,6 +505,31 @@ big lever: on the same bench the GPU-attention path hits *40 tok/s -- 7.4x over 
 baseline and ~3x over the fused CPU-attention path* -- still byte-identical to
 greedy.
 
+*** AI agent harness: giving the model hands (and a path to self-improvement)
+
+A trained LLM only emits text; what lets Claude Code / Codex *act* is the scaffold
+around the model.  ~nl-llm-agent.el~ is that scaffold, reimplemented in Elisp so
+the agent's native action language is Lisp running inside Emacs.  It distils the
+parts that make the open-source coding agents work:
+- a ~100-line loop over a *linear* message history, model-agnostic -- the policy is
+  just ~(messages -> text)~, no tool-call API required (mini-swe-agent);
+- actions written *as Elisp code* and ~eval~'d, so every Emacs/anvil primitive is
+  already a tool and the agent can write new ones (smolagents CodeAct);
+- file edits as *SEARCH/REPLACE* blocks (Aider);
+- a *linter guardrail* -- an ~*.el~ edit whose result fails ~check-parens~ is
+  discarded and the error fed back, so the agent retries (SWE-agent ACI);
+- a cheap *repo map* (files + def names) to give structure without dumping files.
+
+~test/agent-test.el~ pins the loop, every action parser, the SEARCH/REPLACE edit
+and the guardrail with a deterministic scripted policy (no model/GPU needed):
+including a deliberately unbalanced edit that is *rejected* while the file stays
+parseable.  ~examples/agent-demo.el~ shows the agent *extending its own toolset* --
+it adds a ~tool-mul~ function to a tools file (a malformed first attempt is
+rejected by the linter, then fixed), loads the library and calls the new tool
+(6*7=42).  Plug nelisp-llm generation in as the policy and the same loop becomes
+self-improving: its successful (linear) trajectories are training data for nlga to
+fine-tune the model on its own agentic behaviour (~docs/design/05-agent-harness.org~).
+
 *** Capstone: a real(er) run with mid-run checkpoint + resume
 
 ~examples/train-big-gpu.el~ exercises the whole stack at once at a larger scale: a

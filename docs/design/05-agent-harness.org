@@ -1,0 +1,87 @@
+#+TITLE: nelisp-llm Design 05 -- Self-hosting agent harness
+#+OPTIONS: toc:nil num:nil
+
+* Status
+Phase 1 (harness PoC) SHIPPED.  =lisp/nl-llm-agent.el= + =test/agent-test.el=
+\(11/11) + =examples/agent-demo.el=.  Phases 2-5 below are designed, not built.
+
+* Why
+An LLM by itself only emits text.  What lets Claude Code / Codex *act* -- edit
+files, run code, iterate -- is the scaffold around the model, not the model.  This
+design distils the parts that make the open-source coding agents work and
+reimplements them in Elisp, so an nelisp-llm-generated model can be given agent
+capabilities and -- because the action language is Lisp running inside Emacs --
+extend, and ultimately retrain, itself.
+
+The agent loop is ~100 lines; the leverage is in five components.  Each is taken
+from the best open-source exemplar and adapted to the Emacs/NeLisp substrate.
+
+* The five components (concept + application)
+
+** 1. Loop + linear history  (from mini-swe-agent)
+mini-swe-agent gets >74% on SWE-bench Verified with a ~100-line loop over a
+*completely linear* message history, each action executed independently, and *no
+tool-calling API* -- the model drives it with plain text.  That model-agnosticism
+is exactly what a small nelisp-llm model needs (small models emit JSON tool calls
+unreliably).
+Application: =nl-llm-agent-run TASK POLICY= where POLICY is just =(MESSAGES ->
+text)=.  Linear history; one action per turn; stop on DONE or step cap.  The same
+linear trajectory is later training data (Phase 5).
+
+** 2. Action language = Elisp  (from smolagents CodeAct)
+smolagents has the model write its actions *as code* rather than as tool-call
+JSON.  In Emacs the natural action code is Elisp, evaluated in-process -- so every
+Emacs and anvil primitive is already a tool, and the agent extends itself by
+writing more Elisp.  This is the crux of the self-improvement story.
+Application: a ```elisp block is read and =eval='d; value or error becomes the
+observation.  (Production sandboxes via =emacs --batch=, Phase 2.)
+
+** 3. Edit format = SEARCH/REPLACE  (from Aider)
+Whole-file rewrites are unreliable for small models; Aider's diff format has the
+model emit only the changed span as a SEARCH/REPLACE block.
+Application: =nl-llm-agent--apply-edit= matches the SEARCH text exactly (must be
+unique), splices in REPLACE.  (Aider's fuzzy fallbacks -- diff-match-patch, git
+cherry-pick -- are Phase 2.)
+
+** 4. Guardrails = linter on edit  (from SWE-agent ACI)
+SWE-agent's biggest ACI win: run a linter on every edit and *discard* it if the
+result does not parse, feeding the error back so the agent retries.  This is what
+makes a weak model usable.
+Application: an =*.el= edit whose result fails =check-parens= is rejected and the
+error returned; the file is left untouched.  (Pinned by the test: a deliberately
+unbalanced edit is rejected and the file still parses.)
+
+** 5. Repo map = ranked structure  (from Aider)
+Aider feeds the model a ranked map of the codebase (tree-sitter tags + PageRank)
+instead of whole files -- essential for a small context window (and a natural fit
+with our StreamingLLM sink+window decode).
+Application: Phase 1 ships a cheap =nl-llm-agent-repo-map= (files + top-level
+def names via regexp).  Phase 3 upgrades it to Emacs 29 built-in tree-sitter +
+a PageRank over the call graph.
+
+* Self-improvement loop (the goal)
+#+begin_example
+  nelisp-llm model --(policy)--> agent harness --(acts: edit/eval/test)-->
+  outcome (tests pass?) --(reward/filter)--> trajectories --(nlga fine-tune)-->
+  better nelisp-llm model  --> repeat
+#+end_example
+The harness turns the model into an agent; the agent's successful trajectories
+(linear histories, by design) are training data; nlga (the on-device autograd +
+Adam already shipped) fine-tunes the model on its own agentic behaviour.  Each
+turn the model gets better at using -- and improving -- itself.
+
+* Phasing
+- *P1 (SHIPPED)*: harness -- loop, Elisp/edit/shell/done actions, SEARCH/REPLACE +
+  linter guardrail, scripted-policy tests, cheap repo map.
+- *P2*: sandboxing (=emacs --batch= for eval; resource/time limits), fuzzy edit
+  application, per-tool permission gating.
+- *P3*: tree-sitter repo map + PageRank ranking; feed only ranked context.
+- *P4*: wire nelisp-llm generation as the POLICY (the integrated GPU decode);
+  prompt/grammar so the small model emits valid action blocks (constrained decode).
+- *P5*: trajectory collection + reward filtering + nlga fine-tune = the
+  self-improvement loop above.
+
+* Sources
+mini-swe-agent (github.com/SWE-agent/mini-swe-agent); SWE-agent ACI
+(swe-agent.com, arXiv:2405.15793); Aider edit-formats + repo map (aider.chat);
+smolagents CodeAgent (huggingface.co/docs/smolagents); OpenHands; goose.
