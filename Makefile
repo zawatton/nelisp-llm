@@ -74,5 +74,8 @@ train-full-gpu:
 checkpoint-gpu:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l examples/checkpoint-gpu.el
 
+train-big-gpu:
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l examples/train-big-gpu.el
+
 clean:
 	rm -f lisp/*.elc

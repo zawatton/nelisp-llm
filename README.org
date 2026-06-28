@@ -303,6 +303,20 @@ B new tokens per step (B-row projections + ~decode-rope-b~ / ~cache-append-b~ /
 ~decode-attn-b~ kernels, shared position).  ~test/gpu-batch-test.el~ checks each
 sequence's logits match decoding it alone (maxrel ~8e-6).
 
+*** Capstone: a real(er) run with mid-run checkpoint + resume
+
+~examples/train-big-gpu.el~ exercises the whole stack at once at a larger scale: a
+weight-tied 4-block model (dim 128, GQA heads 8 / kv 4, ff 512, seq 48) is trained
+on-device over corpus sliding windows with Adam + warmup/cosine LR + global-norm
+gradient clipping + dropout.  Halfway through (step 400) it checkpoints, the GPU
+backend is *stopped* (simulating the end of a session), then the checkpoint is
+reloaded -- weights, Adam state (m/v) and step counter -- the GPU is restarted, and
+training *resumes*.  The loss continues across the boundary without regression
+(phase 1 ends ~5.10, phase 2 picks up at ~5.13 and keeps falling to ~5.00 by step
+800), confirming the resume is seamless in a real run, not just bit-identical in a
+unit test.  It finishes by batch-generating from four prompts with temperature /
+top-k sampling and decoding them.  ~800 steps in ~377s (~0.47s/step) on a GTX 1060.
+
 *** Scaling: on-device vs host-driven training
 
 Per training step of one full block (RMSNorm + GQA/RoPE + SwiGLU + head, GTX
