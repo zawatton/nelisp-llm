@@ -179,6 +179,15 @@ laid out (heads*seq) x seq so the existing row-softmax applies directly),
 is constant in the number of heads instead of growing with it.  Bit-for-bit the
 same math (the block/MoE/stack tests still match CPU autograd to f32).
 
+*** Fused MLP / SwiGLU
+
+Two more fusions cut the feed-forward dispatch count: ~matmul-at~ computes a
+linear's weight gradient dW = g^T·x in a single dispatch (no separate transpose
+op or buffer), shrinking *every* linear's backward; and ~silu-mul~ /
+~silu-mul-bwd~ fold the SwiGLU gate silu(a)·b into one forward and one backward
+kernel.  Same math (still f32-identical to CPU); on the 2-block dim-64 model the
+batch shrinks from 257 to 234 dispatches.
+
 *** Scaling: on-device vs host-driven training
 
 Per training step of one full block (RMSNorm + GQA/RoPE + SwiGLU + head, GTX

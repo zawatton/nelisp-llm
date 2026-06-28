@@ -87,10 +87,9 @@ RT must be a resident input created by `nlga-const' (same shape).  Use between
           (let ((dx (nlga--tmp b (* seq in))))
             (nlga--d b (list 'matmul (list gy (nlga-rt-slot w) dx) (list seq out in) (nlga--g (* seq in))))
             (nlga--accum b (nlga--grad b x) dx (* seq in)))
-          ;; dW = gy^T . x
-          (let ((gyt (nlga--tmp b (* out seq))) (dw (nlga--tmp b (* out in))))
-            (nlga--d b (list 'transpose (list gy gyt) (list seq out) (nlga--g (* seq out))))
-            (nlga--d b (list 'matmul (list gyt (nlga-rt-slot x) dw) (list out seq in) (nlga--g (* out in))))
+          ;; dW = gy^T . x  (fused: one matmul-at, no separate transpose dispatch)
+          (let ((dw (nlga--tmp b (* out in))))
+            (nlga--d b (list 'matmul-at (list gy (nlga-rt-slot x) dw) (list out seq in) (nlga--g (* out in))))
             (nlga--accum b (nlga--grad b w) dw (* out in)))
           ;; db = colsum(gy)
           (let ((db (nlga--tmp b out)))
@@ -318,10 +317,21 @@ old SCL/MASK args are accepted for API compatibility but unused."
          (ctx (nlga-attn-context b p v seq dim heads kvheads)))
     (nlga-linear b ctx wo bo)))
 
+(defun nlga-silu-mul (b a c)
+  "Fused SwiGLU gate: silu(A) (*) C (one kernel instead of silu + mul)."
+  (let* ((n (nlga-rt-size a)) (os (nlga--tmp b n))
+         (o (nlga-rt--make :slot os :rows (nlga-rt-rows a) :cols (nlga-rt-cols a))))
+    (nlga--d b (list 'silu-mul (list (nlga-rt-slot a) (nlga-rt-slot c) os) (list n) (nlga--g n)))
+    (nlga--bwd-push b (lambda ()
+      (let ((go (nlga--grad b o)) (da (nlga--tmp b n)) (db (nlga--tmp b n)))
+        (nlga--d b (list 'silu-mul-bwd (list go (nlga-rt-slot a) (nlga-rt-slot c) da db) (list n) (nlga--g n)))
+        (nlga--accum b (nlga--grad b a) da n)
+        (nlga--accum b (nlga--grad b c) db n))))
+    o))
+
 (defun nlga-swiglu (b x wg bg wu bu wd bd)
-  "SwiGLU FFN: (silu(X.Wg^T+bg) (*) (X.Wu^T+bu)) . Wd^T + bd."
-  (nlga-linear b (nlga-mul b (nlga-silu b (nlga-linear b x wg bg))
-                          (nlga-linear b x wu bu)) wd bd))
+  "SwiGLU FFN: (silu(X.Wg^T+bg) (*) (X.Wu^T+bu)) . Wd^T + bd  (fused gate)."
+  (nlga-linear b (nlga-silu-mul b (nlga-linear b x wg bg) (nlga-linear b x wu bu)) wd bd))
 
 (defun nlga-moe (b x router brouter experts top-k)
   "Top-K sparse MoE over X (seq x dim).  ROUTER (E x dim) param, BROUTER (E)
