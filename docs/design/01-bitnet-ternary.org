@@ -12,9 +12,16 @@ straight-through backward so the optimizer trains the full-precision latent
 weight.  Verified in =test/gpu-bitnet-test.el= (forward GPU==CPU with ternary W +
 int8 act, maxrel 1.9e-7; training loss == CPU STE reference, maxrel 1.5e-7; loss
 decreases; trained latent weight quantizes to a genuinely ternary {-b,0,+b}).
-This completes the MVP gate ("f32-constrained QAT") plus int8 activations.  Still
-to do: Phase B -- store ternary weights as int8 / 2-bit packed resident buffers
-and a =bitlinear= matmul kernel targeting DP4A on Pascal (GTX 1060).
+This completes the MVP gate ("f32-constrained QAT") plus int8 activations.
+
+Phase B (packed storage) also lands: =lisp/nl-llm-bitnet.el= packs the ternary
+weight as base-4 codes, PK=8 per f32 (exact, 16 of 32 bits used), and the kernel
+=bitlinear-packed= reads each packed float once and peels the codes with integer
+%4 // /4 -- no new dtype, no bitcast.  =test/gpu-bitpack-test.el= shows the packed
+forward equals the f32 ternary linear (maxrel 2.1e-7) at an ~8x smaller weight
+buffer (8x exactly when in is a multiple of PK).  Remaining for a future pass: a
+true int8 / DP4A path on Pascal for a compute (not just bandwidth) speedup, and
+wiring packed weights through a whole-model forward.
 
 Source: "The Era of 1-bit LLMs: All Large Language Models are in 1.58 Bits"
 (Microsoft, 2024).

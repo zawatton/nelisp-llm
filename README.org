@@ -346,9 +346,16 @@ so the latent W gets the gradient and the optimizer trains it).
 ~test/gpu-bitnet-test.el~ checks the GPU BitLinear against a CPU STE reference
 with both quantizers: forward matches to maxrel 1.9e-7, the training loss
 trajectory matches to 1.5e-7 and decreases, and the trained latent weight
-quantizes to a genuinely ternary set.  This completes Phase A (ternary weights +
-int8 activations); int8/2-bit packed storage + a DP4A matmul kernel are Phase B
-(~docs/design/01-bitnet-ternary.org~).
+quantizes to a genuinely ternary set.
+
+Phase B packs the trained ternary weight for compact storage:
+~nl-llm-bitnet-pack~ encodes it as base-4 codes, 8 per f32 (16 of 32 bits), and
+the ~bitlinear-packed~ kernel reads each packed float once and peels the codes
+with integer =%4= / =/4= -- so the weight buffer is ~8x smaller (the GTX 1060's
+bandwidth/VRAM is the binding constraint).  ~test/gpu-bitpack-test.el~ shows the
+packed forward equals the f32 ternary linear (maxrel 2.1e-7) at 8x less weight
+memory.  A true int8/DP4A path (compute, not just bandwidth) and whole-model
+packed inference are future work (~docs/design/01-bitnet-ternary.org~).
 
 *** Paged KV cache: PagedAttention
 
@@ -422,6 +429,7 @@ size, while on-device keeps everything resident and only moves the loss out.
 - ~lisp/nl-llm-decode.el~   -- KV-cache incremental decode (CPU; biases, tied head)
 - ~lisp/nl-llm-stream.el~   -- StreamingLLM bounded decode (attention sink + window, CPU)
 - ~lisp/nl-llm-spec.el~     -- self-speculative (MTP) greedy decode (lossless, CPU)
+- ~lisp/nl-llm-bitnet.el~   -- BitNet b1.58 packed ternary-weight inference (Phase B)
 - ~lisp/nl-llm-gpu-decode.el~ -- on-GPU KV-cache decode (resident cache, runtime pos)
 - ~lisp/nl-llm-ckpt.el~      -- checkpoint save / load (config, step, all tensors)
 - ~lisp/nl-llm-autograd.el~ -- reverse-mode backward for all of the above
