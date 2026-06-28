@@ -65,11 +65,37 @@ Measured on a GeForce GTX 1060 (one block, seq 16, ff = 4·dim, ~make bench-gpu~
 | dim 256  | train   |  15329 |  14551 |   1.1x  |
 
 Inference is a large, *scaling* win (residency amortises the weight upload over
-every token).  Training is currently break-even: in-place SGD forces the
+every token).  Host-driven training is break-even: in-place SGD forces the
 (mutated) weights to be re-encoded and re-uploaded every step, and the elisp
-float marshalling eats the GPU compute gain.  The next step for training is to
-keep weights + optimiser state resident and update them on-device, so they
-never round-trip.
+float marshalling eats the GPU compute gain.
+
+** On-device training (resident weights + on-device SGD)
+
+The fix is to keep the weights *and* the optimiser update on the GPU.
+~nl-llm-gpu-mlp-train~ (in ~nl-llm-gpu-train.el~) uploads the weights, inputs
+and targets to resident buffers once, then runs each step's *entire* forward +
+backward + SGD as ONE fused command buffer that updates the resident weight
+buffers in place (a new ~sgd~ GPU kernel writes back into the resident slots,
+alongside new ~sub-scale~ / ~colsum~ / ~gelu-bwd~ kernels).  Nothing
+weight-sized crosses the host boundary per step.  ~test/gpu-train-test.el~
+checks the on-device loss trajectory matches the CPU autograd reference
+(maxrel < 2e-2).
+
+Per-step training time for an FFN-shaped MLP (dim -> 4·dim -> dim, seq 16,
+steady state via differencing; ~make bench-gpu-train~):
+
+| MLP            | CPU ms | host-GPU ms | on-device ms | vs CPU | vs host-GPU |
+|----------------+--------+-------------+--------------+--------+-------------|
+| 64 ->256 ->64  |    505 |         606 |          5.4 |   93x  |   112x      |
+| 128->512 ->128 |   1905 |        2059 |          9.7 |  197x  |   213x      |
+| 256->1024->256 |   7413 |        7348 |         22.8 |  325x  |   322x      |
+
+Keeping the parameters resident and updating them on-device turns training from
+break-even into a 90-320x win that *grows* with model size, because the per-step
+cost is now GPU compute + a tiny command, not elisp weight marshalling.  The
+on-device step is currently wired for the 2-layer MLP (the FFN shape); extending
+the same fused-batch pattern to the full GQA + MoE block is mechanical
+follow-on work.
 
 * Layout
 
@@ -79,10 +105,12 @@ never round-trip.
 - ~lisp/nl-llm-block.el~    -- pre-norm block + model forward (GQA/MoE)
 - ~lisp/nl-llm-autograd.el~ -- reverse-mode backward for all of the above
 - ~lisp/nl-llm-gpu.el~      -- GPU backend wiring (enable / invalidate)
-- ~test/*-test.el~          -- correctness + numerical gradient checks (incl. gpu-test)
+- ~lisp/nl-llm-gpu-train.el~ -- on-device (resident) training step + SGD
+- ~test/*-test.el~          -- correctness + gradient checks (incl. gpu, gpu-train)
 - ~examples/train-modern.el~      -- train a single-head RMSNorm/RoPE/SwiGLU block
 - ~examples/train-modern-full.el~ -- train the full block (multi-head GQA + MoE)
-- ~examples/bench-gpu.el~         -- CPU vs GPU timing table
+- ~examples/bench-gpu.el~         -- CPU vs GPU forward/training timing table
+- ~examples/bench-gpu-train.el~   -- on-device vs host-driven training timing
 
 * Run
 
@@ -90,6 +118,7 @@ never round-trip.
 make test                 # all correctness + gradient-check suites (incl. GPU)
 make train-modern-full    # train the full GQA + MoE block on open data
 make bench-gpu            # CPU vs GPU timing table (needs a Vulkan device)
+make bench-gpu-train      # on-device vs host-driven training timing
 #+end_src
 
 or directly:
