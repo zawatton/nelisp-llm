@@ -137,6 +137,18 @@ descriptor rebuild.  This is bit-identical to the per-step batch path (max loss
 diff 0) and ~10x faster: on the 2-block dim-64 model the GPU per-step time drops
 from ~108 ms to ~11 ms on a GTX 1060.
 
+*** Training over many windows (corpus training)
+
+A compiled batch can be re-run on fresh data without recompiling: the one-hot
+token/target inputs are resident buffers, and ~nlga-update~ overwrites their
+contents in place (~OP_WRITE_RESIDENT~).  So a real training loop compiles the
+fused batch once and, per window, just refreshes the (small) one-hot inputs and
+re-submits -- every weight stays resident, nothing weight-sized moves.
+~test/gpu-window-test.el~ checks a sliding-window run matches CPU autograd to f32
+(maxrel < 1e-7); ~examples/train-corpus-gpu.el~ trains a 2-block dim-64 model
+over thousands of windows of public-domain text on-device (avg loss 5.6 -> 4.7,
+~38 ms/window incl. the host-side one-hot build).
+
 * Layout
 
 - ~lisp/nl-llm-arch.el~     -- core primitives (RMSNorm, RoPE, SiLU, SwiGLU)
@@ -153,6 +165,7 @@ from ~108 ms to ~11 ms on a GTX 1060.
 - ~examples/bench-gpu.el~         -- CPU vs GPU forward/training timing table
 - ~examples/bench-gpu-train.el~   -- on-device vs host-driven training timing
 - ~examples/train-stacked-gpu.el~ -- train a multi-block model on-device
+- ~examples/train-corpus-gpu.el~  -- on-device training over a whole corpus
 
 * Run
 

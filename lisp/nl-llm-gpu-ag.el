@@ -25,7 +25,7 @@
 
 (cl-defstruct (nlga (:constructor nlga--make))
   (slots nil) (nslot 0) (disp nil) (bwd nil) (params nil) (nout 0) (compiled nil))
-(cl-defstruct (nlga-rt (:constructor nlga-rt--make)) slot rows cols grad)
+(cl-defstruct (nlga-rt (:constructor nlga-rt--make)) slot rows cols grad handle)
 (defsubst nlga-rt-size (x) (* (nlga-rt-rows x) (nlga-rt-cols x)))
 
 (defun nlga-new () (nlga--make))
@@ -50,18 +50,27 @@
 
 ;; --- leaves ----------------------------------------------------------
 (defun nlga-const (b tensor)
-  "Upload TENSOR resident as a non-trainable input; return an rt."
-  (let ((sh (photon-tensor-shape tensor)))
-    (nlga-rt--make :slot (nlga--res b (photon-tensor-data tensor))
-                   :rows (car sh) :cols (or (nth 1 sh) 1))))
+  "Upload TENSOR resident as a non-trainable input; return an rt.
+The rt records its resident handle so it can be refreshed with `nlga-update'
+(e.g. per training window) without recompiling the batch."
+  (let* ((sh (photon-tensor-shape tensor)) (data (photon-tensor-data tensor))
+         (h (nelisp-gpu-server-upload data))
+         (slot (nlga--slot b (list 'res h (length data)))))
+    (nlga-rt--make :slot slot :rows (car sh) :cols (or (nth 1 sh) 1) :handle h)))
 (defun nlga-param (b tensor)
   "Upload TENSOR resident as a trainable parameter (records it for SGD)."
   (let* ((sh (photon-tensor-shape tensor)) (data (photon-tensor-data tensor))
          (h (nelisp-gpu-server-upload data))
          (slot (nlga--slot b (list 'res h (length data))))
-         (rt (nlga-rt--make :slot slot :rows (car sh) :cols (or (nth 1 sh) 1))))
+         (rt (nlga-rt--make :slot slot :rows (car sh) :cols (or (nth 1 sh) 1) :handle h)))
     (push (list :rt rt :tensor tensor :handle h) (nlga-params b))
     rt))
+
+(defun nlga-update (rt tensor)
+  "Overwrite the resident buffer backing RT with TENSOR's data, in place.
+RT must be a resident input created by `nlga-const' (same shape).  Use between
+`nlga-step' calls to feed the next training window without recompiling."
+  (nelisp-gpu-server-write-resident (nlga-rt-handle rt) (photon-tensor-data tensor)))
 (defun nlga-scalar (b v) "Resident 1-element rt holding V." (nlga-const b (photon-tensor '(1) (vector v))))
 
 ;; --- ops -------------------------------------------------------------

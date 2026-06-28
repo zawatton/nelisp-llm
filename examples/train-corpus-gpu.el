@@ -1,0 +1,81 @@
+;;; train-corpus-gpu.el --- on-device training over a whole corpus  -*- lexical-binding: t; -*-
+;; Trains a stacked model over many sliding windows of a public-domain corpus,
+;; fully on-device: the fused forward+backward+SGD batch is compiled ONCE and
+;; re-submitted per window, refreshing only the (resident) one-hot token/target
+;; inputs with nlga-update -- so the per-window cost is GPU compute + a tiny
+;; input upload, with every weight resident.  Reports the loss trend and the
+;; steady-state per-window time.
+;;   emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l examples/train-corpus-gpu.el
+(add-to-list 'load-path (expand-file-name "lisp"))
+(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+(require 'cl-lib)
+(require 'photon-tensor)
+(require 'photon-bpe)
+(require 'nl-llm-gpu)
+(require 'nl-llm-gpu-ag)
+
+(defun tc--t (shape seed sc) (let ((n 1)) (dolist (d shape) (setq n (* n d)))
+  (photon-tensor shape (let ((v (make-vector n 0.0)) (i 0))
+    (while (< i n) (aset v i (* sc 2.0 (- (/ (float (mod (+ (* (1+ i) 2654435761) (* (1+ seed) 40503)) 65536)) 65536.0) 0.5))) (setq i (1+ i))) v))))
+(defun tc--ones (n) (photon-tensor (list n) (make-vector n 1.0)))
+(defun tc--zeros (sh) (let ((n 1)) (dolist (d sh) (setq n (* n d))) (photon-tensor sh (make-vector n 0.0))))
+(defun tc--oh (ids start seq vocab)
+  (let ((v (make-vector (* seq vocab) 0.0))) (dotimes (i seq) (aset v (+ (* i vocab) (aref ids (+ start i))) 1.0)) (photon-tensor (list seq vocab) v)))
+(defun tc--ce (ld ids start seq vocab) (let ((loss 0.0) (i 0))
+  (while (< i seq) (let ((base (* i vocab)) (mx -1.0e30) (j 0) (tg (aref ids (+ start i 1))))
+    (while (< j vocab) (when (> (aref ld (+ base j)) mx) (setq mx (aref ld (+ base j)))) (setq j (1+ j)))
+    (let ((s 0.0) (j2 0)) (while (< j2 vocab) (setq s (+ s (exp (- (aref ld (+ base j2)) mx)))) (setq j2 (1+ j2)))
+      (setq loss (- loss (- (- (aref ld (+ base tg)) mx) (log s)))))) (setq i (1+ i))) (/ loss (float seq))))
+
+(unless (nl-llm-gpu-enable)
+  (princ "no GPU server / Vulkan device\n") (kill-emacs 0))
+
+(let* ((corpus (with-temp-buffer (insert-file-contents "data/corpus.txt") (buffer-string)))
+       (bpe (photon-bpe-train (list corpus) 80))
+       (ids (apply #'vector (photon-bpe-encode bpe corpus))) (ntok (length ids))
+       (vocab (photon-bpe-size bpe))
+       (nblocks 2) (dim 64) (heads 4) (kvh 2) (ff 128) (seq 16) (steps 300) (lr 0.3)
+       (hd (/ dim heads)) (kvdim (* kvh hd)) (sc (/ 1.0 (sqrt (float dim)))) (scl (/ 1.0 (sqrt (float hd))))
+       (span (- ntok seq 1))
+       (mkblk (lambda (s0) (list :ln1g (tc--ones dim) :wq (tc--t (list dim dim) (+ s0 1) sc) :bq (tc--zeros (list dim))
+                                 :wk (tc--t (list kvdim dim) (+ s0 2) sc) :bk (tc--zeros (list kvdim))
+                                 :wv (tc--t (list kvdim dim) (+ s0 3) sc) :bv (tc--zeros (list kvdim))
+                                 :wo (tc--t (list dim dim) (+ s0 4) sc) :bo (tc--zeros (list dim)) :ln2g (tc--ones dim)
+                                 :wg (tc--t (list ff dim) (+ s0 5) sc) :bg (tc--zeros (list ff))
+                                 :wu (tc--t (list ff dim) (+ s0 6) sc) :bu (tc--zeros (list ff))
+                                 :wd (tc--t (list dim ff) (+ s0 7) sc) :bd (tc--zeros (list dim)))))
+       (tables (nl-llm-gpu-rope-tables seq hd))
+       (mask (let ((md (make-vector (* seq seq) 0.0)) (i 0)) (while (< i seq) (let ((j (1+ i))) (while (< j seq) (aset md (+ (* i seq) j) -1.0e30) (setq j (1+ j)))) (setq i (1+ i))) (photon-tensor (list seq seq) md)))
+       (b (nlga-new)))
+  (cl-flet ((wp (tn) (nlga-param b tn)) (wb (bt) (let ((o nil) (kv bt)) (while kv (push (car kv) o) (push (nlga-param b (cadr kv)) o) (setq kv (cddr kv))) (nreverse o))))
+    (let* ((oh (nlga-const b (tc--oh ids 0 seq vocab))) (ohtgt (nlga-const b (tc--oh ids 1 seq vocab)))
+           (wter (wp (tc--t (list vocab dim) 99 sc)))
+           (blks (let ((l nil) (n 0)) (while (< n nblocks) (push (wb (funcall mkblk (* (1+ n) 100))) l) (setq n (1+ n))) (nreverse l)))
+           (lnfgr (wp (tc--ones dim))) (whr (wp (tc--t (list vocab dim) 9 sc))) (bhr (wp (tc--zeros (list vocab))))
+           (cosr (nlga-const b (car tables))) (sinr (nlga-const b (cdr tables)))
+           (sposr (nlga-scalar b 1.0)) (snegr (nlga-scalar b -1.0)) (sclr (nlga-scalar b scl)) (oner (nlga-scalar b 1.0))
+           (maskr (nlga-const b mask)) (lrr (nlga-scalar b lr))
+           (logits (nlga-model b oh wter blks lnfgr whr bhr heads kvh cosr sinr sposr snegr sclr maskr))
+           (lout (nlga-keep b logits oner)) (recent nil) (t0 nil) (tn nil) (first-avg nil))
+      (nlga-seed-ce b logits ohtgt) (nlga-finish b lrr) (nlga-compile b)
+      (princ (format "corpus on-device: blocks=%d dim=%d ff=%d seq=%d vocab=%d tokens=%d windows/epoch=%d\n"
+                     nblocks dim ff seq vocab ntok span))
+      (let ((s 0))
+        (while (< s steps)
+          (when (= s 1) (setq t0 (float-time)))
+          (let ((start (% (* s 13) span)))   ; stride through the corpus
+            (nlga-update oh (tc--oh ids start seq vocab))
+            (nlga-update ohtgt (tc--oh ids (1+ start) seq vocab))
+            (let ((l (tc--ce (nth lout (nlga-step b)) ids start seq vocab)))
+              (push l recent) (when (> (length recent) 25) (setcdr (nthcdr 24 recent) nil))
+              (when (= s 24) (setq first-avg (/ (apply #'+ recent) (length recent))))
+              (when (or (= (% s 50) 0) (= s (1- steps)))
+                (princ (format "step %3d  loss=%.4f  (avg25=%.4f)\n" s l (/ (apply #'+ recent) (length recent)))))))
+          (setq s (1+ s))))
+      (setq tn (float-time))
+      (nlga-free b) (nl-llm-gpu-disable)
+      (let ((last-avg (/ (apply #'+ recent) (length recent))))
+        (princ (format "avg25 loss: first=%.4f last=%.4f  per-window=%.1f ms\n"
+                       (or first-avg 0.0) last-avg (/ (* 1000.0 (- tn t0)) (1- steps))))
+        (princ (format "TRAIN-CORPUS-GPU=%s\n" (if (< last-avg (or first-avg 1e9)) "PASS" "FAIL")))))))
+;;; train-corpus-gpu.el ends here

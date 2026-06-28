@@ -2,7 +2,7 @@
 EMACS ?= emacs
 PHOTON ?= ../nelisp-photon/lisp
 
-.PHONY: test compile clean train train-modern train-modern-full gpu-test gpu-train-test gpu-ag-test gpu-block-test gpu-moe-test gpu-stack-test bench-gpu bench-gpu-train train-stacked-gpu
+.PHONY: test compile clean train train-modern train-modern-full gpu-test gpu-train-test gpu-ag-test gpu-block-test gpu-moe-test gpu-stack-test gpu-window-test bench-gpu bench-gpu-train train-stacked-gpu train-corpus-gpu
 
 test:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/arch-test.el
@@ -16,6 +16,7 @@ test:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-block-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-moe-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-stack-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-window-test.el
 
 compile:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) \
@@ -45,6 +46,9 @@ bench-gpu-train:
 
 train-stacked-gpu:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l examples/train-stacked-gpu.el
+
+train-corpus-gpu:
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l examples/train-corpus-gpu.el
 
 clean:
 	rm -f lisp/*.elc
