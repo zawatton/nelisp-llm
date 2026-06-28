@@ -354,8 +354,11 @@ the ~bitlinear-packed~ kernel reads each packed float once and peels the codes
 with integer =%4= / =/4= -- so the weight buffer is ~8x smaller (the GTX 1060's
 bandwidth/VRAM is the binding constraint).  ~test/gpu-bitpack-test.el~ shows the
 packed forward equals the f32 ternary linear (maxrel 2.1e-7) at 8x less weight
-memory.  A true int8/DP4A path (compute, not just bandwidth) and whole-model
-packed inference are future work (~docs/design/01-bitnet-ternary.org~).
+memory.  ~examples/bitnet-model.el~ wires packed weights through a whole-model
+decode: on a dim-128 / 6-block model the packed decode is bit-identical to the
+f32 ternary decode and the block-linear weight VRAM drops 8.0x (5760 -> 720 KB),
+6.9x for the whole model.  A true int8/DP4A path (compute, not just bandwidth) is
+future work (~docs/design/01-bitnet-ternary.org~).
 
 *** Paged KV cache: PagedAttention
 

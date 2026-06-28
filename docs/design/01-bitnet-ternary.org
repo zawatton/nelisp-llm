@@ -19,9 +19,16 @@ weight as base-4 codes, PK=8 per f32 (exact, 16 of 32 bits used), and the kernel
 =bitlinear-packed= reads each packed float once and peels the codes with integer
 %4 // /4 -- no new dtype, no bitcast.  =test/gpu-bitpack-test.el= shows the packed
 forward equals the f32 ternary linear (maxrel 2.1e-7) at an ~8x smaller weight
-buffer (8x exactly when in is a multiple of PK).  Remaining for a future pass: a
-true int8 / DP4A path on Pascal for a compute (not just bandwidth) speedup, and
-wiring packed weights through a whole-model forward.
+buffer (8x exactly when in is a multiple of PK).
+
+Packed weights are also wired through a *whole-model* forward
+(=nl-llm-bitnet-decode-block/-step=, =examples/bitnet-model.el=): every block
+linear is packed and run via =bitlinear-packed=, the tied head/embedding stay
+f32.  On a dim-128 / 6-block / GQA model the packed decode is bit-identical to the
+f32 ternary decode (maxrel 0) and the block-linear weight VRAM drops 8.0x
+(5760 -> 720 KB), 6.9x for the whole model including the f32 embedding.  Remaining
+for a future pass: a true int8 / DP4A path on Pascal for a compute (not just
+bandwidth) speedup, and packing the embedding/head too.
 
 Source: "The Era of 1-bit LLMs: All Large Language Models are in 1.58 Bits"
 (Microsoft, 2024).
