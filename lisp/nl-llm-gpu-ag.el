@@ -490,13 +490,31 @@ forward + loss seed (before `nlga-compile')."
           (nlga--d b (list 'adam (list (nlga-rt-slot rt) gs ms vs hslot) (list n) (nlga--g n)))))
       (setf (nlga-adam b) (list :h hh :lr lr :b1 b1 :b2 b2 :eps ep :mv mv)))))
 
-(defun nlga-adam-update-t (b tstep)
+(defun nlga-adam-update-t (b tstep &optional base-lr)
   "Refresh the Adam hyperparameter buffer for 1-based timestep TSTEP:
-lr_t = lr * sqrt(1 - b2^t) / (1 - b1^t).  Call before each `nlga-step'."
-  (let* ((a (nlga-adam b)) (lr (plist-get a :lr)) (b1 (plist-get a :b1))
+lr_t = LR * sqrt(1 - b2^t) / (1 - b1^t), where LR is BASE-LR if given (e.g. a
+learning-rate schedule value) else the base lr set at `nlga-finish-adam'.
+Call before each `nlga-step'."
+  (let* ((a (nlga-adam b)) (lr (or base-lr (plist-get a :lr))) (b1 (plist-get a :b1))
          (b2 (plist-get a :b2)) (ep (plist-get a :eps))
          (lr-t (* lr (/ (sqrt (- 1.0 (expt b2 tstep))) (- 1.0 (expt b1 tstep))))))
     (nelisp-gpu-server-write-resident (plist-get a :h) (vector lr-t b1 b2 ep))))
+
+;; --- learning-rate schedules (pure host math; feed to the lr buffer) --
+(defun nl-llm-lr-warmup-cosine (step total warmup base &optional min-lr)
+  "Learning rate at 1-based STEP: linear warmup over WARMUP steps up to BASE,
+then cosine decay to MIN-LR (default 0) over the remaining TOTAL-WARMUP steps.
+For SGD, write (vector lr) into the lr scalar with `nlga-update'; for Adam, pass
+it as BASE-LR to `nlga-adam-update-t'."
+  (let ((mn (or min-lr 0.0)))
+    (cond ((<= step warmup) (* base (/ (float step) (float (max 1 warmup)))))
+          ((>= step total) mn)
+          (t (let ((p (/ (float (- step warmup)) (float (max 1 (- total warmup))))))
+               (+ mn (* 0.5 (- base mn) (+ 1.0 (cos (* float-pi p))))))))))
+
+(defun nl-llm-lr-inv-sqrt (step warmup base)
+  "Noam-style inverse-sqrt schedule: BASE * min(1/sqrt(step), step/warmup^1.5)."
+  (* base (min (/ 1.0 (sqrt (float step))) (/ (float step) (expt (float warmup) 1.5)))))
 
 (defun nlga-step (b)
   "Run the assembled batch once (one training step); return the out vectors.

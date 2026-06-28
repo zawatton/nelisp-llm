@@ -206,6 +206,15 @@ exactly (the first contribution writes the grad, the second vadds).
 ~test/gpu-tie-test.el~ trains a tied model on-device and matches the CPU autograd
 reference (which ties the same ~wte~ pav) to f32 (maxrel ~9e-8).
 
+*** Learning-rate schedules
+
+The learning rate is just a value in a resident buffer, so a schedule needs no
+new machinery: for SGD, ~nlga-update~ the lr scalar each step; for Adam, pass the
+scheduled base lr to ~nlga-adam-update-t~ (it still applies the bias correction).
+~nl-llm-lr-warmup-cosine~ and ~nl-llm-lr-inv-sqrt~ provide the usual shapes.
+~test/gpu-sched-test.el~ trains with a warmup+cosine schedule and matches a CPU
+reference using the same per-step lr to f32 (maxrel ~8e-6).
+
 *** Scaling: on-device vs host-driven training
 
 Per training step of one full block (RMSNorm + GQA/RoPE + SwiGLU + head, GTX
