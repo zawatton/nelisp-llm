@@ -188,6 +188,14 @@ op or buffer), shrinking *every* linear's backward; and ~silu-mul~ /
 kernel.  Same math (still f32-identical to CPU); on the 2-block dim-64 model the
 batch shrinks from 257 to 234 dispatches.
 
+A weight's gradient has no fan-out (each weight is used once), so its backward
+op writes straight into the resident grad slot (zeroed each run) instead of
+computing into a tmp and vadd-accumulating -- a tmp + a vadd saved per weight,
+bias, RMSNorm gain and embedding table.  (A ~gwritten~ flag keeps it correct if a
+parameter ever is reused: the first write is direct, later ones accumulate.)
+Activation gradients, which do fan out, keep the accumulate path.  The 2-block
+batch drops further to 198 dispatches; per-step ~17 ms.
+
 *** Scaling: on-device vs host-driven training
 
 Per training step of one full block (RMSNorm + GQA/RoPE + SwiGLU + head, GTX

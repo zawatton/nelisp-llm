@@ -25,7 +25,7 @@
 
 (cl-defstruct (nlga (:constructor nlga--make))
   (slots nil) (nslot 0) (disp nil) (bwd nil) (params nil) (nout 0) (compiled nil) (adam nil))
-(cl-defstruct (nlga-rt (:constructor nlga-rt--make)) slot rows cols grad handle)
+(cl-defstruct (nlga-rt (:constructor nlga-rt--make)) slot rows cols grad handle gwritten)
 (defsubst nlga-rt-size (x) (* (nlga-rt-rows x) (nlga-rt-cols x)))
 
 (defun nlga-new () (nlga--make))
@@ -44,6 +44,20 @@
 (defun nlga--accum (b dst-grad src-slot n)
   "Accumulate SRC-SLOT into grad slot DST-GRAD in place (vadd)."
   (nlga--d b (list 'vadd (list dst-grad src-slot dst-grad) (list n) (nlga--g n))))
+(defun nlga--accum-into (b rt n producer)
+  "PRODUCER is a fn of a destination slot that emits a dispatch writing RT's full
+N-element gradient contribution there.  The FIRST contribution to RT's grad is
+written directly into the grad slot (which is zeroed each run), saving a tmp +
+vadd; later contributions (fan-out) go through a tmp + vadd.  Only correct when
+every writer of RT's grad uses this helper -- used for single-writer leaf weight
+gradients (W/bias/gamma/embedding)."
+  (let ((g (nlga--grad b rt)))
+    (if (nlga-rt-gwritten rt)
+        (let ((tmp (nlga--tmp b n)))
+          (funcall producer tmp)
+          (nlga--d b (list 'vadd (list g tmp g) (list n) (nlga--g n))))
+      (funcall producer g)
+      (setf (nlga-rt-gwritten rt) t))))
 ;; backward thunks are stored most-recent-first; running them in stored order
 ;; is reverse-chronological = correct backprop order.
 (defun nlga--bwd-push (b thunk) (push thunk (nlga-bwd b)))
@@ -87,14 +101,12 @@ RT must be a resident input created by `nlga-const' (same shape).  Use between
           (let ((dx (nlga--tmp b (* seq in))))
             (nlga--d b (list 'matmul (list gy (nlga-rt-slot w) dx) (list seq out in) (nlga--g (* seq in))))
             (nlga--accum b (nlga--grad b x) dx (* seq in)))
-          ;; dW = gy^T . x  (fused: one matmul-at, no separate transpose dispatch)
-          (let ((dw (nlga--tmp b (* out in))))
-            (nlga--d b (list 'matmul-at (list gy (nlga-rt-slot x) dw) (list out seq in) (nlga--g (* out in))))
-            (nlga--accum b (nlga--grad b w) dw (* out in)))
-          ;; db = colsum(gy)
-          (let ((db (nlga--tmp b out)))
-            (nlga--d b (list 'colsum (list gy db) (list seq out) (nlga--g out)))
-            (nlga--accum b (nlga--grad b bias) db out)))))
+          ;; dW = gy^T . x  (one matmul-at; written straight into the weight grad)
+          (nlga--accum-into b w (* out in)
+            (lambda (dst) (nlga--d b (list 'matmul-at (list gy (nlga-rt-slot x) dst) (list out seq in) (nlga--g (* out in))))))
+          ;; db = colsum(gy)  (straight into the bias grad)
+          (nlga--accum-into b bias out
+            (lambda (dst) (nlga--d b (list 'colsum (list gy dst) (list seq out) (nlga--g out))))))))
     y))
 
 (defun nlga-gelu (b x)
@@ -126,12 +138,12 @@ RT must be a resident input created by `nlga-const' (same shape).  Use between
     (nlga--d b (list 'rmsnorm-fwd (list (nlga-rt-slot x) istd (nlga-rt-slot gamma) os)
                      (list m n) (nlga--g (* m n))))
     (nlga--bwd-push b (lambda ()
-      (let ((go (nlga--grad b o)) (dx (nlga--tmp b (* m n))) (dg (nlga--tmp b n)))
+      (let ((go (nlga--grad b o)) (dx (nlga--tmp b (* m n))))
         (nlga--d b (list 'rmsnorm-dx (list go (nlga-rt-slot x) istd (nlga-rt-slot gamma) dx)
                          (list m n) (nlga--g m)))
         (nlga--accum b (nlga--grad b x) dx (* m n))
-        (nlga--d b (list 'rmsnorm-dgamma (list go (nlga-rt-slot x) istd dg) (list m n) (nlga--g n)))
-        (nlga--accum b (nlga--grad b gamma) dg n))))
+        (nlga--accum-into b gamma n
+          (lambda (dst) (nlga--d b (list 'rmsnorm-dgamma (list go (nlga-rt-slot x) istd dst) (list m n) (nlga--g n))))))))
     o))
 
 (defun nlga-silu (b x)
@@ -383,10 +395,10 @@ scatter-add backward."
     (nlga--d b (list 'embed-gather (list (nlga-rt-slot tok) (nlga-rt-slot wte) os)
                      (list seq dim) (nlga--g (* seq dim))))
     (nlga--bwd-push b (lambda ()
-      (let ((go (nlga--grad b o)) (dw (nlga--tmp b (* vocab dim))))
-        (nlga--d b (list 'embed-bwd (list (nlga-rt-slot tok) go dw)
-                         (list seq dim vocab) (nlga--g (* vocab dim))))
-        (nlga--accum b (nlga--grad b wte) dw (* vocab dim)))))
+      (let ((go (nlga--grad b o)))
+        (nlga--accum-into b wte (* vocab dim)
+          (lambda (dst) (nlga--d b (list 'embed-bwd (list (nlga-rt-slot tok) go dst)
+                                        (list seq dim vocab) (nlga--g (* vocab dim)))))))))
     o))
 
 (defun nlga-model (b onehot wte blks lnfg wh bh heads kvheads cosr sinr spos sneg scl mask)
