@@ -492,41 +492,69 @@ flat (BSZ*vocab) logits.  Advancing lengths after the step is the caller's job
                                 (plist-get blk :wd) (plist-get blk :bd)))))
 
 ;;;###autoload
+;;;###autoload
+(defun nl-llm-gpu-tree-verify-new (blocks wte lnfg bh heads kvh dim vocab maxctx m tables maxdepth)
+  "Build + compile a PERSISTENT tree-verify graph for M draft-tree nodes over a
+context of up to MAXCTX tokens.  The model weights are uploaded once and stay
+resident; `nl-llm-gpu-tree-verify-step' re-submits the compiled graph with only
+fresh context K/V (first L rows) + node tokens each round -- no weight re-upload,
+no recompile.  Returns a context plist for -step / -free."
+  (let* ((b (nlga-new)) (kvdim (* kvh (/ dim heads)))
+         (tok (nlga-const b (photon-tensor (list m) (make-vector m 0.0))))
+         (posns (nlga-const b (photon-tensor (list m) (make-vector m 0.0))))
+         (parent (nlga-const b (photon-tensor (list m) (make-vector m 0.0))))
+         (lenb (nlga-const b (photon-tensor '(1) (vector 0.0))))
+         (sign (nlga-scalar b 1.0)) (one (nlga-scalar b 1.0))
+         (wter (nlga-const b wte)) (lnfgr (nlga-const b lnfg)) (bhr (nlga-const b bh))
+         (cosr (nlga-const b (car tables))) (sinr (nlga-const b (cdr tables)))
+         (bconsts (mapcar (lambda (blk) (nl-llm-gpu--block-consts b blk)) blocks))
+         (cks (mapcar (lambda (_) (cons (nlga-const b (photon-tensor (list maxctx kvdim) (make-vector (* maxctx kvdim) 0.0)))
+                                        (nlga-const b (photon-tensor (list maxctx kvdim) (make-vector (* maxctx kvdim) 0.0))))) blocks))
+         (x (nlga-embed b tok wter)) (bl bconsts) (cl cks))
+    (while bl
+      (setq x (nl-llm-gpu--tree-block b x (car bl) (car (car cl)) (cdr (car cl))
+                                      parent lenb sign cosr sinr posns heads kvh dim kvdim m maxdepth))
+      (setq bl (cdr bl) cl (cdr cl)))
+    (let ((lout (nlga-keep b (nlga-linear b (nlga-rmsnorm b x lnfgr) wter bhr) one)))
+      (nlga-compile b)
+      (list :b b :tok tok :posns posns :parent parent :lenb lenb :cks cks :lout lout
+            :m m :vocab vocab :kvdim kvdim :maxctx maxctx))))
+
+;;;###autoload
+(defun nl-llm-gpu-tree-verify-step (vctx cdc l nodes parents positions)
+  "Run one tree verify on the persistent VCTX.  CDC is the per-block context KV
+cache (a list of `nl-llm-dcache' already filled with the L accepted tokens);
+NODES/PARENTS/POSITIONS describe the M-node draft tree (PARENTS sentinel = M).
+Returns a list of M (vocab) logit vectors.  Only the context KV (first L rows) and
+the node inputs are written; the compiled graph + resident weights are reused."
+  (let* ((m (plist-get vctx :m)) (vocab (plist-get vctx :vocab)) (kvdim (plist-get vctx :kvdim)))
+    (let ((cl (plist-get vctx :cks)) (dl cdc))
+      (while dl
+        (nelisp-gpu-server-write-resident (nlga-rt-handle (car (car cl))) (nl-llm-gpu--head-vec (nl-llm-dcache-k (car dl)) (* l kvdim)))
+        (nelisp-gpu-server-write-resident (nlga-rt-handle (cdr (car cl))) (nl-llm-gpu--head-vec (nl-llm-dcache-v (car dl)) (* l kvdim)))
+        (setq cl (cdr cl) dl (cdr dl))))
+    (nlga-update (plist-get vctx :tok) (photon-tensor (list m) (let ((v (make-vector m 0.0)) (i 0)) (dolist (tk nodes) (aset v i (float tk)) (setq i (1+ i))) v)))
+    (nlga-update (plist-get vctx :posns) (photon-tensor (list m) (apply #'vector (mapcar #'float positions))))
+    (nlga-update (plist-get vctx :parent) (photon-tensor (list m) (apply #'vector (mapcar #'float parents))))
+    (nlga-update (plist-get vctx :lenb) (photon-tensor '(1) (vector (float l))))
+    (let ((flat (nth (plist-get vctx :lout) (nlga-step (plist-get vctx :b)))) (res nil))
+      (dotimes (i m) (push (let ((v (make-vector vocab 0.0))) (dotimes (j vocab) (aset v j (aref flat (+ (* i vocab) j)))) v) res))
+      (nreverse res))))
+
+;;;###autoload
+(defalias 'nl-llm-gpu-tree-verify-free 'nl-llm-gpu-decode-free
+  "Free a persistent tree-verify context (see `nl-llm-gpu-decode-free').")
+
+;;;###autoload
 (defun nl-llm-gpu-tree-verify (blocks wte lnfg bh heads kvh dim vocab ctx-tokens nodes parents positions tables maxdepth)
-  "One-forward tree verify.  CTX-TOKENS is the accepted sequence; NODES is a list
-of M draft-tree token ids with PARENTS (parent index per node, sentinel = M for a
-root) and per-node POSITIONS.  Returns a list of M (vocab) logit vectors -- the
-next-token logits at every tree node -- computed in a single fused GPU batch where
-each node attends the shared context plus its ancestor chain (tree-attn).  TABLES
-= (cos . sin) with > max(POSITIONS) rows.  The server must be running."
-  (let* ((m (length nodes)) (kvdim (* kvh (/ dim heads))) (L (length ctx-tokens))
-         (cdc (mapcar (lambda (_) (nl-llm-dcache-new (max 1 L) dim heads kvh)) blocks)))
-    (dolist (tk ctx-tokens) (nl-llm-decode-step tk blocks cdc wte lnfg bh dim))  ; CPU prefill -> per-block K/V
-    (let* ((b (nlga-new))
-           (tok (nlga-const b (photon-tensor (list m) (let ((v (make-vector m 0.0)) (i 0))
-                                                        (dolist (tk nodes) (aset v i (float tk)) (setq i (1+ i))) v))))
-           (posns (nlga-const b (photon-tensor (list m) (apply #'vector (mapcar #'float positions)))))
-           (parent (nlga-const b (photon-tensor (list m) (apply #'vector (mapcar #'float parents)))))
-           (lenb (nlga-const b (photon-tensor '(1) (vector (float L)))))
-           (sign (nlga-scalar b 1.0)) (one (nlga-scalar b 1.0))
-           (wter (nlga-const b wte)) (lnfgr (nlga-const b lnfg)) (bhr (nlga-const b bh))
-           (cosr (nlga-const b (car tables))) (sinr (nlga-const b (cdr tables)))
-           (bconsts (mapcar (lambda (blk) (nl-llm-gpu--block-consts b blk)) blocks))
-           (cks (mapcar (lambda (dc)
-                          (cons (nlga-const b (photon-tensor (list L kvdim) (nl-llm-gpu--head-vec (nl-llm-dcache-k dc) (* L kvdim))))
-                                (nlga-const b (photon-tensor (list L kvdim) (nl-llm-gpu--head-vec (nl-llm-dcache-v dc) (* L kvdim)))))) cdc))
-           (x (nlga-embed b tok wter)) (bl bconsts) (cl cks))
-      (while bl
-        (setq x (nl-llm-gpu--tree-block b x (car bl) (car (car cl)) (cdr (car cl))
-                                        parent lenb sign cosr sinr posns heads kvh dim kvdim m maxdepth))
-        (setq bl (cdr bl) cl (cdr cl)))
-      (let ((lout (nlga-keep b (nlga-linear b (nlga-rmsnorm b x lnfgr) wter bhr) one)))
-        (nlga-compile b)
-        (let ((flat (nth lout (nlga-step b))) (res nil))
-          (nlga-free b)
-          (dotimes (i m) (push (let ((v (make-vector vocab 0.0)))
-                                 (dotimes (j vocab) (aset v j (aref flat (+ (* i vocab) j)))) v) res))
-          (nreverse res))))))
+  "One-shot tree verify: build a persistent graph, run it once, free it.  See
+`nl-llm-gpu-tree-verify-new' / -step for the reusable (compile-once) form."
+  (let* ((m (length nodes)) (l (length ctx-tokens)) (mc (max 1 l))
+         (cdc (mapcar (lambda (_) (nl-llm-dcache-new mc dim heads kvh)) blocks))
+         (vctx (nl-llm-gpu-tree-verify-new blocks wte lnfg bh heads kvh dim vocab mc m tables maxdepth)))
+    (dolist (tk ctx-tokens) (nl-llm-decode-step tk blocks cdc wte lnfg bh dim))
+    (prog1 (nl-llm-gpu-tree-verify-step vctx cdc l nodes parents positions)
+      (nl-llm-gpu-tree-verify-free vctx))))
 
 ;;;###autoload
 (defun nl-llm-gpu-spec-chain-decode (prompt nsteps blocks wte lnfg bh mtp-heads heads kvh dim vocab maxseq tables maxdepth)
@@ -537,20 +565,25 @@ hidden (head_k drafts the token k ahead), verifies the whole chain in ONE
 `nl-llm-gpu-tree-verify' forward, accepts the longest greedily-matching prefix and
 emits accepted + 1 bonus token.  Returns (TOKENS . FORWARDS); TOKENS is exactly
 plain greedy (lossless) and length(TOKENS)/FORWARDS is the mean tokens per verify."
-  (let* ((depth (1+ (length mtp-heads))) (acc (append prompt nil)) (out nil) (forwards 0))
+  (let* ((depth (1+ (length mtp-heads))) (acc (append prompt nil)) (out nil) (forwards 0)
+         (maxctx (+ (length prompt) nsteps 1))
+         (vctx (nl-llm-gpu-tree-verify-new blocks wte lnfg bh heads kvh dim vocab maxctx depth tables maxdepth)))
     (while (< (length out) nsteps)
       (setq forwards (1+ forwards))
-      (let* ((cdc (mapcar (lambda (_) (nl-llm-dcache-new maxseq dim heads kvh)) blocks)) (h nil) (L (length acc)))
-        (dolist (tk acc) (setq h (nl-llm-decode-h tk blocks cdc wte lnfg dim)))   ; hidden of last accepted token
+      ;; ONE CPU prefill per round: fills the per-block KV cache AND returns the
+      ;; last hidden for drafting.  The GPU verify reuses the resident weights.
+      (let* ((cdc (mapcar (lambda (_) (nl-llm-dcache-new maxctx dim heads kvh)) blocks)) (h nil) (l (length acc)))
+        (dolist (tk acc) (setq h (nl-llm-decode-h tk blocks cdc wte lnfg dim)))
         (let* ((drafts (cons (nl-llm--head-argmax h wte bh vocab)                 ; head1 (tied) + MTP heads
                              (mapcar (lambda (wb) (nl-llm--head-argmax h (car wb) (cdr wb) vocab)) mtp-heads)))
                (parents (let ((p nil) (k 0)) (while (< k depth) (push (float (if (= k 0) depth (1- k))) p) (setq k (1+ k))) (nreverse p)))
-               (positions (let ((p nil) (k 0)) (while (< k depth) (push (+ L k) p) (setq k (1+ k))) (nreverse p)))
-               (pa (nl-llm-gpu-tree-verify blocks wte lnfg bh heads kvh dim vocab acc drafts parents positions tables maxdepth))
+               (positions (let ((p nil) (k 0)) (while (< k depth) (push (+ l k) p) (setq k (1+ k))) (nreverse p)))
+               (pa (nl-llm-gpu-tree-verify-step vctx cdc l drafts parents positions))
                (a 1))                                                             ; node0 (= argmax head1) always accepted
           (while (and (< a depth) (= (nth a drafts) (nl-llm-spec-argmax (nth (1- a) pa) 0 vocab))) (setq a (1+ a)))
           (let ((emit (append (cl-subseq drafts 0 a) (list (nl-llm-spec-argmax (nth (1- a) pa) 0 vocab)))))
             (dolist (tk emit) (when (< (length out) nsteps) (push tk out) (setq acc (append acc (list tk)))))))))
+    (nl-llm-gpu-tree-verify-free vctx)
     (cons (nreverse out) forwards)))
 
 (provide 'nl-llm-gpu-decode)
