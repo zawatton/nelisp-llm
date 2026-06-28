@@ -335,18 +335,20 @@ command buffer is compiled once and the cache stays bounded forever.
 
 *** Ternary weights: BitNet b1.58 (QAT, Phase A)
 
-~nlga-bitlinear~ trains a linear with *ternary* weights (Microsoft BitNet b1.58):
-the effective weight is =beta * round(clip(W/beta, -1, 1))= with =beta = mean|W|=,
-so it takes values in {-beta, 0, +beta} -- the "1.58 bits".  Training keeps a
-full-precision latent W; ~nlga-quant-weight~ quantizes it on-device each step
-(kernels =absmean-acc= + =quant-w=) and its backward is a straight-through
-estimator (the quantizer is identity in reverse, so the latent W gets the
-gradient and the optimizer trains it).  ~test/gpu-bitnet-test.el~ checks the GPU
-BitLinear against a CPU STE reference: forward matches to maxrel 2.5e-7, the
-training loss trajectory matches the CPU reference to 2.0e-7 and decreases, and
-the trained latent weight quantizes to a genuinely ternary set.  This is Phase A
-(ternary weights, full-precision activations); int8 activations + the packed/DP4A
-kernel are Phase B (~docs/design/01-bitnet-ternary.org~).
+~nlga-bitlinear~ trains a linear with *ternary* weights and *int8* activations
+(Microsoft BitNet b1.58): the effective weight is =beta * round(clip(W/beta, -1,
+1))= with =beta = mean|W|=, so it takes values in {-beta, 0, +beta} -- the "1.58
+bits" -- and each activation row is absmax-quantized to int8.  Training keeps a
+full-precision latent W; ~nlga-quant-weight~ (kernels =absmean-acc= + =quant-w=)
+and ~nlga-quant-act~ (kernel =quant-act=) quantize on-device each step, and both
+backwards are straight-through estimators (the quantizer is identity in reverse,
+so the latent W gets the gradient and the optimizer trains it).
+~test/gpu-bitnet-test.el~ checks the GPU BitLinear against a CPU STE reference
+with both quantizers: forward matches to maxrel 1.9e-7, the training loss
+trajectory matches to 1.5e-7 and decreases, and the trained latent weight
+quantizes to a genuinely ternary set.  This completes Phase A (ternary weights +
+int8 activations); int8/2-bit packed storage + a DP4A matmul kernel are Phase B
+(~docs/design/01-bitnet-ternary.org~).
 
 *** Paged KV cache: PagedAttention
 

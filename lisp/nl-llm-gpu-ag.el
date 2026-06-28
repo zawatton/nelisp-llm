@@ -126,11 +126,27 @@ unchanged and the optimizer trains W.  Returns the WQ rt (same shape as W)."
         (nlga--accum b (nlga--grad b w) (nlga--grad b wq) n)))
     wq))
 
+(defun nlga-quant-act (b x)
+  "Per-row absmax int8 activation quantization for BitNet b1.58 (QAT, Phase A).
+Forward: each row is scaled by gamma = max|row|/127 and rounded to an int8 grid,
+XQ = gamma * clip(round(X/gamma), -127, 127).  Backward is straight-through (STE):
+the gradient passes to X unchanged.  Returns the quantized activation rt."
+  (let* ((seq (nlga-rt-rows x)) (cols (nlga-rt-cols x)) (n (* seq cols))
+         (xqs (nlga--tmp b n))
+         (xq (nlga-rt--make :slot xqs :rows seq :cols cols)))
+    (nlga--d b (list 'quant-act (list (nlga-rt-slot x) xqs) (list seq cols) (nlga--g seq)))
+    (nlga--bwd-push b
+      (lambda ()                              ; STE: dX += dXQ (identity)
+        (nlga--accum b (nlga--grad b x) (nlga--grad b xq) n)))
+    xq))
+
 (defun nlga-bitlinear (b x w bias)
-  "BitLinear (BitNet b1.58, Phase A): affine with ternary weights via QAT + STE.
-Forward uses WQ = `nlga-quant-weight' of W; backward trains the full-precision W.
-Activations are full precision in this phase (the ternary weights are the win)."
-  (nlga-linear b x (nlga-quant-weight b w) bias))
+  "BitLinear (BitNet b1.58, Phase A): ternary weights + int8 activations via
+QAT + STE.  Forward uses WQ = `nlga-quant-weight' and XQ = `nlga-quant-act';
+backward (straight-through) trains the full-precision latent weight.  For a
+ternary-weight / fp-activation (W1.58A16) variant, compose `nlga-quant-weight'
+with `nlga-linear' directly instead."
+  (nlga-linear b (nlga-quant-act b x) (nlga-quant-weight b w) bias))
 
 (defun nlga-gelu (b x)
   (let* ((n (nlga-rt-size x)) (os (nlga--tmp b n))
