@@ -530,6 +530,19 @@ rejected by the linter, then fixed), loads the library and calls the new tool
 self-improving: its successful (linear) trajectories are training data for nlga to
 fine-tune the model on its own agentic behaviour (~docs/design/05-agent-harness.org~).
 
+That wiring is ~nl-llm-agent-model.el~ (Phase 4): a char tokenizer plus
+*constrained decoding* drives a real nelisp-llm model as the policy.  A grammar
+says which characters are legal at each position; the model's logits are masked to
+that set and the argmax taken; fixed scaffold characters are forced and only the
+variable slots are model-chosen -- so the output is ALWAYS a parseable, executable
+action however weak the model.  The generation engine is ~nl-llm-decode-step~
+behind a (token -> logits) step function, so the GPU/integrated decode swaps in
+unchanged.  ~examples/agent-model-demo.el~ shows an *untrained* random model
+producing 3/3 structurally valid Elisp actions (the content is gibberish until the
+model is trained -- Phase 5 -- but the structure is guaranteed), and
+~test/agent-model-test.el~ pins both the exact constrained generation and the
+every-step validity.
+
 *** Capstone: a real(er) run with mid-run checkpoint + resume
 
 ~examples/train-big-gpu.el~ exercises the whole stack at once at a larger scale: a

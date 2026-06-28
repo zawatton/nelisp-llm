@@ -2,8 +2,11 @@
 #+OPTIONS: toc:nil num:nil
 
 * Status
-Phase 1 (harness PoC) SHIPPED.  =lisp/nl-llm-agent.el= + =test/agent-test.el=
-\(11/11) + =examples/agent-demo.el=.  Phases 2-5 below are designed, not built.
+Phase 1 (harness) SHIPPED -- =lisp/nl-llm-agent.el= + =test/agent-test.el= (11/11)
++ =examples/agent-demo.el=.
+Phase 4 (real model wired as policy, via constrained decoding) SHIPPED --
+=lisp/nl-llm-agent-model.el= + =test/agent-model-test.el= (6/6) +
+=examples/agent-model-demo.el=.  Phases 2/3/5 below are designed, not built.
 
 * Why
 An LLM by itself only emits text.  What lets Claude Code / Codex *act* -- edit
@@ -76,8 +79,16 @@ turn the model gets better at using -- and improving -- itself.
 - *P2*: sandboxing (=emacs --batch= for eval; resource/time limits), fuzzy edit
   application, per-tool permission gating.
 - *P3*: tree-sitter repo map + PageRank ranking; feed only ranked context.
-- *P4*: wire nelisp-llm generation as the POLICY (the integrated GPU decode);
-  prompt/grammar so the small model emits valid action blocks (constrained decode).
+- *P4 (SHIPPED)*: nelisp-llm generation wired as the POLICY.  A char tokenizer
+  (vocab 96) + a CONSTRAINED decoder: a grammar says which characters are legal at
+  each position, the model's logits are masked to that set and the argmax taken;
+  fixed scaffold characters are forced, only variable slots are model-chosen.  So
+  the output is ALWAYS a parseable, executable action however weak the model --
+  the model picks content, the grammar guarantees structure.  Generation engine is
+  =nl-llm-decode-step= (CPU) behind a (token -> logits) STEP-FN, so the GPU /
+  integrated decode swaps in unchanged.  =examples/agent-model-demo.el=: an
+  untrained random model yields 3/3 structurally valid Elisp actions (gibberish
+  content -> P5).
 - *P5*: trajectory collection + reward filtering + nlga fine-tune = the
   self-improvement loop above.
 
