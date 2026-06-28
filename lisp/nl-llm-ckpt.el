@@ -14,15 +14,18 @@
 ;;;###autoload
 (defun nl-llm-ckpt-save (path model)
   "Save MODEL to PATH as a sexp checkpoint.  MODEL is a plist with :config (a
-plist of hyperparameters), :step (integer), :wte, :lnfg, :bh (tensors) and
-:blocks (a list of block plists of tensors, with biases)."
+plist of hyperparameters), :step (integer), :wte, :lnfg, :bh (tensors), :blocks
+(a list of block plists of tensors, with biases), and optionally :opt (the Adam
+optimiser state from `nlga-adam-state', a list of (m . v) tensor pairs in
+parameter order) for a complete, seamless resume."
   (let ((form (list :format nl-llm-ckpt-format
                     :config (plist-get model :config)
                     :step   (or (plist-get model :step) 0)
                     :wte    (plist-get model :wte)
                     :lnfg   (plist-get model :lnfg)
                     :bh     (plist-get model :bh)
-                    :blocks (plist-get model :blocks))))
+                    :blocks (plist-get model :blocks)
+                    :opt    (plist-get model :opt))))
     (with-temp-buffer
       (let ((print-length nil) (print-level nil)) (prin1 form (current-buffer)))
       (let ((coding-system-for-write 'utf-8))

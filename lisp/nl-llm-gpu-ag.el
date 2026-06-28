@@ -517,6 +517,30 @@ loss seed (before `nlga-compile')."
           (nlga--d b (list 'adam (list (nlga-rt-slot rt) gs ms vs hslot sslot) (list n) (nlga--g n)))))
       (setf (nlga-adam b) (list :h hh :lr lr :b1 b1 :b2 b2 :eps ep :mv mv)))))
 
+(defun nlga-adam-state (b)
+  "Read back the Adam optimiser state as a list of (m-tensor . v-tensor) in
+parameter order (matching `nlga-params').  Server must be up; call before
+`nlga-free'.  Pair with the saved step for a complete, seamless resume."
+  (let* ((rest (reverse (plist-get (nlga-adam b) :mv))) (out nil))
+    (dolist (p (nlga-params b))
+      (let* ((sh (photon-tensor-shape (plist-get p :tensor))) (n (nlga-rt-size (plist-get p :rt)))
+             (mh (car rest)) (vh (cadr rest)))
+        (push (cons (photon-tensor sh (nelisp-gpu-server-read-resident mh n))
+                    (photon-tensor sh (nelisp-gpu-server-read-resident vh n)))
+              out)
+        (setq rest (cddr rest))))
+    (nreverse out)))
+
+(defun nlga-adam-restore (b opt)
+  "Overwrite each parameter's resident Adam m/v with OPT, a list of (m . v)
+tensors in parameter order (from `nlga-adam-state' / a checkpoint).  Call after
+`nlga-finish-adam' (which allocated the m/v buffers) and before stepping."
+  (let ((rest (reverse (plist-get (nlga-adam b) :mv))) (ol opt))
+    (dolist (_ (nlga-params b))
+      (nelisp-gpu-server-write-resident (car rest) (photon-tensor-data (car (car ol))))
+      (nelisp-gpu-server-write-resident (cadr rest) (photon-tensor-data (cdr (car ol))))
+      (setq rest (cddr rest) ol (cdr ol)))))
+
 (defun nlga-adam-update-t (b tstep &optional base-lr)
   "Refresh the Adam hyperparameter buffer for 1-based timestep TSTEP:
 lr_t = LR * sqrt(1 - b2^t) / (1 - b1^t), where LR is BASE-LR if given (e.g. a

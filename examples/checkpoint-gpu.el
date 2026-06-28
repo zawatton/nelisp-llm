@@ -38,7 +38,7 @@
        (blks (let ((l nil) (n 0)) (while (< n nblocks) (push (funcall mkblk (* (1+ n) 100)) l) (setq n (1+ n))) (nreverse l)))
        (tables (nl-llm-gpu-rope-tables seq hd))
        (mask (let ((md (make-vector (* seq seq) 0.0)) (i 0)) (while (< i seq) (let ((j (1+ i))) (while (< j seq) (aset md (+ (* i seq) j) -1.0e30) (setq j (1+ j)))) (setq i (1+ i))) (photon-tensor (list seq seq) md)))
-       (ckpt (make-temp-file "nl-llm-ckpt" nil ".sexp")))
+       (ckpt (make-temp-file "nl-llm-ckpt" nil ".sexp")) (adam-st nil))
   (unless (nl-llm-gpu-enable) (princ "no GPU\n") (kill-emacs 0))
   ;; ---- train (memorise one window), readback, SAVE checkpoint ----
   (let* ((b (nlga-new)) (wb (lambda (bt) (let ((o nil) (kv bt)) (while kv (push (car kv) o) (push (nlga-param b (cadr kv)) o) (setq kv (cddr kv))) (nreverse o))))
@@ -54,9 +54,10 @@
     (let ((s 0)) (while (< s steps)
       (nlga-adam-update-t b (1+ s) (nl-llm-lr-warmup-cosine (1+ s) steps 20 lr 0.001))
       (nlga-step b) (setq s (1+ s))))
+    (setq adam-st (nlga-adam-state b))   ; capture optimiser state for a complete resume
     (nlga-readback b) (nlga-free b))
   (nl-llm-ckpt-save ckpt (list :config (list :dim dim :heads heads :kv-heads kvh :ff ff :vocab vocab :nblocks nblocks :seq seq)
-                               :step steps :wte wte :lnfg lnfg :bh bh :blocks blks))
+                               :step steps :wte wte :lnfg lnfg :bh bh :blocks blks :opt adam-st))
   (nl-llm-gpu-disable)                    ; stop the GPU entirely (simulate session end)
   (princ (format "saved checkpoint: %s (%d bytes)\n" (file-name-nondirectory ckpt) (nth 7 (file-attributes ckpt))))
   ;; ---- later: load the checkpoint, restart the GPU, generate from it ----
