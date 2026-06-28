@@ -2,7 +2,7 @@
 EMACS ?= emacs
 PHOTON ?= ../nelisp-photon/lisp
 
-.PHONY: test compile clean train train-modern train-modern-full gpu-test gpu-train-test gpu-ag-test gpu-block-test gpu-moe-test gpu-stack-test gpu-window-test gpu-gather-test gpu-adam-test gpu-tie-test gpu-sched-test bench-gpu bench-gpu-train bench-ondevice train-stacked-gpu train-corpus-gpu generate-gpu train-full-gpu checkpoint-gpu train-big-gpu stream-decode
+.PHONY: test compile clean train train-modern train-modern-full gpu-test gpu-train-test gpu-ag-test gpu-block-test gpu-moe-test gpu-stack-test gpu-window-test gpu-gather-test gpu-adam-test gpu-tie-test gpu-sched-test bench-gpu bench-gpu-train bench-ondevice train-stacked-gpu train-corpus-gpu generate-gpu train-full-gpu checkpoint-gpu train-big-gpu stream-decode spec-decode
 
 test:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/arch-test.el
@@ -13,6 +13,7 @@ test:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/sample-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/decode-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/stream-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/spec-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/dropout-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/ckpt-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-test.el
@@ -84,6 +85,9 @@ train-big-gpu:
 
 stream-decode:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l examples/stream-decode.el
+
+spec-decode:
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l examples/spec-decode.el
 
 clean:
 	rm -f lisp/*.elc

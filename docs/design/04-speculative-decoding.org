@@ -3,7 +3,20 @@
 #+STATUS: DRAFT
 
 * Status
-DRAFT -- concept + application design.  Not implemented.
+SHIPPED (greedy, single look-ahead head); sampling / tree / GPU-batched verify pending.
+
+MTP self-speculative greedy decode lands: training adds a second look-ahead head
+H2 (predicts the token two ahead) via a second =nlga-seed-ce-idx= at a +2 target;
+=lisp/nl-llm-spec.el= drafts with H2 and verifies with the main head.  The
+emitted stream is provably identical to plain greedy regardless of H2 (the
+acceptance only ever emits =argmax(head1)= tokens), pinned in
+=test/spec-test.el= (random model, 3 seeds, exact match -- no GPU needed).
+=examples/spec-decode.el= trains H2 on-device and shows the speedup: lossless,
+1.92x tokens-per-forward (near the 2x ceiling for one extra head).
+
+Verify here is sequential KV feeds counted as one round (= one batched target
+forward).  Pending: batch the verify as a true GPU prefill, lossless *sampling*
+(rejection rule, not just greedy), and JetSpec-style tree drafting.
 
 Sources: "Multi-Token Prediction" (Google, 2026); "JetSpec" parallel-tree
 speculative decoding (UCSD Hao AI Lab, 2026); classic speculative decoding.

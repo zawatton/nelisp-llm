@@ -92,5 +92,21 @@ next token.  Call once per position, in order, to generate."
     (photon-tensor-data
      (photon-tensor-linear (nl-llm-rmsnorm x lnfg) wte bh))))
 
+;;;###autoload
+(defun nl-llm-decode-h (token blocks caches wte lnfg dim &optional rope-base)
+  "Like `nl-llm-decode-step' but return the post-final-RMSNorm hidden (1 x dim)
+instead of logits, so that several heads (e.g. the main tied head and an MTP
+look-ahead head) can be applied to the same hidden.  Feeds TOKEN and advances
+the KV CACHES exactly as `nl-llm-decode-step'."
+  (let* ((wd (photon-tensor-data wte))
+         (x (photon-tensor (list 1 dim)
+                           (let ((v (make-vector dim 0.0)))
+                             (dotimes (j dim) (aset v j (aref wd (+ (* token dim) j)))) v)))
+         (bl blocks) (cl caches))
+    (while bl
+      (setq x (nl-llm-decode-block x (car bl) (car cl) rope-base))
+      (setq bl (cdr bl) cl (cdr cl)))
+    (nl-llm-rmsnorm x lnfg)))
+
 (provide 'nl-llm-decode)
 ;;; nl-llm-decode.el ends here

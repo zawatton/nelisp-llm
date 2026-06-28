@@ -364,6 +364,21 @@ per-sequence decode to f32 (maxrel 8.1e-6) and checks the on-demand block count.
 Decode is synchronous here; per-sequence lengths, a free-list and prefix sharing
 are the next step (~docs/design/03-paged-attention.org~).
 
+*** Faster decode: self-speculative (MTP) generation
+
+~nl-llm-spec.el~ decodes with speculative execution (Leviathan et al. 2023) using
+an MTP look-ahead head (Medusa/Cai et al. 2024).  Training adds a second head H2
+that predicts the token /two/ ahead (a second cross-entropy at a +2 target); at
+decode each round drafts the next token from the main head and a speculative token
+from H2, verifies both in one target forward, and emits two tokens on a hit, one
+on a miss.  The emitted stream is *exactly* plain greedy regardless of H2 -- the
+acceptance only ever keeps =argmax(main head)= tokens -- so it is lossless by
+construction.  ~test/spec-test.el~ pins this on a random model across seeds (no
+GPU); ~examples/spec-decode.el~ trains H2 on-device and measures the speedup
+(lossless, ~1.92x tokens per forward, near the 2x ceiling for one extra head).
+Pending: a batched GPU verify, lossless sampling, and tree drafting
+(~docs/design/04-speculative-decoding.org~).
+
 *** Capstone: a real(er) run with mid-run checkpoint + resume
 
 ~examples/train-big-gpu.el~ exercises the whole stack at once at a larger scale: a
@@ -404,6 +419,7 @@ size, while on-device keeps everything resident and only moves the loss out.
 - ~lisp/nl-llm-block.el~    -- pre-norm block + model forward (GQA/MoE) + sampling
 - ~lisp/nl-llm-decode.el~   -- KV-cache incremental decode (CPU; biases, tied head)
 - ~lisp/nl-llm-stream.el~   -- StreamingLLM bounded decode (attention sink + window, CPU)
+- ~lisp/nl-llm-spec.el~     -- self-speculative (MTP) greedy decode (lossless, CPU)
 - ~lisp/nl-llm-gpu-decode.el~ -- on-GPU KV-cache decode (resident cache, runtime pos)
 - ~lisp/nl-llm-ckpt.el~      -- checkpoint save / load (config, step, all tensors)
 - ~lisp/nl-llm-autograd.el~ -- reverse-mode backward for all of the above
