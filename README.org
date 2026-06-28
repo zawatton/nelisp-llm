@@ -585,6 +585,14 @@ the bank from the ~1/8 baseline (~examples/agent-tasks-demo.el~: 15% -> 56% over
 4-task bank).  A tiny char model only partially generalises the conditional copy --
 which is precisely the capacity/scale that training on the GPU (nlga) is for.
 
+And that fine-tune step *scales to the GPU*: ~examples/agent-gpu-finetune-demo.el~
+(and ~test/agent-gpu-test.el~) trains an nlga model on the agent's successful
+trajectories on-device -- CE + Adam, the same gradient engine behind the
+~train-*-gpu~ examples -- and the trajectory cross-entropy drops 4.6 -> 1.8 on the
+GPU.  So the whole stack -- generate (constrained decode), act (sandboxed),
+reward (run the tests), and learn (nlga on the GPU) -- runs in nelisp, and the
+model improves itself from its own wins.
+
 *** Capstone: a real(er) run with mid-run checkpoint + resume
 
 ~examples/train-big-gpu.el~ exercises the whole stack at once at a larger scale: a

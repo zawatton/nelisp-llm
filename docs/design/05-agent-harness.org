@@ -129,7 +129,13 @@ turn the model gets better at using -- and improving -- itself.
   lifts mean success across the bank from the ~1/8 baseline
   (=test/agent-tasks-test.el=, =examples/agent-tasks-demo.el=: 15% -> 56% over the
   4-task bank; a tiny char model only partially generalises the conditional copy --
-  capacity/scale is exactly what P5-on-GPU buys).
+  capacity/scale is exactly what P5-on-GPU buys).  GPU scale SHIPPED: the
+  fine-tune step runs on-device via nlga -- =test/agent-gpu-test.el= +
+  =examples/agent-gpu-finetune-demo.el= train an nlga model on the agent's
+  successful trajectories (CE + Adam, the same engine behind train-*-gpu) and the
+  trajectory CE drops 4.6 -> 1.8 on the GPU.  Remaining: transfer the GPU-trained
+  weights back into the rollout decoder to close the whole rollout<->train loop
+  on-device.
 
 * Sources
 mini-swe-agent (github.com/SWE-agent/mini-swe-agent); SWE-agent ACI

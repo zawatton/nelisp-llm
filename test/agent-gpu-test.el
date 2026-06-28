@@ -1,0 +1,93 @@
+;;; agent-gpu-test.el --- P5 scale: fine-tune agent trajectories on the GPU (nlga)  -*- lexical-binding: t; -*-
+;; The self-improvement fine-tune step scales to the GPU: given the agent's
+;; successful trajectories (here, correct synthesised actions for several tasks),
+;; an nlga model is trained on them on-device (CE + Adam) and the loss drops -- the
+;; same gradient engine that powers train-*-gpu, now applied to agent trajectories.
+;; Skips (exit 0) without a Vulkan device.
+;;   emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l test/agent-gpu-test.el
+(add-to-list 'load-path (expand-file-name "lisp"))
+(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+(require 'cl-lib)
+(require 'photon-tensor)
+(require 'nl-llm-agent-model)
+(require 'nl-llm-gpu)
+(require 'nl-llm-gpu-ag)
+(require 'nl-llm-gpu-decode)   ; nl-llm-gpu-rope-tables
+
+(defvar ag--fail 0)
+(defun ag--ck (name ok &optional extra)
+  (princ (format "%-52s %s  %s\n" name (if ok "PASS" (progn (setq ag--fail (1+ ag--fail)) "FAIL")) (or extra ""))))
+(defun ag--t (shape seed sc) (let ((n 1)) (dolist (d shape) (setq n (* n d)))
+  (photon-tensor shape (let ((v (make-vector n 0.0)) (i 0))
+    (while (< i n) (aset v i (* sc 2.0 (- (/ (float (mod (+ (* (1+ i) 2654435761) (* (1+ seed) 40503)) 65536)) 65536.0) 0.5))) (setq i (1+ i))) v))))
+(defun ag--ones (n) (photon-tensor (list n) (make-vector n 1.0)))
+(defun ag--zeros (shape) (let ((n 1)) (dolist (d shape) (setq n (* n d))) (photon-tensor shape (make-vector n 0.0))))
+
+;; pad/encode a trajectory string to a fixed-length (toks . targets) char-id pair
+(defun ag--encode (s seq)
+  (let ((toks (make-vector seq 0)) (tgts (make-vector seq 0)) (cs (append s nil)) (i 0))
+    (while (and cs (< i seq)) (aset toks i (nl-llm-agent--char->id (car cs))) (setq cs (cdr cs) i (1+ i)))
+    (dotimes (j seq) (aset tgts j (if (< (1+ j) seq) (aref toks (1+ j)) 0)))
+    (cons toks tgts)))
+(defun ag--onehot (vec vocab) (let ((seq (length vec)) (v (make-vector (* (length vec) vocab) 0.0)))
+  (dotimes (i seq) (aset v (+ (* i vocab) (aref vec i)) 1.0)) (photon-tensor (list seq vocab) v)))
+(defun ag--ce (logits seq vocab targets)
+  (let ((s 0.0)) (dotimes (i seq)
+    (let ((mx -1e30) (z 0.0) (base (* i vocab)))
+      (dotimes (c vocab) (when (> (aref logits (+ base c)) mx) (setq mx (aref logits (+ base c)))))
+      (dotimes (c vocab) (setq z (+ z (exp (- (aref logits (+ base c)) mx)))))
+      (setq s (+ s (- (- (aref logits (+ base (aref targets i))) mx) (log z))))))
+    (/ (- s) seq)))
+
+(if (not (nl-llm-gpu-enable))
+    (ag--ck "GPU fine-tune of agent trajectories [SKIPPED: no GPU]" t)
+  (let* ((vocab nl-llm-agent-char-vocab) (dim 24) (ff 24) (heads 2) (kvh 2) (hd (/ dim heads)) (kvdim (* kvh hd))
+         (nblocks 1) (seq 40) (scl (/ 1.0 (sqrt (float hd)))) (sc (/ 1.0 (sqrt (float dim)))) (lr 0.05)
+         ;; the agent's successful trajectories (correct actions for several tasks)
+         (trajs (mapcar (lambda (s) (ag--encode s seq))
+                        '("```elisp\n(defun f235 (x) (* x 2))\n```"
+                          "```elisp\n(defun f235 (x) (* x 3))\n```"
+                          "```elisp\n(defun f235 (x) (* x 4))\n```"
+                          "```elisp\n(defun f235 (x) (* x 5))\n```")))
+         (tables (nl-llm-gpu-rope-tables seq hd))
+         (mkblk (lambda (s0) (list :ln1g (ag--ones dim) :wq (ag--t (list dim dim) (+ s0 1) sc) :bq (ag--zeros (list dim))
+                                   :wk (ag--t (list kvdim dim) (+ s0 2) sc) :bk (ag--zeros (list kvdim))
+                                   :wv (ag--t (list kvdim dim) (+ s0 3) sc) :bv (ag--zeros (list kvdim))
+                                   :wo (ag--t (list dim dim) (+ s0 4) sc) :bo (ag--zeros (list dim)) :ln2g (ag--ones dim)
+                                   :wg (ag--t (list ff dim) (+ s0 5) sc) :bg (ag--zeros (list ff))
+                                   :wu (ag--t (list ff dim) (+ s0 6) sc) :bu (ag--zeros (list ff))
+                                   :wd (ag--t (list dim ff) (+ s0 7) sc) :bd (ag--zeros (list dim)))))
+         (b (nlga-new)))
+    (cl-flet ((wp (tn) (nlga-param b tn))
+              (wb (bt) (let ((out nil) (kv bt)) (while kv (push (car kv) out) (push (nlga-param b (cadr kv)) out) (setq kv (cddr kv))) (nreverse out))))
+      (let* ((oh (nlga-const b (ag--onehot (car (car trajs)) vocab)))
+             (ohtgt (nlga-const b (ag--onehot (cdr (car trajs)) vocab)))
+             (wter (wp (ag--t (list vocab dim) 99 sc)))
+             (blks (let ((l nil) (n 0)) (while (< n nblocks) (push (wb (funcall mkblk (* (1+ n) 100))) l) (setq n (1+ n))) (nreverse l)))
+             (lnfgr (wp (ag--ones dim))) (whr (wp (ag--t (list vocab dim) 9 sc))) (bhr (wp (ag--zeros (list vocab))))
+             (cosr (nlga-const b (car tables))) (sinr (nlga-const b (cdr tables)))
+             (sposr (nlga-scalar b 1.0)) (snegr (nlga-scalar b -1.0)) (sclr (nlga-scalar b scl)) (oner (nlga-scalar b 1.0))
+             (maskr (nlga-const b (let ((md (make-vector (* seq seq) 0.0)) (i 0))
+                                    (while (< i seq) (let ((j (1+ i))) (while (< j seq) (aset md (+ (* i seq) j) -1.0e30) (setq j (1+ j)))) (setq i (1+ i))) (photon-tensor (list seq seq) md))))
+             (lrr (nlga-scalar b lr))
+             (logits (nlga-model b oh wter blks lnfgr whr bhr heads kvh cosr sinr sposr snegr sclr maskr))
+             (lout (nlga-keep b logits oner)) (nt (length trajs)) (first-ce nil) (last-ce nil))
+        (nlga-seed-ce b logits ohtgt) (nlga-finish b lrr) (nlga-compile b)
+        (let ((s 0) (steps 60))
+          (while (< s steps)
+            (let ((tr (nth (mod s nt) trajs)))
+              (nlga-update oh (ag--onehot (car tr) vocab))
+              (nlga-update ohtgt (ag--onehot (cdr tr) vocab))
+              (let ((ce (ag--ce (nth lout (nlga-step b)) seq vocab (cdr tr))))
+                (when (< s nt) (setq first-ce (cons ce first-ce)))
+                (when (>= s (- steps nt)) (setq last-ce (cons ce last-ce))))
+              (setq s (1+ s)))))
+        (nlga-free b) (nl-llm-gpu-disable)
+        (let ((f (/ (apply #'+ first-ce) (length first-ce))) (l (/ (apply #'+ last-ce) (length last-ce))))
+          (princ (format "trajectory CE on GPU: first=%.3f -> last=%.3f\n" f l))
+          (ag--ck "nlga fine-tunes agent trajectories on the GPU (loss drops)" (< l (* 0.6 f))
+                  (format "%.3f -> %.3f" f l)))))))
+
+(princ (format "NL-LLM-AGENT-GPU %s (%d failures)\n" (if (= ag--fail 0) "ALL-PASS" "HAS-FAILURES") ag--fail))
+(kill-emacs (if (= ag--fail 0) 0 1))
+;;; agent-gpu-test.el ends here
