@@ -593,6 +593,21 @@ GPU.  So the whole stack -- generate (constrained decode), act (sandboxed),
 reward (run the tests), and learn (nlga on the GPU) -- runs in nelisp, and the
 model improves itself from its own wins.
 
+Finally the loop is *closed on-device* (~nl-llm-agent-ondevice.el~): one model with
+two views that share weight tensors -- a CPU view (stacked ~nl-llm-ag-block~) rolls
+out, an nlga GPU graph built from the *same host tensors* trains, and
+~nlga-readback~ copies the trained weights straight back into the shared tensors.
+The CPU and GPU views are the same function (their logits agree to ~2e-5), so the
+transfer is just the readback -- after the GPU trains, the CPU rollout immediately
+decodes with the GPU-trained weights.  Loop: rollout (CPU) -> reward -> train (GPU)
+-> readback -> repeat.  ~examples/agent-ondevice-demo.el~ (and
+~test/agent-ondevice-test.el~): the CPU-rollout success rate climbs from the 25%
+random baseline to a ~70% peak, with the head weight provably changed only by the
+GPU training fed back through it -- the rise is the proof the transfer closes the
+loop.  An nelisp-llm model now writes Lisp to act on itself, runs it under a
+sandbox, scores it by running tests, and retrains itself on the GPU -- end to end,
+in nelisp.
+
 *** Capstone: a real(er) run with mid-run checkpoint + resume
 
 ~examples/train-big-gpu.el~ exercises the whole stack at once at a larger scale: a

@@ -133,9 +133,17 @@ turn the model gets better at using -- and improving -- itself.
   fine-tune step runs on-device via nlga -- =test/agent-gpu-test.el= +
   =examples/agent-gpu-finetune-demo.el= train an nlga model on the agent's
   successful trajectories (CE + Adam, the same engine behind train-*-gpu) and the
-  trajectory CE drops 4.6 -> 1.8 on the GPU.  Remaining: transfer the GPU-trained
-  weights back into the rollout decoder to close the whole rollout<->train loop
-  on-device.
+  trajectory CE drops 4.6 -> 1.8 on the GPU.  The loop is then CLOSED on-device
+  (=lisp/nl-llm-agent-ondevice.el=): one model, two views sharing weight tensors --
+  a CPU view (stacked =nl-llm-ag-block=) rolls out, an nlga GPU graph built from the
+  SAME host tensors trains, and =nlga-readback= copies the trained weights straight
+  back into the shared tensors (the two are the same function -- CPU vs nlga logits
+  agree to ~2e-5 -- so the transfer is just the readback).  Loop: rollout (CPU) ->
+  reward -> train (GPU) -> readback -> repeat.  =test/agent-ondevice-test.el= +
+  =examples/agent-ondevice-demo.el=: the CPU-rollout success rises from the 25%
+  random baseline to a ~70% peak with the head weight provably changed only by the
+  GPU training (a replay buffer stabilises the STaR step).  Whole loop -- generate,
+  act, reward, learn -- runs in nelisp, on the GPU.
 
 * Sources
 mini-swe-agent (github.com/SWE-agent/mini-swe-agent); SWE-agent ACI

@@ -2,7 +2,7 @@
 EMACS ?= emacs
 PHOTON ?= ../nelisp-photon/lisp
 
-.PHONY: test compile clean train train-modern train-modern-full gpu-test gpu-train-test gpu-ag-test gpu-block-test gpu-moe-test gpu-stack-test gpu-window-test gpu-gather-test gpu-adam-test gpu-tie-test gpu-sched-test bench-gpu bench-gpu-train bench-ondevice train-stacked-gpu train-corpus-gpu generate-gpu train-full-gpu checkpoint-gpu train-big-gpu stream-decode spec-decode bitnet-model bench-dp4a spec-chain integrated-decode bench-longctx agent-demo agent-model-demo agent-improve-demo agent-code-demo agent-sandbox-demo agent-tasks-demo agent-gpu-finetune-demo
+.PHONY: test compile clean train train-modern train-modern-full gpu-test gpu-train-test gpu-ag-test gpu-block-test gpu-moe-test gpu-stack-test gpu-window-test gpu-gather-test gpu-adam-test gpu-tie-test gpu-sched-test bench-gpu bench-gpu-train bench-ondevice train-stacked-gpu train-corpus-gpu generate-gpu train-full-gpu checkpoint-gpu train-big-gpu stream-decode spec-decode bitnet-model bench-dp4a spec-chain integrated-decode bench-longctx agent-demo agent-model-demo agent-improve-demo agent-code-demo agent-sandbox-demo agent-tasks-demo agent-gpu-finetune-demo agent-ondevice-demo
 
 test:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/arch-test.el
@@ -52,6 +52,7 @@ test:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/agent-code-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/agent-tasks-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/agent-gpu-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/agent-ondevice-test.el
 
 compile:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) \
@@ -141,6 +142,9 @@ agent-tasks-demo:
 
 agent-gpu-finetune-demo:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l examples/agent-gpu-finetune-demo.el
+
+agent-ondevice-demo:
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l examples/agent-ondevice-demo.el
 
 clean:
 	rm -f lisp/*.elc
