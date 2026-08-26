@@ -10,15 +10,18 @@ test:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/moe-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/block-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/autograd-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/lora-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/sample-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/decode-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/stream-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/spec-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/dropout-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/ckpt-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/lora-ckpt-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-train-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-ag-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-lora-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-block-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-moe-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-stack-test.el
