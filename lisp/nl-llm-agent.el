@@ -25,6 +25,7 @@
 
 ;;; Code:
 
+(require 'nl-llm-compat)
 (require 'cl-lib)
 (require 'subr-x)
 
@@ -64,43 +65,51 @@ rejected -- read the error and try again."
   (let ((s (if (string-prefix-p "\n" s) (substring s 1) s)))
     (if (string-suffix-p "\n" s) (substring s 0 -1) s)))
 
-(defun nl-llm-agent--fenced (lang)
-  "Return the body of the first ```LANG fenced block in the current buffer, or nil."
-  (goto-char (point-min))
-  (when (re-search-forward (concat "^```" lang "[ \t]*$") nil t)
-    (forward-line 1)
-    (let ((s (point)))
-      (when (re-search-forward "^```[ \t]*$" nil t)
-        (nl-llm-agent--strip1-nl (buffer-substring s (match-beginning 0)))))))
+(defun nl-llm-agent--fenced (text lang)
+  "Return the body of the first ```LANG fenced block in TEXT, or nil."
+  (when (string-match (concat "^```" lang "[ \t]*$") text)
+    (let ((start (match-end 0)))
+      (when (string-match "^```[ \t]*$" text start)
+        (nl-llm-agent--strip1-nl
+         (substring text start (match-beginning 0)))))))
 
 (defun nl-llm-agent--parse (text)
   "Parse assistant TEXT into one action: (edit PATH SEARCH REPLACE) | (elisp CODE)
 | (shell CMD) | (done ANSWER) | (none).  Concrete actions take priority over DONE."
-  (with-temp-buffer
-    (insert text)
-    (cond
-     ;; SEARCH/REPLACE edit
-     ((progn (goto-char (point-min)) (re-search-forward "^<<<<<<< SEARCH[ \t]*$" nil t))
-      (let ((after-mark (point)) (mark-bol (match-beginning 0)) path search replace)
-        (save-excursion
-          (goto-char mark-bol) (forward-line -1)
-          (while (and (> (point) (point-min)) (looking-at "^[ \t]*$")) (forward-line -1))
-          (setq path (string-trim (buffer-substring (line-beginning-position) (line-end-position)))))
-        (goto-char after-mark)
-        (when (re-search-forward "^=======[ \t]*$" nil t)
-          (setq search (nl-llm-agent--strip1-nl (buffer-substring after-mark (match-beginning 0))))
-          (let ((mid (point)))
-            (when (re-search-forward "^>>>>>>> REPLACE[ \t]*$" nil t)
-              (setq replace (nl-llm-agent--strip1-nl (buffer-substring mid (match-beginning 0)))))))
-        (if (and path search replace) (list 'edit path search replace) (list 'none))))
-     ;; Elisp CodeAct
-     ((let ((c (or (nl-llm-agent--fenced "elisp") (nl-llm-agent--fenced "emacs-lisp")))) (and c (list 'elisp c))))
-     ;; shell
-     ((let ((c (or (nl-llm-agent--fenced "sh") (nl-llm-agent--fenced "bash")))) (and c (list 'shell c))))
-     ;; finish
-     ((progn (goto-char (point-min)) (re-search-forward "^DONE\\(?:[ \t]+\\(.*\\)\\)?$" nil t))
-      (list 'done (string-trim (or (match-string 1) ""))))
-     (t (list 'none)))))
+  (cond
+   ;; SEARCH/REPLACE edit
+   ((string-match "^<<<<<<< SEARCH[ \t]*$" text)
+    (let* ((after-mark (match-end 0))
+           (mark-bol (match-beginning 0))
+           (path-lines (nreverse (split-string (substring text 0 mark-bol) "\n")))
+           path search replace)
+      (while (and path-lines (string-blank-p (car path-lines)))
+        (setq path-lines (cdr path-lines)))
+      (when path-lines
+        (setq path (string-trim (car path-lines))))
+      (when (string-match "^=======[ \t]*$" text after-mark)
+        (let ((separator-begin (match-beginning 0))
+              (mid (match-end 0)))
+          (setq search
+                (nl-llm-agent--strip1-nl
+                 (substring text after-mark separator-begin)))
+          (when (string-match "^>>>>>>> REPLACE[ \t]*$" text mid)
+            (setq replace
+                  (nl-llm-agent--strip1-nl
+                   (substring text mid (match-beginning 0)))))))
+      (if (and path search replace) (list 'edit path search replace) (list 'none))))
+   ;; Elisp CodeAct
+   ((let ((body (or (nl-llm-agent--fenced text "elisp")
+                    (nl-llm-agent--fenced text "emacs-lisp"))))
+      (and body (list 'elisp body))))
+   ;; shell
+   ((let ((body (or (nl-llm-agent--fenced text "sh")
+                    (nl-llm-agent--fenced text "bash"))))
+      (and body (list 'shell body))))
+   ;; finish
+   ((string-match "^DONE\\(?:[ \t]+\\(.*\\)\\)?$" text)
+    (list 'done (string-trim (or (match-string 1 text) ""))))
+   (t (list 'none))))
 
 ;; ---- action execution ------------------------------------------------------
 
@@ -127,7 +136,9 @@ result that does not parse is discarded.  Returns (OK . MESSAGE)."
                                    (substring content (+ idx (length search))))))
                   (if (not (nl-llm-agent--lint-ok new file))
                       (cons nil "edit REJECTED: result has unbalanced parens / does not parse")
-                    (progn (with-temp-file file (insert new)) (cons t (format "edit applied to %s" path)))))))))))))
+                    (progn
+                      (write-region new nil file nil 'silent)
+                      (cons t (format "edit applied to %s" path)))))))))))))
 
 (defun nl-llm-agent--eval-elisp (code)
   "Evaluate CODE (one or more forms) IN-PROCESS, capturing the value or error.
@@ -274,9 +285,13 @@ give the policy structure without dumping whole files."
       (let ((defs nil))
         (with-temp-buffer
           (insert-file-contents f)
-          (goto-char (point-min))
-          (while (re-search-forward "^(\\(?:cl-\\)?def\\(?:un\\|var\\|macro\\|custom\\|const\\)[* ]+\\([^ \t\n()]+\\)" nil t)
-            (push (match-string 1) defs)))
+          (let ((text (buffer-string))
+                (start 0))
+            (while (string-match
+                    "^(\\(?:cl-\\)?def\\(?:un\\|var\\|macro\\|custom\\|const\\)[* ]+\\([^ \t\n()]+\\)"
+                    text start)
+              (push (match-string 1 text) defs)
+              (setq start (match-end 0)))))
         (push (format "%s: %s" (file-relative-name f dir)
                       (string-join (nreverse defs) " "))
               lines)))

@@ -800,3 +800,33 @@ independence, the paper's other zero-shot finding -- at =R=16=, the final state
 from two different =S0='s lands within a mean relative L2 distance of *0.0039*
 of each other, i.e. the recurrence has (almost) converged to a fixed point
 independent of where it started.
+
+* Running under the NeLisp standalone reader
+
+The CPU-only code also runs with the standalone reader built from the sibling
+~nelisp~ repository.  Override ~NELISP~ when the binary is elsewhere:
+
+#+begin_src sh
+make test-nelisp-fast                    # quick nine-suite compatibility check
+make test-nelisp                         # all supported CPU-only suites
+make test-nelisp NELISP=/path/to/nelisp # use another standalone binary
+#+end_src
+
+~lisp/nl-llm-compat.el~ contains guarded pure-Elisp fallbacks for the standalone
+reader's missing trigonometric functions, ~user-error~,
+~call-process-shell-command~, noninteractive command detection, parenthesis
+checking, and recursive/relative file helpers.  It also advertises ~subr-x~ when
+the reader already supplies the string and binding helpers used here.  The
+checkpoint code serializes through strings because NeLisp does not yet accept a
+buffer as a ~prin1~ or ~read~ stream, and top-k sampling explicitly skips masked
+logits instead of exponentiating a huge negative sentinel.
+
+On the 2026-09-05 NeLisp build at ~d145e3c02~, ~make test-nelisp-fast~ took 286
+seconds (4 minutes 46 seconds).  The full target is much slower: standalone
+autograd, speculative decoding, and model-backed agent suites can each run for
+tens of minutes.
+
+~agent-sandbox-test~ remains Emacs-only because its contract launches an isolated
+~emacs -Q --batch~ subprocess through a shell timeout.  GPU, integrated, and
+on-device suites also remain outside ~test-nelisp~: they require the GPU backend
+and are not CPU-only standalone-reader coverage.

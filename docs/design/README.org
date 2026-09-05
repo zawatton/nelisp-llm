@@ -16,6 +16,9 @@ work.
 |  2 | [[file:02-streaming-llm-attention-sink.org][StreamingLLM attention sink]]              | SHIPPED | low-md | bounded long ctx  |
 |  3 | [[file:03-paged-attention.org][PagedAttention KV paging]]                 | SHIPPED | med    | var-len batching  |
 |  4 | [[file:04-speculative-decoding.org][Speculative / multi-token decoding]]       | SHIPPED | high   | decode latency    |
+|  5 | [[file:05-agent-harness.org][Self-hosting agent harness]]               | P1-P5✓ | high   | agency / self-improve |
+|  6 | [[file:06-coconut.org][Coconut -- chain of continuous thought]]   | SHIPPED (CPU ref) | med    | latent reasoning (width) |
+|  7 | [[file:07-recurrent-depth.org][Recurrent depth -- iterate a shared block]] | SHIPPED (CPU ref) | med-lo | latent reasoning (depth), test-time compute |
 
 Recommended order: 1 -> 2 -> 3 -> 4.  Each technique should first clear a
 *minimal correctness MVP* (1 = f32-constrained QAT, 2 = cache-relative RoPE, 3 =

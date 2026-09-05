@@ -36,7 +36,8 @@
          "Break it (should be rejected).\nsample.el\n<<<<<<< SEARCH\n(defun greet () \"hello\")\n=======\n(defun greet () \"hello\"\n>>>>>>> REPLACE"
          ;; (4) finish
          "DONE renamed greet"))
-       (_ (with-temp-file file (insert ";;; sample.el\n(defun greet () \"hi\")\n")))
+       (_ (write-region ";;; sample.el\n(defun greet () \"hi\")\n"
+                        nil file nil 'silent))
        (res (nl-llm-agent-run "rename the greeting" (nl-llm-agent-scripted-policy responses)
               :workdir dir :max-steps 8
               :trace (lambda (_step role content) (when (eq role 'observation) (push content obs)))))

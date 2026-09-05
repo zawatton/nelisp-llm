@@ -43,7 +43,8 @@
         (let ((kv blk1)) (while kv (unless (ck--teq (cadr kv) (plist-get blk2 (car kv))) (setq ok nil)) (setq kv (cddr kv)))))
       (ck--ck "all block tensors (incl. biases) exact" ok)))
   ;; bad format -> error
-  (with-temp-file path (prin1 (list :format "bogus" :step 0) (current-buffer)))
+  (write-region (prin1-to-string (list :format "bogus" :step 0))
+                nil path nil 'silent)
   (ck--ck "bad format rejected" (condition-case nil (progn (nl-llm-ckpt-load path) nil) (error t)))
   (delete-file path))
 

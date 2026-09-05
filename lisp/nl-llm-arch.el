@@ -7,6 +7,7 @@
 
 ;;; Code:
 
+(require 'nl-llm-compat)
 (require 'photon-tensor)
 
 (defun nl-llm-mul (a b)
