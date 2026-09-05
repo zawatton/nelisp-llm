@@ -1,0 +1,148 @@
+#+TITLE: Coconut -- Chain of Continuous Thought
+#+OPTIONS: toc:2 num:t
+#+STATUS: DRAFT
+
+* Status
+DRAFT -- design + implementation brief.  Implementation lands in
+=lisp/nl-llm-coconut.el= + =test/coconut-test.el= + =examples/coconut-demo.el=
+(CPU autograd reference first, as every technique here does; a GPU / KV-cache
+phase is listed under Follow-ups and is *not* part of this doc's MVP).
+
+Source: Hao, Sukhbaatar, Su, Li, Hu, Weston, Tian, "Training Large Language
+Models to Reason in a Continuous Latent Space" (Meta FAIR, arXiv 2412.06769,
+Dec 2024).
+
+* Motivation
+Chain-of-thought makes a model reason by *emitting language tokens* and reading
+them back.  Two costs: every reasoning step must be verbalised (most tokens carry
+no reasoning, a few carry all of it), and committing to one token per step
+forces a depth-first walk of the reasoning tree.  Coconut removes the
+verbalisation: the model's *last hidden state* is fed back as the next input
+embedding, so a "thought" is a continuous vector instead of a token.  The paper
+shows this beats CoT on planning-heavy tasks (ProsQA, ProntoQA) with far fewer
+tokens, and that a continuous thought behaves like a breadth-first frontier --
+it encodes several candidate next steps at once and prunes later.
+
+For nelisp-llm this is the first *latent reasoning* technique and it lands on
+the CPU autograd path with two new row ops and zero new kernels.
+
+* Principle
+Given a question =q= and a model with an LM head:
+
+1. Encode =q= followed by a special =<bot>= (begin-of-thought) token.
+2. Take the last-layer hidden state at the last position, =h_t=, and use it
+   *directly* as the input embedding of position =t+1= -- a continuous thought.
+   Repeat =c= times (each thought attends over the question and the earlier
+   thoughts; RoPE positions simply continue).
+3. Append =<eot>= (end-of-thought) and switch back to language mode: decode the
+   answer tokens normally.
+
+Which hidden state: the output of the last block *after the final norm* (what HF
+=hidden_states[-1]= is for Llama, and what the reference implementation feeds
+back).  Here that is =nl-llm-ag-rmsnorm= with the model's =lnfg= gain, i.e. the
+tensor that would otherwise go into the LM head.
+
+** Training (multi-stage curriculum)
+Data are =(question, reasoning steps s_1..s_m, answer)= triples.  Stage =k=
+replaces the first =k= language steps by =k*c= continuous thoughts (=c= thoughts
+per removed step; paper uses c=1 or 2) and keeps the remaining steps + answer as
+language targets:
+
+: stage 0 :  q <bot> <eot> s_1 s_2 ... s_m a          (plain CoT with markers)
+: stage 1 :  q <bot> [t]  <eot> s_2 ... s_m a
+: stage k :  q <bot> [t]*k <eot> s_{k+1} ... s_m a
+
+Loss = cross-entropy on =<eot>= and every language token after the thoughts; the
+question and the thought positions carry no loss.  Gradients flow *through the
+thoughts* (the feedback path is differentiated), which is what lets the model
+learn to put reasoning into the vector.  Because thought =i+1= depends on
+thought =i=, training needs =c*k + 1= sequential forward passes per example (the
+paper does the same; KV-cache reuse is an optimisation, not a semantic).  The
+paper resets the optimiser state at each stage boundary; with plain SGD here
+there is no state to reset.
+
+** Inference
+After =<bot>=, produce a fixed =c*k= thoughts (the paper's default; a learned
+stop classifier is an alternative it also tests), emit =<eot>=, then greedy /
+sampled decode of the answer.
+
+* Where it lands here
+Everything is expressed with existing autograd pieces plus two row ops:
+
+- Model: the CPU autograd stack -- =photon-autograd-embedding= for token rows,
+  =nl-llm-ag-block= x N, =nl-llm-ag-rmsnorm= (=lnfg=), =photon-autograd-linear=
+  head.  Same plist shape as =examples/train-modern-full.el= / the agent
+  modules (=:wte :blocks :lnfg :wh :bh :dim :heads :kv-heads=), plus two
+  special ids =:bot= and =:eot=.
+- New autograd ops (row analogues of =nl-llm-ag-slice-cols= /
+  =nl-llm-ag-concat-cols=):
+  - =nl-llm-ag-slice-rows X R0 N= -> (N x dim); backward scatters into rows.
+  - =nl-llm-ag-concat-rows TENSORS= -> stacked rows; backward slices back.
+- =nl-llm-coconut-forward MODEL QUESTION C SUFFIX= : the =c+1= sequential passes
+  above.  With =C = 0= the input is exactly =q <bot> <eot> suffix= and the
+  result must be *bit-identical* to the plain model forward on that token
+  list -- the equivalence the tests pin.
+- Row bookkeeping (P = length of QUESTION, n = length of SUFFIX):
+  : rows 0..P-1     question
+  : row  P          <bot>
+  : rows P+1..P+c   thoughts (continuous; no token id)
+  : row  P+c+1      <eot>
+  : rows P+c+2..    suffix tokens
+  Targets are =<eot> ++ suffix= (n+1 of them) read from logit rows
+  =P+c .. P+c+n=; the final suffix row predicts nothing.
+- =nl-llm-coconut-loss MODEL QUESTION C SUFFIX= : slice those rows off the logits
+  and =photon-autograd-softmax-ce= against the targets.
+- =nl-llm-coconut-generate MODEL QUESTION C MAX-NEW= : thoughts, then =<eot>=,
+  then greedy decode until =<eot>=/=MAX-NEW= (full recompute per token -- fine
+  at this scale; see Follow-ups for the KV-cache variant).
+- Curriculum: =nl-llm-coconut-stage-example ITEM K C= maps a
+  =(:q :steps :a)= item to the =(question . suffix)= pair for stage K;
+  =nl-llm-coconut-train MODEL DATA &key STAGES EPOCHS LR C= runs stages
+  0..STAGES with SGD and returns per-stage mean losses.
+- Synthetic task (so the whole thing runs on the CPU in a minute):
+  =nl-llm-coconut-task-chain-add K N SEED= -- questions are K random digits,
+  the reasoning steps are the running sums mod 10 (K-1 steps, one digit
+  token each), the answer is the final sum mod 10.  Vocab = 10 digits +
+  =<bot>= (10) + =<eot>= (11) = 12.  This is depth-demanding (the answer is a
+  K-1 step computation) and every step is one token, so stage k removes
+  exactly one step.
+
+* Verification
+=test/coconut-test.el= (CPU, seeded, no GPU, must finish in well under 3 min
+under stock Emacs):
+
+1. =slice-rows= / =concat-rows= numerical gradient checks (the existing
+   =ag--gradcheck= pattern, maxrel < 1e-3).
+2. *Equivalence.* =C = 0=: coconut logits == plain model forward logits on the
+   literal token list, maxdiff exactly 0.
+3. *Shape / determinism* with =C = 2=: rows = P+1+c+1+n; two runs identical.
+4. *Gradient flows through the thoughts.* Finite-difference check of the loss
+   w.r.t. a block weight (and =wte=) with =C = 2=; maxrel < 1e-3.  This is the
+   load-bearing test: it proves the feedback path is part of the graph.
+5. *Thoughts matter.* Replacing the thought rows by zeros changes the suffix
+   logits (maxdiff > 0).
+6. *Curriculum smoke.* Train on the chain-add task for stages 0..2 (c=1) at
+   dim ~16, 2 blocks, ~64 items, a few epochs each: within each stage the mean
+   loss of the last epoch < the first epoch; at the final stage the greedy
+   =nl-llm-coconut-generate= answer accuracy on the training items is above the
+   0.1 chance level and above the untrained model's.
+
+=examples/coconut-demo.el= trains the curriculum and prints, per stage, the
+loss trajectory and held-out answer accuracy in latent mode, plus the number of
+generated tokens per answer versus the stage-0 CoT baseline.
+
+* Cost / risk
+- Effort: medium.  Two row ops, one forward with careful row bookkeeping, a
+  curriculum loop.  No kernels.
+- Risk: (a) scale mismatch between token embeddings and fed-back hidden states
+  (the paper feeds them raw; keep raw, note it); (b) at toy scale the latent
+  stages may not beat CoT -- the tests only assert learning happens and the
+  gradient is right, the demo reports the comparison honestly.
+
+* Follow-ups (not MVP)
+- KV-cache inference: a =nl-llm-decode-h= variant that accepts an embedding row
+  instead of a token id, so the =c+1= passes become =c+1= cached steps.
+- nlga (on-device) training: needs resident row slice/concat -- straightforward
+  on the existing builder.
+- Learned stop (binary classifier on the thought) instead of a fixed =c*k=.
+- Mixing in a fraction of stage-0 CoT data at every stage (paper appendix).

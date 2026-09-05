@@ -1,0 +1,145 @@
+#+TITLE: Recurrent depth -- latent reasoning by iterating a shared block
+#+OPTIONS: toc:2 num:t
+#+STATUS: DRAFT
+
+* Status
+DRAFT -- design + implementation brief.  Implementation lands in
+=lisp/nl-llm-recur.el= + =test/recur-test.el= + =examples/recur-demo.el= (CPU
+autograd reference; on-device and KV-sharing phases are Follow-ups).
+
+Source: Geiping, McLeish, Jain, Kirchenbauer, Singh, Bartoldson, Kailkhura,
+Bhatele, Goldstein, "Scaling up Test-Time Compute with Latent Reasoning: A
+Recurrent Depth Approach" (arXiv 2502.05171, Feb 2025; the Huginn-0125 model).
+
+* Motivation
+Chain-of-thought spends test-time compute by emitting more *tokens*.  Recurrent
+depth spends it in *depth*: a shared block is applied =r= times to a latent
+state, and =r= is chosen at inference time -- more iterations for harder inputs,
+fewer for easy ones, with no extra tokens and no special training data.  The
+paper trains a 3.5B model this way and shows accuracy on reasoning tasks
+rising with =r= at test time, plus zero-shot adaptive exit (stop when the state
+stops changing) and zero-shot KV-cache sharing across iterations.  It is
+complementary to Coconut (Doc 06): Coconut widens the sequence with latent
+positions, recurrent depth deepens each position.
+
+* Principle
+Three parts, all standard transformer blocks (ours: =nl-llm-ag-block=):
+
+- *Prelude* =P=: embed the tokens and run =l_P= blocks -> =e= (seq x h).
+- *Recurrent core* =R=: a latent state =s= is iterated
+  : s_0 ~ N(0, sigma^2 I)                       (fresh random init per forward)
+  : s_i = R( A [ s_{i-1} ; e ] )     i = 1..r    (input injection every step)
+  where =[ s ; e ]= is the *column* concatenation (seq x 2h), =A= is a linear
+  adapter (2h -> h, with bias), and =R= is =l_R= blocks.  Injecting =e= at
+  every iteration is what keeps the recurrence anchored to the input (a plain
+  =s_i = R(s_{i-1})= forgets it).
+- *Coda* =C=: =l_C= blocks, final RMSNorm, LM head -> logits.
+
+** Training
+Per training step draw =r= from a *log-normal Poisson* (paper: mean ~32 for
+pretraining; ours is a small mean like 3-4 at toy scale) and run the recurrence
+=r= times, but backpropagate only through the *last k* iterations
+(truncated backprop through time; paper k = 8).  Iterations =1..r-k= are
+computed without gradient; the prelude still receives gradient because =e= is
+injected into each of the last =k= iterations.  This keeps the cost of a step
+bounded at =k= block-stacks of backward while training the model to be stable
+under many iterations.
+
+** Inference
+- Fixed =r=: any value; accuracy typically rises then saturates.
+- *Adaptive exit*: after each iteration run the coda on the current state and
+  compare the output distribution at the last position with the previous
+  iteration's; stop when =KL(p_{i-1} || p_i) < eps= (paper eps = 5e-4) or at
+  =r_max=.  Zero-shot: nothing about it is trained.
+- The paper also finds *path independence*: at large =r= the state converges to
+  (nearly) the same point from different =s_0=.  We report it as a demo metric.
+
+* Where it lands here
+No new kernels, one new tape utility.
+
+- Model (=nl-llm-recur-model-new &key VOCAB DIM HEADS KV-HEADS FF N-PRELUDE
+  N-CORE N-CODA SEED SIGMA=) -> plist of pav params:
+  =:wte :prelude (blocks) :wa :ba (adapter, DIM x 2*DIM) :core (blocks)
+  :coda (blocks) :lnfg :wh :bh :dim :heads :kv-heads :sigma=.
+  =nl-llm-recur-params MODEL= lists every pav for zero-grad / SGD.  Blocks
+  are plain SwiGLU (=:wg :bg :wu :bu :wd :bd=) pre-norm blocks, biases
+  included, exactly what =nl-llm-ag-block= consumes.
+- Adapter input = =nl-llm-ag-concat-cols (list s e)= (existing op), then
+  =photon-autograd-linear= with =:wa :ba=.
+- Truncated backprop = a *no-grad scope* on the tape:
+  #+begin_src elisp
+  (defmacro nl-llm-ag-no-grad (&rest body)
+    "Run BODY, then drop every tape entry it recorded (no gradient flows into
+  or out of the ops recorded inside).  The value is still a pav; detach it
+  with `photon-autograd-const' on its value before using it downstream."
+    `(let ((nl-llm--tape0 photon-autograd--tape))
+       (prog1 (progn ,@body) (setq photon-autograd--tape nl-llm--tape0))))
+  #+end_src
+  Iterations =1..r-k= run inside it and =s_{r-k}= is re-wrapped with
+  =photon-autograd-const=; iterations =r-k+1..r= run on the tape as usual.
+  =e= (recorded before the scope) keeps its tape entries, so the prelude gets
+  gradient through the injection in the last =k= steps -- and only there.
+- =nl-llm-recur-forward MODEL TOKENS R &key K S0= -> plist
+  =(:logits pav :states (s_1..s_r values) :e pav :r R)=.  =K= defaults to R
+  (full backprop); =S0= defaults to a fresh seeded Gaussian draw.
+- =s_0= sampling: =nl-llm-recur-randn N SIGMA SEED= via the Marsaglia polar
+  method (needs only =sqrt= / =log=; **do not use Box-Muller** -- =cos=/=sin=
+  are not native in the NeLisp standalone reader at the moment).  Seeded and
+  deterministic; the tests pass an explicit =S0= where bit-identity matters.
+- =nl-llm-recur-loss MODEL TOKENS TARGETS R &key K S0= -> softmax-CE pav.
+- =nl-llm-recur-sample-r RBAR &optional SIGMA-LOG= : draw =tau= log-normal with
+  mean =RBAR - 1= (=sigma_log= default 0.5), then =r = 1 + Poisson(tau)=
+  (Knuth's method: =exp= + uniforms; no trig).  Always >= 1.
+- =nl-llm-recur-forward-adaptive MODEL TOKENS RMAX EPS &key S0= -> plist
+  =(:logits :r-used :kls)=: iterate, coda + softmax at the last position each
+  step, stop when the KL to the previous step's distribution < EPS.
+- Synthetic task: a depth-demanding next-token task with no intermediate
+  steps in the input -- K random digits followed by a separator, target = the
+  sum mod 10 (=nl-llm-recur-task-sum-mod K N SEED=; vocab = 10 digits +
+  separator = 11).  The model must do a K-1 step computation inside the
+  recurrence, so extra iterations have something to buy.
+
+* Verification
+=test/recur-test.el= (CPU, seeded, no GPU, well under 3 min under stock Emacs):
+
+1. *Shape / determinism.* logits are (seq x vocab); two forwards with the same
+   explicit =S0= are bit-identical.
+2. *Recurrence has effect.* =r=1= and =r=2= logits differ (maxdiff > 0);
+   =r=1= vs =r=1= with a different =S0= differ (state is used).
+3. *Gradients through the recurrence.* Finite-difference checks of the loss
+   with =r=2, k=2= w.r.t. an adapter weight, a core block weight, and a prelude
+   block weight; maxrel < 1e-3.  The prelude check proves the injection path
+   carries gradient.
+4. *Truncation is exact.* With =r=3, k=1=: analytic grads must equal (maxdiff
+   0) the grads of a hand-built reference where =s_2= is computed detached and
+   fed in as =S0= with =r=1=; and they must differ from the =k=3= grads.
+5. *Adaptive exit bounds.* On a briefly trained model: =EPS= huge -> =r-used=
+   = 1; =EPS = 0= -> =r-used = RMAX=; in between 1 <= r-used <= RMAX and the
+   returned KLs are finite and non-negative.
+6. *Training smoke.* Train on the sum-mod task with =r ~ sample-r(3)=, =k=2=,
+   SGD, a few hundred steps at dim ~16: the last-50-step mean loss < the
+   first-50 mean.  Then evaluate the held-out loss at =r = 1= and =r = 4=:
+   report both; assert only that both are finite (the "more depth helps"
+   comparison is a demo metric at this scale, not a pass/fail).
+
+=examples/recur-demo.el= trains as in (6) and prints: held-out loss for
+=r in {1, 2, 4, 8, 16}=, the mean =r-used= of adaptive exit at a few =EPS=,
+and a path-independence number (mean L2 distance between final states from two
+different =S0= at =r=16=, relative to the state norm).
+
+* Cost / risk
+- Effort: medium-low.  One macro, one model builder, forward / loss / adaptive
+  loop, a sampler.  No kernels.
+- Risk: the recurrence can diverge at toy scale (state norm blows up with
+  =r=); the pre-norm blocks and the RMSNorm inside them bound this in
+  practice.  If it does, add an RMSNorm gain on the adapter output (the
+  paper's sandwich norm) -- optional knob, off by default.
+
+* Follow-ups (not MVP)
+- nlga (on-device) training with the no-grad prefix as plain forward
+  dispatches and only the last =k= unrolled on the graph.
+- KV-cache sharing across iterations at decode time (paper Sec. 5) on top of
+  =nl-llm-decode=.
+- Per-token adaptive exit (different =r= per position) -- needs the cache
+  bookkeeping above.
+- Compare with Coconut on the same synthetic tasks (Doc 06).
