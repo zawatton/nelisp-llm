@@ -8,6 +8,7 @@
 
 ;;; Code:
 
+(require 'nl-llm-compat)
 (require 'photon-tensor)
 
 (defconst nl-llm-lora-ckpt-format "nl-llm-lora-ckpt-v1"
@@ -93,15 +94,14 @@
 ADAPTERS is an alist mapping opaque site keys to adapter plists.
 META is written verbatim under the :meta key."
   (nl-llm-lora-ckpt--validate adapters)
-  (let ((form (list :format nl-llm-lora-ckpt-format
-                    :meta meta
-                    :adapters adapters)))
-    (with-temp-buffer
-      (let ((print-length nil)
-            (print-level nil))
-        (prin1 form (current-buffer)))
-      (let ((coding-system-for-write 'utf-8))
-        (write-region (point-min) (point-max) path nil 'silent)))
+  (let* ((form (list :format nl-llm-lora-ckpt-format
+                     :meta meta
+                     :adapters adapters))
+         (text (let ((print-length nil)
+                     (print-level nil))
+                 (prin1-to-string form))))
+    (let ((coding-system-for-write 'utf-8))
+      (write-region text nil path nil 'silent))
     path))
 
 ;;;###autoload
@@ -111,7 +111,7 @@ META is written verbatim under the :meta key."
     (let ((coding-system-for-read 'utf-8))
       (insert-file-contents path))
     (goto-char (point-min))
-    (let* ((ckpt (read (current-buffer)))
+    (let* ((ckpt (read (buffer-string)))
            (found (plist-get ckpt :format)))
       (unless (equal found nl-llm-lora-ckpt-format)
         (error "nl-llm-lora-ckpt: bad/unknown format %S (expected %S)"

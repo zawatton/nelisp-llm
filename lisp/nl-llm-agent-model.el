@@ -17,6 +17,7 @@
 
 ;;; Code:
 
+(require 'nl-llm-compat)
 (require 'cl-lib)
 (require 'subr-x)
 (require 'photon-tensor)

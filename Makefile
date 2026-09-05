@@ -1,6 +1,7 @@
 # nelisp-llm -- experiment repo for small LMs on the nelisp-photon substrate.
 EMACS ?= emacs
 PHOTON ?= ../nelisp-photon/lisp
+NELISP ?= ../nelisp/target/nelisp
 
 .PHONY: test compile clean train train-modern train-modern-full gpu-test gpu-train-test gpu-ag-test gpu-block-test gpu-moe-test gpu-stack-test gpu-window-test gpu-gather-test gpu-adam-test gpu-tie-test gpu-sched-test bench-gpu bench-gpu-train bench-ondevice train-stacked-gpu train-corpus-gpu generate-gpu train-full-gpu checkpoint-gpu train-big-gpu stream-decode spec-decode bitnet-model bench-dp4a spec-chain integrated-decode bench-longctx agent-demo agent-model-demo agent-improve-demo agent-code-demo agent-sandbox-demo agent-tasks-demo agent-gpu-finetune-demo agent-ondevice-demo
 
@@ -151,3 +152,37 @@ agent-ondevice-demo:
 
 clean:
 	rm -f lisp/*.elc
+
+.PHONY: test-nelisp test-nelisp-fast
+
+test-nelisp:
+	$(NELISP) --load test/arch-test.el
+	$(NELISP) --load test/attn-test.el
+	$(NELISP) --load test/moe-test.el
+	$(NELISP) --load test/block-test.el
+	$(NELISP) --load test/autograd-test.el
+	$(NELISP) --load test/lora-test.el
+	$(NELISP) --load test/sample-test.el
+	$(NELISP) --load test/decode-test.el
+	$(NELISP) --load test/stream-test.el
+	$(NELISP) --load test/spec-test.el
+	$(NELISP) --load test/dropout-test.el
+	$(NELISP) --load test/ckpt-test.el
+	$(NELISP) --load test/lora-ckpt-test.el
+	$(NELISP) --load test/agent-test.el
+# agent-sandbox is Emacs-only: it launches an isolated emacs -Q --batch subprocess with a shell timeout.
+	$(NELISP) --load test/agent-model-test.el
+	$(NELISP) --load test/agent-improve-test.el
+	$(NELISP) --load test/agent-code-test.el
+	$(NELISP) --load test/agent-tasks-test.el
+
+test-nelisp-fast:
+	$(NELISP) --load test/arch-test.el
+	$(NELISP) --load test/attn-test.el
+	$(NELISP) --load test/moe-test.el
+	$(NELISP) --load test/block-test.el
+	$(NELISP) --load test/sample-test.el
+	$(NELISP) --load test/decode-test.el
+	$(NELISP) --load test/dropout-test.el
+	$(NELISP) --load test/ckpt-test.el
+	$(NELISP) --load test/lora-ckpt-test.el
