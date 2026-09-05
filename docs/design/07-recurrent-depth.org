@@ -3,9 +3,45 @@
 #+STATUS: DRAFT
 
 * Status
-DRAFT -- design + implementation brief.  Implementation lands in
-=lisp/nl-llm-recur.el= + =test/recur-test.el= + =examples/recur-demo.el= (CPU
-autograd reference; on-device and KV-sharing phases are Follow-ups).
+SHIPPED -- CPU autograd reference: =lisp/nl-llm-recur.el= (the =nl-llm-ag-no-grad=
+truncated-BPTT tape scope, the prelude/adapter/core/coda model builder, forward,
+loss, the log-normal-Poisson =R= sampler, adaptive-exit inference, and the
+sum-mod-10 synthetic task) + =test/recur-test.el= (16/16, ~47s) + the
+=examples/recur-demo.el= table (~2min).  On-device and KV-sharing phases are
+still Follow-ups, not part of this MVP.
+
+Implemented as designed, with three clarifications/fixes forced by the six
+Verification checks and one review pass:
+- Test 5 ("EPS huge -> r-used = 1") requires a reference distribution *before*
+  any recurrence iteration runs, so adaptive exit also runs the coda once on
+  =S0= itself (an "i=0" pass) before the loop, and compares =KL(p_0 || p_1)= at
+  =i=1=; the doc's prose only mentions comparing consecutive *iterations*
+  (i-1, i), which would make =r-used=1= unreachable.
+- =nl-llm-recur-sample-r='s log-normal draw clamps =tau <= 700= before
+  =(exp (- tau))=, to keep the Poisson rate calculation away from the
+  NeLisp =(exp very-negative)= -> NaN edge (Emacs returns 0.0 there; this
+  matters only for pathological log-normal draws, which the clamp makes
+  moot either way).
+- Fixed after review: the block builder was sizing K/V projections =DIM x DIM=
+  (MHA-shaped) regardless of =KV-HEADS=, instead of =KV-HEADS*(DIM/HEADS) x
+  DIM= as =nl-llm-ag-gqa= expects (compare =examples/train-modern-full.el='s
+  =Wk=/=Wv= built with =kvdim=).  All of this doc's tests/demo use
+  =heads=2, kv-heads=1=, so K/V were twice too wide; the gradchecks and
+  exactness checks still passed either way (self-consistent, not GQA-correct),
+  and at the tiny =dim=4= gradcheck scale the fix happens to be numerically
+  invisible (RoPE's =m=0= pair has =theta=p= independent of head width, and
+  =dim=4, heads=2= gives only one pair) -- the effect only shows up once
+  =dim/heads > 2= (e.g. the =dim=16= training/demo models), where the
+  reported numbers below already reflect the fix.
+
+Held-out loss vs =R= does not improve monotonically at this toy scale (dim 16,
+1 block per stage, ~300 steps) -- =examples/recur-demo.el= reports the honest
+numbers (no R in {1,2,4,8,16} is a clear winner on this run); adaptive exit's
+mean iterations used does scale sensibly with =EPS= (2.0 -> 16.0 as EPS drops
+1.0 -> 1e-4), and path independence at R=16 is clearly visible (mean relative
+L2 distance between states from two different S0 ~ 0.004).  Per the design
+doc, "more depth helps accuracy" is a demo metric at this scale, not a
+pass/fail gate.
 
 Source: Geiping, McLeish, Jain, Kirchenbauer, Singh, Bartoldson, Kailkhura,
 Bhatele, Goldstein, "Scaling up Test-Time Compute with Latent Reasoning: A

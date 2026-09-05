@@ -149,5 +149,10 @@ agent-gpu-finetune-demo:
 agent-ondevice-demo:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l examples/agent-ondevice-demo.el
 
+.PHONY: recur-demo
+
+recur-demo:
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l examples/recur-demo.el
+
 clean:
 	rm -f lisp/*.elc

@@ -684,3 +684,81 @@ or directly:
 #+begin_src sh
 emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l test/autograd-test.el
 #+end_src
+
+* Recurrent depth: latent reasoning by iterating a shared block
+
+~lisp/nl-llm-recur.el~ implements recurrent depth (Geiping et al., "Scaling up
+Test-Time Compute with Latent Reasoning," arXiv 2502.05171, the Huginn-0125
+model) on the CPU autograd path -- ~docs/design/07-recurrent-depth.org~.
+Instead of spending test-time compute on more *tokens* (chain-of-thought), a
+shared block is applied =R= times to a latent state and =R= is chosen at
+inference time.  A model is three stacks of plain pre-norm GQA/SwiGLU blocks
+(~nl-llm-ag-block~): a *prelude* embeds the tokens into =E=; a recurrent *core*
+iterates a latent state =S=, injecting =E= at every iteration through a linear
+*adapter* on the column-concat =[S ; E]= (so the recurrence stays anchored to
+the input instead of forgetting it); a *coda* reads the final state into
+logits.  =S0= is Gaussian, sampled by the Marsaglia polar method
+(~nl-llm-recur-randn~ -- =sqrt=/=log= only, no trig, so it stays NeLisp-portable).
+
+Training draws =R= per step from a log-normal Poisson (~nl-llm-recur-sample-r~,
+Knuth's method for the Poisson draw -- =exp= + uniforms, no trig) and
+backpropagates only through the *last K* iterations: truncated BPTT via a new
+tape primitive, ~nl-llm-ag-no-grad~, which lets the first =R-K= iterations run
+forward-only and then discards every tape entry they recorded (a plain
+save/restore of the ~photon-autograd--tape~ pointer).  The state at that
+boundary is re-attached as a fresh leaf with ~photon-autograd-const~, so no
+gradient flows further back through the recurrence -- but =E= was recorded
+*before* the no-grad scope, so its own tape entries survive, and the prelude
+still trains through the injection at each of the surviving =K= iterations.
+
+~test/recur-test.el~ (16/16, ~47s) pins: forward shape and bit-identical
+determinism given an explicit =S0=; that the recurrence and =S0= both actually
+change the output; three finite-difference gradchecks through the recurrence
+(an adapter weight, a core block weight, and a *prelude* block weight, proving
+the injection path carries gradient) at maxrel < 3e-6; truncation exactness --
+with =R=3, K=1=, the analytic gradients equal (maxdiff *exactly* 0.0) a
+hand-built reference that detaches =S2= via ~photon-autograd-const~ and reruns
+=R=1= on it, and differ from the =K=3= (full backprop) gradients (maxdiff
+0.198); adaptive-exit bounds on a briefly trained model (huge =EPS= ->
+=r-used=1=, =EPS=0= -> =r-used=RMAX=, KLs finite and non-negative in between);
+and a training smoke on the sum-mod-10 synthetic task (=K=4= digits + a
+separator, target = the digit sum mod 10 with no intermediate steps in the
+input) showing the mean loss over the last 50 of 200 steps below the first 50
+(1.91 -> 1.08).
+
+The K/V projections are sized =KV-HEADS * (DIM / HEADS)= wide (not =DIM= wide),
+matching what =nl-llm-ag-gqa= actually expects (see how
+~examples/train-modern-full.el~ builds its =Wk=/=Wv= with =kvdim=) -- with
+=heads=2, kv-heads=1= this makes GQA genuinely share one K/V head across both
+query heads instead of silently running MHA-shaped (twice too wide) K/V under
+a GQA label.
+
+~examples/recur-demo.el~ trains the same task for 300 steps (mean loss 1.88 ->
+1.08) and reports, on 20 held-out examples:
+
+| R  | mean loss |
+|----+-----------|
+| 1  |    0.6731 |
+| 2  |    0.8437 |
+| 4  |    0.7130 |
+| 8  |    0.6596 |
+| 16 |    0.6788 |
+
+test-time depth does *not* improve monotonically with =R= at this toy scale (1
+block per stage, dim 16) -- reported honestly, as the design doc treats this
+as a demo metric rather than a pass/fail gate.  What *does* show cleanly:
+
+| EPS    | mean r-used |
+|--------+-------------|
+| 1.0    |        2.00 |
+| 0.1    |        2.60 |
+| 0.01   |        6.85 |
+| 0.001  |       14.05 |
+| 0.0001 |       16.00 |
+
+zero-shot adaptive exit spends more iterations as =EPS= tightens, exactly as
+intended even though the model was never trained to be interruptible; and path
+independence, the paper's other zero-shot finding -- at =R=16=, the final state
+from two different =S0='s lands within a mean relative L2 distance of *0.0039*
+of each other, i.e. the recurrence has (almost) converged to a fixed point
+independent of where it started.
