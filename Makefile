@@ -151,3 +151,8 @@ agent-ondevice-demo:
 
 clean:
 	rm -f lisp/*.elc
+
+.PHONY: coconut-demo
+
+coconut-demo:
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l examples/coconut-demo.el

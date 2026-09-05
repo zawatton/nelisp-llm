@@ -1,12 +1,15 @@
 #+TITLE: Coconut -- Chain of Continuous Thought
 #+OPTIONS: toc:2 num:t
-#+STATUS: DRAFT
+#+STATUS: SHIPPED
+#+VERIFIED-BY: test/coconut-test.el (13 checks, 0 failures, 80.2 seconds)
 
 * Status
-DRAFT -- design + implementation brief.  Implementation lands in
-=lisp/nl-llm-coconut.el= + =test/coconut-test.el= + =examples/coconut-demo.el=
-(CPU autograd reference first, as every technique here does; a GPU / KV-cache
-phase is listed under Follow-ups and is *not* part of this doc's MVP).
+SHIPPED -- the CPU autograd MVP lands in =lisp/nl-llm-coconut.el=,
+=test/coconut-test.el=, and =examples/coconut-demo.el=.  The test script runs
+13 checks in the six verification groups below (0 failures in 80.2 seconds),
+including exact =c=0= identity and finite differences through two chained
+thoughts.  The demo completes in 83.4 seconds.  GPU and KV-cache work remains
+the explicitly out-of-scope follow-up described below.
 
 Source: Hao, Sukhbaatar, Su, Li, Hu, Weston, Tian, "Training Large Language
 Models to Reason in a Continuous Latent Space" (Meta FAIR, arXiv 2412.06769,

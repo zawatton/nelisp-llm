@@ -684,3 +684,41 @@ or directly:
 #+begin_src sh
 emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l test/autograd-test.el
 #+end_src
+
+* Coconut: Chain of Continuous Thought
+
+Coconut moves reasoning out of the token vocabulary and into the model's hidden
+space.  After a question and =<bot>= marker, the final post-=lnfg= RMSNorm row is
+fed directly back as the next input embedding; several such rows can be chained
+before =<eot>= returns the model to language decoding.  Training replaces one
+leading language reasoning step per curriculum stage with =c= continuous
+thoughts, while cross-entropy remains only on =<eot>= and the remaining language
+suffix.
+
+=lisp/nl-llm-coconut.el= maps this directly onto the CPU autograd stack:
+=photon-autograd-embedding=, stacked =nl-llm-ag-block= calls, final RMSNorm, and
+the LM head.  Its new =nl-llm-ag-slice-rows= and =nl-llm-ag-concat-rows= preserve
+the feedback graph, so gradients from later thoughts reach both token embeddings
+and earlier transformer passes.  It also provides a hash-seeded small-model
+builder, loss and greedy generation, staged SGD training, and the deterministic
+four-digit chain-add task.
+
+=test/coconut-test.el= runs 13 checks in six groups in 80.2 seconds on stock
+Emacs.  It pins row-op finite differences, bit-identical =c=0= logits against a
+literal plain forward (=maxdiff 0=), =c=2= shape and determinism, loss gradients
+through two thoughts (=wte= maxrel =3.52e-8=, =wq= =2.43e-8=), and a thought-zero
+ablation (=maxdiff 2.228e-1=).  The three-stage 64-item smoke decreases its epoch
+mean loss at every stage:
+
+| stage | thoughts | epoch mean loss                 |
+|-------+----------+---------------------------------|
+|     0 |        0 | 2.1889 -> 1.8742 -> 1.8391      |
+|     1 |        1 | 2.0092 -> 1.7983 -> 1.7929      |
+|     2 |        2 | 1.3594 -> 1.3011 -> 1.2746      |
+
+Final-stage greedy answer accuracy on its training items rises from 7.8% before
+training to 18.8%, above the 10% chance level.  =make coconut-demo= repeats the
+curriculum and reports the honest held-out result: answer accuracy is 9.4%,
+12.5%, and 9.4% at stages 0, 1, and 2, while emitted language tokens per answer
+fall from the stage-0 CoT budget of 4 to 3 and then 2.  At this toy capacity the
+latent stages save language tokens but do not improve final held-out accuracy.
