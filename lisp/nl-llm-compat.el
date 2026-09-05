@@ -12,6 +12,16 @@
 (declare-function nl-llm-compat--sin-kernel "nl-llm-compat")
 (declare-function nl-llm-compat--cos-kernel "nl-llm-compat")
 (declare-function nl-llm-compat--atan-kernel "nl-llm-compat")
+(declare-function nl-llm-compat--native-exp "nl-llm-compat" (x))
+
+(unless (= 0.0 (exp -1.0e30))
+  (defalias 'nl-llm-compat--native-exp (symbol-function 'exp))
+  (defun exp (x)
+    "Return e raised to X, avoiding broken NeLisp extreme underflow.
+NeLisp versions affected by this shim return NaN for very negative inputs and
+can hang near -1e6.  Values below -745 underflow to zero in double precision."
+    (let ((xf (float x)))
+      (if (< xf -745.0) 0.0 (nl-llm-compat--native-exp xf)))))
 
 (unless (and (fboundp 'sin)
              (fboundp 'cos)

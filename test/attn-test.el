@@ -19,7 +19,8 @@
   (let* ((a (photon-tensor-data ta)) (b (photon-tensor-data tb))
          (n (length a)) (m 0.0) (i 0))
     (while (< i n)
-      (let ((e (abs (- (aref a i) (aref b i))))) (when (> e m) (setq m e)))
+      (let ((e (abs (- (aref a i) (aref b i)))))
+        (when (or (/= e e) (> e m)) (setq m e)))
       (setq i (1+ i)))
     m))
 

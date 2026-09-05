@@ -29,7 +29,8 @@
   "Max abs elementwise difference between two same-length float vectors."
   (let ((n (length a)) (i 0) (md 0.0))
     (while (< i n)
-      (let ((d (abs (- (aref a i) (aref b i))))) (when (> d md) (setq md d)))
+      (let ((d (abs (- (aref a i) (aref b i)))))
+        (when (or (/= d d) (> d md)) (setq md d)))
       (setq i (1+ i)))
     md))
 
@@ -70,7 +71,7 @@ grad accumulated into TARGET.  Prints a PASS/FAIL row."
                  (num (/ (- lp lm) (* 2.0 eps)))
                  (den (max 1.0e-4 (abs num) (abs (aref ana i))))
                  (rel (/ (abs (- num (aref ana i))) den)))
-            (when (> rel maxrel) (setq maxrel rel))))
+            (when (or (/= rel rel) (> rel maxrel)) (setq maxrel rel))))
         (aset xd i orig))
       (setq i (1+ i)))
     (rt--ck name (< maxrel tol) (format "maxrel=%.2e" maxrel))))
@@ -134,7 +135,8 @@ grad accumulated into TARGET.  Prints a PASS/FAIL row."
             (grads-maxdiff (gs1 gs2)
               (let ((md 0.0) (rest2 gs2))
                 (dolist (g1 gs1)
-                  (let ((d (rt--maxdiff g1 (car rest2)))) (when (> d md) (setq md d)))
+                  (let ((d (rt--maxdiff g1 (car rest2))))
+                    (when (or (/= d d) (> d md)) (setq md d)))
                   (setq rest2 (cdr rest2)))
                 md)))
     (let ((g-k3 (grads-for 3 3 s0))    ; full backprop, r=3

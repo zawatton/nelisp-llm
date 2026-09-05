@@ -44,7 +44,10 @@
       (setq i (1+ i)))
     (bl--ck "model logits finite (no NaN/Inf)" fin))
   (let* ((d2 (photon-tensor-data (nl-llm-model-forward model tokens))) (m 0.0) (i 0) (n (length d)))
-    (while (< i n) (let ((e (abs (- (aref d i) (aref d2 i))))) (when (> e m) (setq m e))) (setq i (1+ i)))
+    (while (< i n)
+      (let ((e (abs (- (aref d i) (aref d2 i)))))
+        (when (or (/= e e) (> e m)) (setq m e)))
+      (setq i (1+ i)))
     (bl--ck "model forward deterministic" (= m 0.0) (format "maxdiff=%.2e" m)))
   (let ((bx (nl-llm-block (bl--mk seq dim 9) b1 heads kvh)))
     (bl--ck "block preserves shape (seq x dim)"

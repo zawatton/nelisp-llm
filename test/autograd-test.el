@@ -48,7 +48,7 @@
                      (num (/ (- lp lm) (* 2.0 eps)))
                      (den (max 1.0e-4 (abs num) (abs (aref ana k))))
                      (rel (/ (abs (- num (aref ana k))) den)))
-                (when (> rel maxrel) (setq maxrel rel)))
+                (when (or (/= rel rel) (> rel maxrel)) (setq maxrel rel)))
               (aset xd k orig)))
           (setq k (1+ k)))
         (ag--ck name (< maxrel tol) (format "maxrel=%.2e" maxrel))))))

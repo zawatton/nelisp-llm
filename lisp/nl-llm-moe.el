@@ -7,6 +7,7 @@
 
 ;;; Code:
 
+(require 'nl-llm-compat)
 (require 'photon-tensor)
 (require 'nl-llm-arch)
 

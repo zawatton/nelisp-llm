@@ -807,26 +807,46 @@ The CPU-only code also runs with the standalone reader built from the sibling
 ~nelisp~ repository.  Override ~NELISP~ when the binary is elsewhere:
 
 #+begin_src sh
-make test-nelisp-fast                    # quick nine-suite compatibility check
-make test-nelisp                         # all supported CPU-only suites
+make test-nelisp-fast                    # nine quick suites, ~5 minutes
+make test-nelisp                         # every suite that finishes under NeLisp, ~30 minutes
 make test-nelisp NELISP=/path/to/nelisp # use another standalone binary
 #+end_src
 
-~lisp/nl-llm-compat.el~ contains guarded pure-Elisp fallbacks for the standalone
-reader's missing trigonometric functions, ~user-error~,
-~call-process-shell-command~, noninteractive command detection, parenthesis
-checking, and recursive/relative file helpers.  It also advertises ~subr-x~ when
-the reader already supplies the string and binding helpers used here.  The
-checkpoint code serializes through strings because NeLisp does not yet accept a
-buffer as a ~prin1~ or ~read~ stream, and top-k sampling explicitly skips masked
-logits instead of exponentiating a huge negative sentinel.
+~lisp/nl-llm-compat.el~ holds guarded pure-Elisp fallbacks for what the reader
+does not provide: ~sin~ / ~cos~ / ~tan~ / ~atan~ (Cody-Waite reduction + fdlibm
+kernels, max abs error vs libm 1.1e-16 for sin/cos and 2.2e-16 for atan over
+282 points including the RoPE angles), ~user-error~,
+~call-process-shell-command~, ~called-interactively-p~, ~check-parens~,
+~file-relative-name~, ~directory-files-recursively~, and a ~subr-x~ feature
+alias.  Every definition sits behind ~(unless (fboundp ...))~, so under Emacs
+the file defines nothing and it steps aside the day NeLisp ships the primitive.
+One shim is gated on behaviour instead: NeLisp's ~exp~ returns NaN for
+~(exp -1.0e30)~ (and hangs near -1e6), so when ~(exp -1.0e30)~ is not 0.0 the
+compat layer wraps ~exp~ to return 0.0 below -745.  Without it every softmax fed
+a -1e30 additive mask -- the causal mask in ~nl-llm-ag-gqa~, the MoE selection
+mask -- is NaN, and the max-accumulating test helpers (~(when (> e m) ...)~)
+never update on NaN, so a broken run printed ~PASS maxdiff=0.00e+00~.  The test
+helpers now count a NaN as a failure, so a PASS under NeLisp is a real one.
 
-On the 2026-09-05 NeLisp build at ~d145e3c02~, ~make test-nelisp-fast~ took 286
-seconds (4 minutes 46 seconds).  The full target is much slower: standalone
-autograd, speculative decoding, and model-backed agent suites can each run for
-tens of minutes.
+Library changes forced by other measured divergences (Emacs behaviour is
+unchanged): checkpoint save/load serialise through strings because NeLisp does
+not accept a buffer as a ~prin1~ / ~read~ stream nor a buffer range in
+~write-region~; top-k sampling skips masked logits explicitly instead of
+exponentiating a huge negative sentinel; the agent parser scans strings because
+~re-search-forward~ / ~looking-at~ are absent.
 
-~agent-sandbox-test~ remains Emacs-only because its contract launches an isolated
-~emacs -Q --batch~ subprocess through a shell timeout.  GPU, integrated, and
-on-device suites also remain outside ~test-nelisp~: they require the GPU backend
-and are not CPU-only standalone-reader coverage.
+Measured on the 2026-09-05 build (commit ~d145e3c02~, recorded in
+~build/.nelisp-vendor-sync-ref~): ~make test-nelisp-fast~ 286 s; in
+~test-nelisp~ the slow members are autograd (470 s) and stream (875 s).  Seven
+CPU suites did not finish within 40 minutes under NeLisp and are left out of
+the target -- spec, coconut, recur, agent-model, agent-improve, agent-code,
+agent-tasks; every row they printed before the cut-off was a genuine PASS, they
+are simply 100x-1000x slower than under Emacs (interpreted float loops).
+~agent-sandbox-test~ stays Emacs-only because its contract launches an isolated
+~emacs -Q --batch~ subprocess through a shell timeout.  GPU, integrated and
+on-device suites need the GPU backend and are outside standalone coverage.
+
+Two standalone-reader crashes were found and are nelisp's to fix, not worked
+around here beyond shrinking a fixture: printing a 622 KB checkpoint sexp with
+~prin1-to-string~, and autograd-test / decode-test dying with SIGSEGV under
+parallel load while passing alone.
