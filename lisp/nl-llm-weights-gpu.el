@@ -94,6 +94,31 @@ is allocated per word."
   (nelisp-gpu-server-upload-bytes (nl-llm-weights-lin-bytes lin)))
 
 ;;;###autoload
+(defun nl-llm-wgpu-upload-lin (lin)
+  "Upload LIN's payload *and its constants*; return a plist of handles.
+(:w H :s H :b H :rows N :words N).
+
+The constants are the point.  A weight's per-row scales do not change, and
+Qwen3's projections have no bias at all, yet the inline form of these calls
+re-sent both on every invocation -- and `nelisp-gpu--floats-bytes' encodes
+float32 one element at a time in Elisp, measured at 4 microseconds each.  For
+a 2048-row projection that is 2048 scales plus 2048 zeros, 16.4ms of encoding
+against a kernel that runs in single-digit milliseconds, paid 1177 times in a
+step.  Uploading them once turns the dominant cost of both directions into
+nothing."
+  (let ((rows (nl-llm-weights-lin-rows lin)))
+    (list :w (nelisp-gpu-server-upload-bytes (nl-llm-weights-lin-bytes lin))
+          :s (nelisp-gpu-server-upload-bytes
+              (nelisp-gpu--floats-bytes (list (nl-llm-weights-lin-scales lin))))
+          :b (nelisp-gpu-server-upload-bytes
+              (nelisp-gpu--floats-bytes (list (make-vector rows 0.0))))
+          :rows rows :words (nl-llm-weights-lin-words lin))))
+
+(defun nl-llm-wgpu--resident-p (handle)
+  "Non-nil when HANDLE is a plist from `nl-llm-wgpu-upload-lin'."
+  (and (consp handle) (plist-member handle :w)))
+
+;;;###autoload
 (defun nl-llm-wgpu-apply (lin handle x &optional base bias)
   "Run LIN (resident at HANDLE) on X at BASE through `bitlinear-dp4a-rows'.
 BIAS defaults to zeros, which is what Qwen3's projections have.  Returns the
@@ -101,15 +126,21 @@ ROWS-long result as a float vector."
   (let* ((cols (nl-llm-weights-lin-cols lin))
          (rows (nl-llm-weights-lin-rows lin))
          (words (nl-llm-weights-lin-words lin))
+         (res (nl-llm-wgpu--resident-p handle))
          (pack (nl-llm-wgpu-pack-act x (or base 0) cols))
          (hact (nelisp-gpu-server-upload-bytes (car pack))))
     (unwind-protect
         (nth 0 (nelisp-gpu-server-run2
                 'bitlinear-dp4a-rows
                 (list (list 'res hact words)
-                      (list 'res handle (* rows words))
-                      (cons 'in (or bias (make-vector rows 0.0)))
-                      (cons 'in (nl-llm-weights-lin-scales lin))
+                      (list 'res (if res (plist-get handle :w) handle)
+                            (* rows words))
+                      (if (and res (null bias))
+                          (list 'res (plist-get handle :b) rows)
+                        (cons 'in (or bias (make-vector rows 0.0))))
+                      (if res
+                          (list 'res (plist-get handle :s) rows)
+                        (cons 'in (nl-llm-weights-lin-scales lin)))
                       (cons 'in (vector (cdr pack)))
                       (cons 'out rows))
                 (list 1 rows words)
@@ -133,14 +164,18 @@ comparison to go with it."
     (unless (= (length g) rows)
       (error "nl-llm-wgpu-apply-t: G is %d long, weight has %d rows"
              (length g) rows))
-    (nth 0 (nelisp-gpu-server-run2
-            'dp4a-rows-t
-            (list (list 'res handle (* rows words))
-                  (cons 'in (nl-llm-weights-lin-scales lin))
-                  (cons 'in g)
-                  (cons 'out cols))
-            (list rows cols words)
-            (/ (+ cols 63) 64)))))
+    (let ((res (nl-llm-wgpu--resident-p handle)))
+      (nth 0 (nelisp-gpu-server-run2
+              'dp4a-rows-t
+              (list (list 'res (if res (plist-get handle :w) handle)
+                          (* rows words))
+                    (if res
+                        (list 'res (plist-get handle :s) rows)
+                      (cons 'in (nl-llm-weights-lin-scales lin)))
+                    (cons 'in g)
+                    (cons 'out cols))
+              (list rows cols words)
+              (/ (+ cols 63) 64))))))
 
 ;;; --- a whole layer, linears on the GPU -----------------------------------
 ;;
@@ -334,13 +369,17 @@ look merely slow."
     (dolist (lay layers)
       (dolist (role nl-llm-wgpu-roles)
         (let ((lin (nl-llm-wf-layer-lin lay role)))
-          (puthash lin (nl-llm-wgpu-upload lin) tbl))))
+          (puthash lin (nl-llm-wgpu-upload-lin lin) tbl))))
     tbl))
 
 ;;;###autoload
 (defun nl-llm-wgpu-free-transposes (tbl)
-  "Free every resident handle in TBL."
-  (maphash (lambda (_lin h) (nelisp-gpu-server-free h)) tbl))
+  "Free every resident handle in TBL, whichever form it takes."
+  (maphash (lambda (_lin h)
+             (if (nl-llm-wgpu--resident-p h)
+                 (dolist (k '(:w :s :b)) (nelisp-gpu-server-free (plist-get h k)))
+               (nelisp-gpu-server-free h)))
+           tbl))
 
 ;;;###autoload
 (defun nl-llm-wgpu-transpose (lin g)
@@ -390,7 +429,7 @@ model is resident inside a 6 GB card with room for the rest."
           ;; back from it need no new machinery.  Leaving it on the CPU would
           ;; make it the whole cost: 70s against the blocks' 7.5s.
           (head (nl-llm-weights-linear wts :wte)))
-      (puthash head (nl-llm-wgpu-upload head) tbl)
+      (puthash head (nl-llm-wgpu-upload-lin head) tbl)
       (list :layers layers :table tbl :cfg cfg
             :head (list :lin head
                         :lnf (nl-llm-weights-row
