@@ -649,6 +649,54 @@ adapter.  The effective step is therefore about 28 times a per-layer adapter's,
 which is why lr 0.02 -- unremarkable for LoRA -- destroys the model and 0.001
 does not.
 
+** Batching the positions, and a number that was reported wrong
+
+A block applied its linears a position at a time, so at seq 6 it made 42 calls
+to apply 7 matrices, and a step made 1177 each way.  They now go a role at a
+time: 197 calls, which is 7 roles x 28 layers plus the head, with the position
+dimension gone from the count.
+
+The forward kernel already took a sequence -- =bitlinear-dp4a-rows= runs idx
+over =seq*out= and indexes GAMMA by position -- and was simply being told
+seq = 1 every time.  =dp4a-rows-t= was given the same dimension to match.
+
+| measurement                | before | after            |
+|----------------------------+--------+------------------|
+| forward hook               | 1177 calls, 23.4s | 197 calls, ~7.0s |
+| transpose hook             | 1177 calls, 20.1s | 197 calls, ~10.6s |
+| Elisp glue between them    | 13.0s  | ~15.5s           |
+| one step at seq 6          | 56.6s  | 32.1 / 32.5 / 34.8s |
+
+*Three samples, because one was not enough and saying so is the point.*  An
+earlier entry in this work reported 29.0s and a 1.95x speedup.  That figure
+was wrong: it was read out of a garbled progress notification rather than out
+of the output file, and the file said 33.8s all along.  The commit message of
+=aa13cff= carries the wrong number and is left as it stands rather than
+rewritten; this is the correction.  The real figure is a median of 32.5s, or
+1.7x, and the spread across three consecutive steps of identical work -- 32.1
+to 34.8 -- is itself the reason a single sample should not have been quoted.
+
+Two things kept the restructure honest.  The tape is built exactly as before,
+so the backward's own suite still applies unchanged; and both halves are
+checked by running the block *both ways* on one GPU table and demanding
+identical results -- unbinding the batched hook restores the position loop --
+rather than by a tolerance.  Forward: 0 of 4096 differ.  Backward: dx 0 of
+4096, adapter gradients 0.
+
+The backward's check is the load-bearing one.  The forward has an absolute
+reference, compared bit for bit against =nl-llm-wf-block=; the backward's suite
+compares gradients against finite differences with a tolerance, and a staging
+error that perturbed the order of accumulation would sit inside it and pass.
+Float addition is not associative, so preserving the order in which :wq, :wk
+and :wv land in the same accumulator is a correctness condition and not
+tidiness.  The adapter's B is perturbed before that comparison, because with B
+at zero dA is identically zero and the two paths would agree for reasons that
+have nothing to do with batching.
+
+*Where the time is now.*  The Elisp glue between the linears -- the norms, the
+rotation, attention, the SwiGLU -- is about 15.5s of 32.5s, the largest single
+part of a step.  The next lever is not the GPU.
+
 Independent and still open: the f32 autograd path's own migration, since
 =nl-llm-ag-block= *refuses* =:head-dim=, =:rope-style= and QK-norm.  That
 refusal is the guard working correctly, and it blocks training a Qwen-shaped
