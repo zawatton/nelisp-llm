@@ -226,5 +226,104 @@ value the forward returned."
     (list :dq dq :dk dkv :dv dv-out :da da :db db
           :da-log da-log :ddt-bias ddt)))
 
+
+;;; --- the block around the recurrence --------------------------------------
+;;
+;; Two pieces sit either side of it.  Before: a causal depthwise convolution
+;; over q, k and v with a kernel of four, then SiLU -- the reference fuses the
+;; activation into the convolution, so it is fused here too and the
+;; pre-activation is kept for the backward.  After: an RMSNorm gated by another
+;; projection of the input.
+;;
+;; The gated norm's order is worth stating because all three orders type-check
+;; and two of them are wrong: the reference normalises, *then* applies the
+;; weight, *then* multiplies by silu(gate).  Gating before normalising would
+;; put the gate inside the variance.
+
+(defun nl-llm-dn--silu (z) (/ z (+ 1.0 (exp (- z)))))
+
+(defun nl-llm-dn--silu-d (z)
+  "Derivative of SiLU at Z."
+  (let ((sg (/ 1.0 (+ 1.0 (exp (- z))))))
+    (* sg (+ 1.0 (* z (- 1.0 sg))))))
+
+;;;###autoload
+(defun nl-llm-dn-conv (x w bias seq ch kern)
+  "Causal depthwise convolution over X (SEQ x CH) then SiLU; return (Y PRE).
+W is CH x KERN, BIAS is CH.  Position T sees T-KERN+1..T, with everything
+before the sequence treated as zero.  PRE is the pre-activation, which the
+backward needs and the forward would otherwise throw away."
+  (let ((pre (make-vector (* seq ch) 0.0))
+        (y (make-vector (* seq ch) 0.0)))
+    (dotimes (tt seq)
+      (dotimes (c ch)
+        (let ((acc (aref bias c)))
+          (dotimes (r kern)
+            (let ((src (+ tt r (- kern) 1)))
+              (when (>= src 0)
+                (setq acc (+ acc (* (aref w (+ (* c kern) r))
+                                    (aref x (+ (* src ch) c))))))))
+          (aset pre (+ (* tt ch) c) acc)
+          (aset y (+ (* tt ch) c) (nl-llm-dn--silu acc)))))
+    (list y pre)))
+
+;;;###autoload
+(defun nl-llm-dn-conv-vjp (x w pre dy seq ch kern)
+  "Gradient of `nl-llm-dn-conv'.  Returns (:dx :dw :dbias)."
+  (let ((dx (make-vector (* seq ch) 0.0))
+        (dw (make-vector (* ch kern) 0.0))
+        (dbias (make-vector ch 0.0))
+        (dpre (make-vector (* seq ch) 0.0)))
+    (dotimes (i (* seq ch))
+      (aset dpre i (* (aref dy i) (nl-llm-dn--silu-d (aref pre i)))))
+    (dotimes (tt seq)
+      (dotimes (c ch)
+        (let ((d (aref dpre (+ (* tt ch) c))))
+          (aset dbias c (+ (aref dbias c) d))
+          (dotimes (r kern)
+            (let ((src (+ tt r (- kern) 1)))
+              (when (>= src 0)
+                (aset dw (+ (* c kern) r)
+                      (+ (aref dw (+ (* c kern) r))
+                         (* d (aref x (+ (* src ch) c)))))
+                (aset dx (+ (* src ch) c)
+                      (+ (aref dx (+ (* src ch) c))
+                         (* d (aref w (+ (* c kern) r)))))))))))
+    (list :dx dx :dw dw :dbias dbias)))
+
+;;;###autoload
+(defun nl-llm-dn-norm-gated (x gate weight n eps)
+  "RMSNorm X (N long) by WEIGHT, then multiply by silu(GATE); return (OUT NRM).
+NRM is the normalised value before the weight, which the backward reads."
+  (let ((ss 0.0) (nrm (make-vector n 0.0)) (out (make-vector n 0.0)))
+    (dotimes (i n) (setq ss (+ ss (* (aref x i) (aref x i)))))
+    (let ((inv (/ 1.0 (sqrt (+ (/ ss (float n)) eps)))))
+      (dotimes (i n)
+        (aset nrm i (* (aref x i) inv))
+        (aset out i (* (aref weight i) (aref nrm i)
+                       (nl-llm-dn--silu (aref gate i))))))
+    (list out nrm)))
+
+;;;###autoload
+(defun nl-llm-dn-norm-gated-vjp (x gate weight nrm dout n eps)
+  "Gradient of `nl-llm-dn-norm-gated'.  Returns (:dx :dgate :dweight)."
+  (let ((dx (make-vector n 0.0)) (dgate (make-vector n 0.0))
+        (dweight (make-vector n 0.0)) (dnrm (make-vector n 0.0))
+        (ss 0.0) (dot 0.0))
+    (dotimes (i n) (setq ss (+ ss (* (aref x i) (aref x i)))))
+    (let ((inv (/ 1.0 (sqrt (+ (/ ss (float n)) eps)))))
+      (dotimes (i n)
+        (let* ((sg (nl-llm-dn--silu (aref gate i)))
+               (yi (* (aref weight i) (aref nrm i))))
+          (aset dgate i (* yi (aref dout i) (nl-llm-dn--silu-d (aref gate i))))
+          (let ((dy (* (aref dout i) sg)))
+            (aset dweight i (* dy (aref nrm i)))
+            (aset dnrm i (* dy (aref weight i))))))
+      (dotimes (i n) (setq dot (+ dot (* (aref dnrm i) (aref x i)))))
+      (dotimes (i n)
+        (aset dx i (- (* (aref dnrm i) inv)
+                      (/ (* inv inv inv (aref x i) dot) (float n))))))
+    (list :dx dx :dgate dgate :dweight dweight)))
+
 (provide 'nl-llm-deltanet)
 ;;; nl-llm-deltanet.el ends here
