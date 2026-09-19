@@ -32,6 +32,7 @@
 (require 'nl-llm-weights-forward)
 (require 'nl-llm-weights-lora)
 (require 'nl-llm-weights-backward)
+(require 'nl-llm-weights-fused)
 
 (defvar wg--fail 0)
 (defvar wg--table (expand-file-name "build/donor/qwen3-0.6b/weights.bin"))
@@ -298,6 +299,55 @@
                                                  (append (car cpu) nil))
                                           "identical to the CPU backward")))
                             (nl-llm-wgpu-free-transposes tbl))))
+
+                      ;; --- a whole block as one batch ---------------------
+                      ;;
+                      ;; The point of everything above it.  A block asked
+                      ;; operation by operation crosses the Elisp boundary more
+                      ;; than twenty times for tensors that are produced on the
+                      ;; device and consumed on the device; as one batch it
+                      ;; crosses once.
+                      ;;
+                      ;; The reference is the *unfused W8A8 path*, not the f32
+                      ;; CPU block: both quantize activations, so the remaining
+                      ;; difference is f32 glue against f64 glue and nothing
+                      ;; else.  Comparing against the f32 block would fold in
+                      ;; the activation quantization, which is measured on its
+                      ;; own elsewhere, and would make this check say two
+                      ;; things at once.
+                      (let* ((flay (nl-llm-wfuse-open-layer wts 0))
+                             (blay (nl-llm-wf-load-layer wts 0))
+                             (bseq 6)
+                             (bx (make-vector (* bseq dim) 0.0)))
+                        (dotimes (p bseq)
+                          (let ((r (nl-llm-weights-embed wts (+ 785 p))))
+                            (dotimes (i dim) (aset bx (+ (* p dim) i) (aref r i)))))
+                        (let ((btbl (nl-llm-wgpu-upload-transposes (list blay))))
+                          (unwind-protect
+                              (let* ((t0 (float-time))
+                                     (ref (nth 0 (nl-llm-wgpu-with-linears btbl
+                                                   (nl-llm-wb-block-forward
+                                                    blay bx bseq cfg))))
+                                     (t1 (float-time))
+                                     (fus (nl-llm-wfuse-block flay bx bseq))
+                                     (t2 (float-time))
+                                     (sc (wg--amax ref)))
+                                (wg--ck "a whole block as one batch == the unfused path"
+                                        (< (wg--rel fus ref sc) 1.0e-5)
+                                        (format "rel %.3e, %.4fs vs %.4fs (%.1fx)"
+                                                (wg--rel fus ref sc) (- t2 t1)
+                                                (- t1 t0)
+                                                (/ (- t1 t0) (max (- t2 t1) 1.0e-6))))
+                                ;; A batch that dispatched nothing, or wrote to
+                                ;; the wrong slot, returns the zeros the out
+                                ;; slot was filled with -- which disagrees with
+                                ;; the reference, so the check above fails, but
+                                ;; without saying which.
+                                (wg--ck "control: the batch wrote its output slot"
+                                        (> (wg--amax fus) 1.0e-3)
+                                        (format "amax %.4f" (wg--amax fus))))
+                            (nl-llm-wgpu-free-transposes btbl)
+                            (nl-llm-wfuse-close-layer flay))))
 
                       ;; --- a tape that lives on the device -----------------
                       ;;
