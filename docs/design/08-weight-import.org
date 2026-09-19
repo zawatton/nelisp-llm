@@ -1,7 +1,7 @@
 #+TITLE: Weight import -- run an open-weight Qwen model natively, without training it
 #+OPTIONS: toc:2 num:t
-#+STATUS: P0-P3 SHIPPED -- the imported model runs, and has been adapted on the
-#+STATUS: real weights: three taught facts to rank 1, control preserved
+#+STATUS: P0-P3 SHIPPED -- imported, adapted on the real weights, 32.5s a step
+#+STATUS: at seq 6; attention is the wall beyond that and wants a fused block
 
 * Status
 Phases 0, 1, 2a, 2b and 2c SHIPPED on the CPU -- an imported Qwen3-0.6B runs,
@@ -696,6 +696,64 @@ have nothing to do with batching.
 *Where the time is now.*  The Elisp glue between the linears -- the norms, the
 rotation, attention, the SwiGLU -- is about 15.5s of 32.5s, the largest single
 part of a step.  The next lever is not the GPU.
+
+** The glue, and the boundary that decides what belongs on the GPU
+
+With the linears batched, the Elisp between them is the largest part of a step.
+Timed by advice, one step at seq 6:
+
+| function                     | calls | total | each     |
+|------------------------------+-------+-------+----------|
+| =nl-llm-wb-attend-vjp=       |    28 | 3.65s | 130.2 ms |
+| =nl-llm-wf--attend=          |    28 | 1.53s |  54.7 ms |
+| =nl-llm-wb-rmsnorm-vjp=      |  4369 | 1.32s |   0.3 ms |
+| =nl-llm-wb-rmsnorm-heads-vjp=|   336 | 0.88s |   2.6 ms |
+| everything named             |       | 9.27s | 29% of the step |
+
+Attention is 5.18s of that 9.27s, and it is the only part of a block that is
+quadratic in the sequence.  Measured rather than projected, on Qwen3-0.6B's
+shapes, forward plus vjp across 28 layers:
+
+| seq | per layer | x28    |
+|-----+-----------+--------|
+|   6 |    0.236s |   6.6s |
+|  12 |    0.790s |  22.1s |
+|  24 |    2.951s |  82.6s |
+|  48 |   11.102s | 310.9s |
+
+3.3x, 3.7x, 3.8x per doubling: quadratic, and 311s a step at seq 48 for
+attention alone.  A realistic training example is tens to hundreds of tokens,
+so this is the wall -- putting every linear on the GPU does not move it.
+
+*So attention went to the GPU, and that did not work either.*
+=attn-causal-gqa= in nelisp-gpu agrees with =nl-llm-wf--attend= to 3.7e-07 at
+seq 1, 6, 24 and 48.  It is not wired in, because at seq 48 a call takes 1.06s
+of which *0.71s is marshalling*: encoding q, k and v is 0.592s and decoding the
+context 0.114s.  The kernel is not the cost.
+
+That gives a rule worth stating, since it decides what is worth moving:
+
+- the Elisp boundary costs about 3 microseconds per float sent and 1.2 per
+  float returned;
+- an Elisp arithmetic operation costs about 0.06 microseconds;
+- so a kernel pays only when the Elisp it replaces does more than roughly *70
+  operations per element crossing the boundary*.
+
+A quantized linear does about 1000 per element and wins by 57x.  Attention at
+seq 48 does about 32 and cannot win, however fast the kernel is.  The forward
+linears escape the rule entirely on the input side, because the quantized
+activation and the weight go through =nelisp-gpu-server-upload-bytes= verbatim
+and never meet the float encoder.
+
+*What this actually asks for* is not a faster kernel but for q, k and v to stay
+on the device between the projections that produce them and the attention that
+consumes them -- which is what =nelisp-gpu-server-batch='s =tmp= slots are for:
+"intermediate tensors stay resident on the GPU and are never marshalled to the
+host".  That is a block fused into one batch, and a different shape of change
+from everything above it.  The kernel is kept, and the suite carries the
+measurement as a check rather than a comment: if "its cost is the boundary, not
+the kernel" ever fails, the boundary has stopped dominating and the kernel is
+worth wiring in.
 
 Independent and still open: the f32 autograd path's own migration, since
 =nl-llm-ag-block= *refuses* =:head-dim=, =:rope-style= and QK-norm.  That
