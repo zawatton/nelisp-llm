@@ -107,11 +107,15 @@
   regenerate with:  make qwen-weights-table && make qwen-forward-ref\n"
                    wfd--table wfd--fixture))
 
-  (let* ((ref (with-temp-buffer
-                (let ((coding-system-for-read 'utf-8-unix))
-                  (insert-file-contents wfd--fixture))
-                (goto-char (point-min))
-                (read (current-buffer))))
+  (let* ((both (with-temp-buffer
+                 (let ((coding-system-for-read 'utf-8-unix))
+                   (insert-file-contents wfd--fixture))
+                 (goto-char (point-min))
+                 ;; Two data: the per-layer states, then the greedy next token.
+                 (let ((a (read (current-buffer))))
+                   (cons a (ignore-errors (read (current-buffer)))))))
+         (ref (car both))
+         (pick (cdr both))
          (tokens (plist-get ref :tokens))
          (nlayers (plist-get ref :layers))
          (dim (plist-get ref :dim))
@@ -146,7 +150,7 @@
         (when first-bad
           (princ (format "\nfirst divergence: %s\n" first-bad))))
 
-      ;; A logit for a handful of tokens, so the head path is exercised too.
+      ;; The head path, on a few tokens read individually.
       (let* ((final (nl-llm-wf-final-norm wts (car (last got)) seq))
              (probe (list 0 100 14990 151935))
              (lg (nl-llm-wf-logits wts final seq (1- seq) probe)))
@@ -156,7 +160,32 @@
                            (append lg nil))
                  (format "%S -> %S" probe
                          (mapcar (lambda (v) (/ (fround (* 1000 v)) 1000.0))
-                                 (append lg nil))))))
+                                 (append lg nil))))
+
+        ;; And the end-to-end answer: the greedy next token over the whole
+        ;; vocabulary must be the id the reference picked, with the same logit.
+        ;; This is the check that fails if anything at all is wrong, and the one
+        ;; that means the import produces the donor's answer rather than a
+        ;; plausible one.  Only meaningful when the reference covers every
+        ;; layer, since a truncated stack predicts something else entirely.
+        (if (not (and pick (= nlayers (plist-get cfg :layers))))
+            (wfd--ck "greedy next token == reference" t
+                     (format "skipped: reference covers %d of %d layers"
+                             nlayers (plist-get cfg :layers)))
+          (let* ((t1 (float-time))
+                 (all (nl-llm-wf-logits-all wts final seq (1- seq)))
+                 (best (nl-llm-wf-argmax all))
+                 (hsecs (- (float-time) t1))
+                 (want (plist-get pick :argmax))
+                 (wlogit (plist-get pick :argmax-logit)))
+            (wfd--ck "greedy next token == reference"
+                     (equal (car best) want)
+                     (format "got %d, want %d (head over %d tokens in %.1fs)"
+                             (car best) want (length all) hsecs))
+            (wfd--ck "its logit matches the reference"
+                     (< (/ (abs (- (cdr best) wlogit)) (max 1.0 (abs wlogit)))
+                        1.0e-9)
+                     (format "%.6f vs %.6f" (cdr best) wlogit))))))
 
     (princ (format "\n%s: %d failure(s)\n"
                    (if (zerop wfd--fail) "weights-forward OK" "weights-forward")

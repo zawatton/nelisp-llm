@@ -221,5 +221,38 @@ the rest of the forward put together."
       (setq i (1+ i)))
     out))
 
+;;;###autoload
+(defun nl-llm-wf-logits-all (wts hidden seq pos)
+  "Return every logit at position POS of HIDDEN, as a float vector of :vocab.
+Reads the tied head once as bytes -- 155 MB for Qwen3-0.6B, which Emacs holds
+comfortably as a unibyte string -- and accumulates over int8 lanes, so the
+151936 x 1024 head costs one read rather than 151936 of them.  That is the
+difference between scoring the whole vocabulary in seconds and in an hour."
+  (let* ((cfg (nl-llm-weights-config wts))
+         (dim (plist-get cfg :dim))
+         (head (nl-llm-weights-linear wts :wte)))
+    (unless (< pos seq)
+      (error "nl-llm-wf-logits-all: position %d outside 0..%d" pos (1- seq)))
+    (nl-llm-weights-apply head hidden (* pos dim))))
+
+;;;###autoload
+(defun nl-llm-wf-argmax (v)
+  "Return (INDEX . VALUE) of the largest element of float vector V."
+  (let ((best 0) (bv (aref v 0)) (i 1) (n (length v)))
+    (while (< i n)
+      (when (> (aref v i) bv) (setq bv (aref v i) best i))
+      (setq i (1+ i)))
+    (cons best bv)))
+
+;;;###autoload
+(defun nl-llm-wf-next-token (wts tokens &optional nlayers progress)
+  "Run TOKENS through WTS and return (ID . LOGIT) for the greedy next token.
+Uses every layer unless NLAYERS says otherwise.  This is the end-to-end path:
+the donor's weights, the donor's conventions, and nothing but Elisp."
+  (let* ((states (nl-llm-wf-hidden wts tokens nlayers progress))
+         (seq (length tokens))
+         (final (nl-llm-wf-final-norm wts (car (last states)) seq)))
+    (nl-llm-wf-argmax (nl-llm-wf-logits-all wts final seq (1- seq)))))
+
 (provide 'nl-llm-weights-forward)
 ;;; nl-llm-weights-forward.el ends here

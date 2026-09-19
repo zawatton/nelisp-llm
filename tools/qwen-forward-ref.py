@@ -120,7 +120,21 @@ def main(table_path, out_path, tokens, nlayers):
             fh.write(f"  ;; {'embedding' if i == 0 else f'after layer {i - 1}'}\n")
             fh.write("  (" + " ".join(repr(float(v)) for v in flat) + ")\n")
         fh.write(" ))\n")
+    # The greedy next token, so the Elisp end-to-end path has something exact
+    # to be checked against rather than "the logits look plausible".
+    final = rmsnorm(states[-1], tb.f32(":lnf"), eps)
+    head = tb.dequant(":wte")
+    logits = final[-1] @ head.T
+    order = np.argsort(-logits)[:5]
+    with open(out_path, "a", encoding="utf-8") as fh:
+        fh.write(";; greedy next token at the last position, and the top 5.\n")
+        fh.write(f"(:argmax {int(order[0])} :argmax-logit {float(logits[order[0]])!r}\n")
+        fh.write(" :top ("
+                 + " ".join(f"({int(i)} . {float(logits[i])!r})" for i in order)
+                 + "))\n")
     print(f"wrote {out_path}: {len(states)} states, {seq} x {dim} each")
+    print(f"  greedy next token {int(order[0])} logit "
+          f"{float(logits[order[0]]):.4f}; top5 {[int(i) for i in order]}")
 
 
 if __name__ == "__main__":
