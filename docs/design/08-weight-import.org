@@ -1,12 +1,13 @@
 #+TITLE: Weight import -- run an open-weight Qwen model natively, without training it
 #+OPTIONS: toc:2 num:t
-#+STATUS: P0-P2c SHIPPED (CPU); 2d started (one linear on the GPU)
+#+STATUS: P0-P2d SHIPPED -- imported Qwen3-0.6B runs on the GPU and predicts the donor's token
 
 * Status
 Phases 0, 1, 2a, 2b and 2c SHIPPED on the CPU -- an imported Qwen3-0.6B runs,
 matches a reference to 1e-14 through all 28 layers, and predicts the donor's
-next token exactly.  Phase 2d has started: one linear runs on the GPU, 67x
-faster than the Elisp loop.  Phase 3 is designed, not implemented.
+next token exactly.  Phase 2d SHIPPED: every linear runs on the GPU, a block 57x
+faster than the Elisp loop, and the whole 28-layer stack predicts the same
+token the CPU oracle does.  Phase 3 is designed, not implemented.
 
 *Phase 0* (a locally served donor as teacher and as an immediately usable
 model): =examples/ollama-provider.el= + =make ollama-provider=.  No change was
@@ -264,7 +265,37 @@ of Phase 2d lands on top of it.
 | GPU vs the same W8A8 on the CPU    | rel 8.2e-08 (f32 accumulate)  |
 | activation quantization cost       | rel 6.7e-03                   |
 | GPU vs the Elisp loop, one linear  | 0.016s vs 1.048s (67x)        |
+| one whole block, GPU vs CPU f32    | 0.116s vs 6.58s (57x)         |
+| one whole block, GPU vs CPU W8A8   | rel 3.2e-08                   |
 | control: one row scale doubled     | detected                      |
+
+*The acceptance criterion is met.*  Running all 28 layers with every linear on
+the GPU predicts *the same token the CPU oracle predicted*:
+
+| path                 | token          | logit     | time  |
+|----------------------+----------------+-----------+-------|
+| CPU oracle, f32 act  | 12095 " Paris" | 17.189348 | 1025s |
+| GPU, W8A8            | 12095 " Paris" | 16.324242 |  210s |
+
+That was not a formality.  Activation quantization costs about 0.7% per block,
+so whether the argmax survives twenty-eight of them is a question, and the
+answer is that it does -- while the logit moves by 5%.  Worth stating both ways
+round: the ranking is preserved, the value is not, so anything that reads the
+logit rather than the argmax (a temperature sample, a confidence threshold)
+needs measuring before it is trusted on this path.
+
+The 4.9x end-to-end speedup is smaller than the 57x per block because compute
+is no longer where the time goes.  Of 210s, about 140s is uploading weights
+(28 layers x ~5s, since this version loads and frees one layer at a time to
+keep VRAM at one block) and about 61s is the tied head, still on the CPU.  The
+28 blocks of actual GPU arithmetic are ~17s.  So the next two wins are known
+and neither needs new numerics: keep all 568 MB resident, which fits 6 GB with
+room to spare and makes the upload a one-time cost, and move the head to the
+same kernel.
+
+=make test-weights-gpu= runs the fast checks in about ten seconds;
+=NL_LLM_GPU_E2E=1 make test-weights-gpu= adds the four-minute end-to-end check
+that pins the 12095 above.
 
 The bytes go from =insert-file-contents-literally= to the GPU buffer untouched,
 because the table's payload is already the uint32 words of four int8 lanes the
@@ -498,7 +529,8 @@ Shape first, then the offline converter, then the self-hosted reader:
   =nl-llm-wts-v1= that uploads straight to
   resident GPU buffers via =OP_WRITE_RESIDENT=, never materializing a
   full-precision float vector on the Elisp side.
-- *2d.* STARTED (one linear; the decode loop is next).  Route the imported
+- *2d.* SHIPPED (every linear; a resident-weights pass and the head remain).
+  Route the imported
   linears through a per-row-scale DP4A kernel, reuse the
   resident decode from =nl-llm-gpu-decode.el=, and migrate that path to
   =:head-dim= (it currently refuses the key rather than deriving a wrong width).

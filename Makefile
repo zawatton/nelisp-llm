@@ -460,9 +460,12 @@ qwen-forward-ref:
 test-weights-forward:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/weights-forward-test.el
 
-# One imported linear through the per-row DP4A kernel: uploaded as bytes, run on
+# Imported linears through the per-row DP4A kernel: uploaded as bytes, run on
 # the GPU, and compared against the same W8A8 arithmetic on the CPU.  Needs a
 # Vulkan device and the donor table; skips cleanly without either.  Calibrated
-# by doubling one row's scale, which it detects.
+# by doubling one row's scale, which it detects.  About ten seconds.
+#
+# NL_LLM_GPU_E2E=1 adds the end-to-end check: all 28 layers on the GPU, whose
+# greedy token must equal the CPU oracle's 12095.  That one takes ~4 minutes.
 test-weights-gpu:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/weights-gpu-test.el

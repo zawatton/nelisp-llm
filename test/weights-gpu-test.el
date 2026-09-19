@@ -128,7 +128,26 @@
                           (aset scales 0 saved)
                           (wg--ck "control: a doubled row scale is detected"
                                   (> rel 1.0e-6)
-                                  (format "rel %.3e" rel)))))
+                                  (format "rel %.3e" rel))))
+
+                      ;; The acceptance criterion for this phase, behind an env
+                      ;; var because it is a four-minute run: does the whole
+                      ;; W8A8 GPU stack still predict what the CPU oracle
+                      ;; predicted?  Activation quantization costs about 0.7%
+                      ;; per layer, so surviving 28 of them is a real question
+                      ;; rather than a formality.
+                      (if (not (getenv "NL_LLM_GPU_E2E"))
+                          (princ (format "%-50s %s  %s\n"
+                                         "end-to-end greedy token" "----"
+                                         "set NL_LLM_GPU_E2E=1 to run (~4 min)"))
+                        (let* ((t3 (float-time))
+                               (best (nl-llm-wgpu-next-token
+                                      wts (list 785 6722 315 9625 374)))
+                               (secs (- (float-time) t3)))
+                          (wg--ck "end-to-end greedy token == CPU oracle"
+                                  (= (car best) 12095)
+                                  (format "got %d want 12095, logit %.6f vs \
+17.189348 (oracle), %.0fs" (car best) (cdr best) secs)))))
                   (nelisp-gpu-server-free handle))))
           (nelisp-gpu-server-stop))
 

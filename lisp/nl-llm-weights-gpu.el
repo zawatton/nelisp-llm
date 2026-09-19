@@ -116,5 +116,201 @@ ROWS-long result as a float vector."
                 (/ (+ rows 63) 64)))
       (nelisp-gpu-server-free hact))))
 
+;;; --- a whole layer, linears on the GPU -----------------------------------
+;;
+;; The linears are where the work is: at one position a layer is about 12.6M
+;; multiply-accumulates across its seven matrices, against a few thousand for
+;; the norms, the rotation and the attention.  So this puts the seven on the GPU
+;; and leaves the elementwise glue on the CPU, which captures nearly all of the
+;; arithmetic while keeping the parts that were hard to get right -- the
+;; decoupled head width, the half-split rotation, QK-norm -- in the code the CPU
+;; oracle already agrees with.
+
+(require 'nl-llm-weights-forward)
+
+(cl-defstruct (nl-llm-wgpu-layer (:constructor nl-llm-wgpu-layer--make))
+  lins       ; plist ROLE -> nl-llm-weights-lin
+  handles    ; plist ROLE -> resident GPU handle
+  ln1g ln2g q-norm k-norm)
+
+(defconst nl-llm-wgpu-roles '(:wq :wk :wv :wo :wg :wu :wd)
+  "The quantized matrices of one imported block, in no particular order.")
+
+;;;###autoload
+(defun nl-llm-wgpu-load-layer (wts layer)
+  "Load LAYER of WTS with its seven matrices resident on the GPU.
+Weights are uploaded once and referenced by handle afterwards, so a 28-layer
+forward pays the transfer a single time."
+  (let (lins handles)
+    (dolist (role nl-llm-wgpu-roles)
+      (let ((lin (nl-llm-weights-linear wts role layer)))
+        (setq lins (plist-put lins role lin))
+        (setq handles (plist-put handles role (nl-llm-wgpu-upload lin)))))
+    (nl-llm-wgpu-layer--make
+     :lins lins :handles handles
+     :ln1g (nl-llm-weights-row wts (nl-llm-weights-tensor wts :ln1g layer) 0)
+     :ln2g (nl-llm-weights-row wts (nl-llm-weights-tensor wts :ln2g layer) 0)
+     :q-norm (nl-llm-weights-row wts (nl-llm-weights-tensor wts :q-norm layer) 0)
+     :k-norm (nl-llm-weights-row wts (nl-llm-weights-tensor wts :k-norm layer) 0))))
+
+;;;###autoload
+(defun nl-llm-wgpu-free-layer (lay)
+  "Free LAY's resident GPU buffers."
+  (dolist (role nl-llm-wgpu-roles)
+    (let ((h (plist-get (nl-llm-wgpu-layer-handles lay) role)))
+      (when h (nelisp-gpu-server-free h)))))
+
+(defun nl-llm-wgpu--lin (lay role x &optional base)
+  "Apply LAY's ROLE matrix to X at BASE on the GPU."
+  (nl-llm-wgpu-apply (plist-get (nl-llm-wgpu-layer-lins lay) role)
+                     (plist-get (nl-llm-wgpu-layer-handles lay) role)
+                     x base))
+
+;;;###autoload
+(defun nl-llm-wgpu-block (lay x seq cfg)
+  "Run one imported block over X (flat SEQ x dim) with its linears on the GPU.
+Elementwise arithmetic stays on the CPU and is the same code
+`nl-llm-wf-block' uses, so the two differ only in how the matrices are
+multiplied -- and therefore only by the activation quantization the GPU path
+does and the f32 path does not."
+  (let* ((dim (plist-get cfg :dim))
+         (heads (plist-get cfg :heads))
+         (kv-heads (plist-get cfg :kv-heads))
+         (hd (plist-get cfg :head-dim))
+         (rbase (plist-get cfg :rope-base))
+         (eps (or (plist-get cfg :rms-eps) 1.0e-6))
+         (qdim (* heads hd)) (kvdim (* kv-heads hd))
+         (ff (nl-llm-weights-lin-rows
+              (plist-get (nl-llm-wgpu-layer-lins lay) :wg)))
+         (q (make-vector (* seq qdim) 0.0))
+         (k (make-vector (* seq kvdim) 0.0))
+         (v (make-vector (* seq kvdim) 0.0)))
+    (dotimes (i seq)
+      (let ((a (nl-llm-wf--rmsnorm x (* i dim) dim
+                                   (nl-llm-wgpu-layer-ln1g lay) eps)))
+        (let ((qi (nl-llm-wgpu--lin lay :wq a))
+              (ki (nl-llm-wgpu--lin lay :wk a))
+              (vi (nl-llm-wgpu--lin lay :wv a)))
+          (dotimes (t0 qdim) (aset q (+ (* i qdim) t0) (aref qi t0)))
+          (dotimes (t0 kvdim) (aset k (+ (* i kvdim) t0) (aref ki t0)))
+          (dotimes (t0 kvdim) (aset v (+ (* i kvdim) t0) (aref vi t0))))))
+    (dotimes (i seq)
+      (nl-llm--rmsnorm-heads q (* i qdim) heads hd
+                             (photon-tensor (list hd)
+                                            (nl-llm-wgpu-layer-q-norm lay))
+                             eps)
+      (nl-llm--rmsnorm-heads k (* i kvdim) kv-heads hd
+                             (photon-tensor (list hd)
+                                            (nl-llm-wgpu-layer-k-norm lay))
+                             eps)
+      (nl-llm--rope-heads q (* i qdim) heads hd i rbase 'half)
+      (nl-llm--rope-heads k (* i kvdim) kv-heads hd i rbase 'half))
+    (let ((ctx (nl-llm-wf--attend q k v seq heads kv-heads hd))
+          (x1 (make-vector (* seq dim) 0.0)))
+      (dotimes (i seq)
+        (let ((o (nl-llm-wgpu--lin lay :wo ctx (* i qdim))))
+          (dotimes (t0 dim)
+            (aset x1 (+ (* i dim) t0)
+                  (+ (aref x (+ (* i dim) t0)) (aref o t0))))))
+      (let ((out (make-vector (* seq dim) 0.0)))
+        (dotimes (i seq)
+          (let* ((b (nl-llm-wf--rmsnorm x1 (* i dim) dim
+                                        (nl-llm-wgpu-layer-ln2g lay) eps))
+                 (g (nl-llm-wgpu--lin lay :wg b))
+                 (u (nl-llm-wgpu--lin lay :wu b))
+                 (h (nl-llm-wf--silu-mul g u ff))
+                 (d (nl-llm-wgpu--lin lay :wd h)))
+            (dotimes (t0 dim)
+              (aset out (+ (* i dim) t0)
+                    (+ (aref x1 (+ (* i dim) t0)) (aref d t0))))))
+        out))))
+
+;;;###autoload
+(defun nl-llm-wgpu-block-cpu (wts layer x seq cfg)
+  "Run one imported block with the GPU's W8A8 arithmetic, on the CPU.
+The reference for `nl-llm-wgpu-block': identical except that every matrix goes
+through `nl-llm-weights-apply-w8a8' instead of the kernel, so a difference
+between the two is the transfer or the kernel and nothing else.  Compare
+against `nl-llm-wf-block' instead to see what the activation quantization
+costs."
+  (let* ((lay (nl-llm-wf-load-layer wts layer))
+         (dim (plist-get cfg :dim))
+         (heads (plist-get cfg :heads))
+         (kv-heads (plist-get cfg :kv-heads))
+         (hd (plist-get cfg :head-dim))
+         (rbase (plist-get cfg :rope-base))
+         (eps (or (plist-get cfg :rms-eps) 1.0e-6))
+         (qdim (* heads hd)) (kvdim (* kv-heads hd))
+         (ff (nl-llm-weights-lin-rows (nl-llm-wf-layer-wg lay)))
+         (q (make-vector (* seq qdim) 0.0))
+         (k (make-vector (* seq kvdim) 0.0))
+         (v (make-vector (* seq kvdim) 0.0)))
+    (dotimes (i seq)
+      (let ((a (nl-llm-wf--rmsnorm x (* i dim) dim
+                                   (nl-llm-wf-layer-ln1g lay) eps)))
+        (let ((qi (nl-llm-weights-apply-w8a8 (nl-llm-wf-layer-wq lay) a))
+              (ki (nl-llm-weights-apply-w8a8 (nl-llm-wf-layer-wk lay) a))
+              (vi (nl-llm-weights-apply-w8a8 (nl-llm-wf-layer-wv lay) a)))
+          (dotimes (t0 qdim) (aset q (+ (* i qdim) t0) (aref qi t0)))
+          (dotimes (t0 kvdim) (aset k (+ (* i kvdim) t0) (aref ki t0)))
+          (dotimes (t0 kvdim) (aset v (+ (* i kvdim) t0) (aref vi t0))))))
+    (dotimes (i seq)
+      (nl-llm--rmsnorm-heads q (* i qdim) heads hd
+                             (photon-tensor (list hd)
+                                            (nl-llm-wf-layer-q-norm lay))
+                             eps)
+      (nl-llm--rmsnorm-heads k (* i kvdim) kv-heads hd
+                             (photon-tensor (list hd)
+                                            (nl-llm-wf-layer-k-norm lay))
+                             eps)
+      (nl-llm--rope-heads q (* i qdim) heads hd i rbase 'half)
+      (nl-llm--rope-heads k (* i kvdim) kv-heads hd i rbase 'half))
+    (let ((ctx (nl-llm-wf--attend q k v seq heads kv-heads hd))
+          (x1 (make-vector (* seq dim) 0.0)))
+      (dotimes (i seq)
+        (let ((o (nl-llm-weights-apply-w8a8 (nl-llm-wf-layer-wo lay)
+                                            ctx (* i qdim))))
+          (dotimes (t0 dim)
+            (aset x1 (+ (* i dim) t0)
+                  (+ (aref x (+ (* i dim) t0)) (aref o t0))))))
+      (let ((out (make-vector (* seq dim) 0.0)))
+        (dotimes (i seq)
+          (let* ((b (nl-llm-wf--rmsnorm x1 (* i dim) dim
+                                        (nl-llm-wf-layer-ln2g lay) eps))
+                 (g (nl-llm-weights-apply-w8a8 (nl-llm-wf-layer-wg lay) b))
+                 (u (nl-llm-weights-apply-w8a8 (nl-llm-wf-layer-wu lay) b))
+                 (h (nl-llm-wf--silu-mul g u ff))
+                 (d (nl-llm-weights-apply-w8a8 (nl-llm-wf-layer-wd lay) h)))
+            (dotimes (t0 dim)
+              (aset out (+ (* i dim) t0)
+                    (+ (aref x1 (+ (* i dim) t0)) (aref d t0))))))
+        out))))
+
+;;;###autoload
+(defun nl-llm-wgpu-next-token (wts tokens &optional nlayers progress)
+  "Greedy next token for TOKENS with every linear on the GPU.
+Returns (ID . LOGIT).  Layers are loaded, used and freed one at a time, so
+peak VRAM is one layer rather than the whole model; the head is scored on the
+CPU because it is read once and used once."
+  (let* ((cfg (nl-llm-weights-config wts))
+         (dim (plist-get cfg :dim))
+         (seq (length tokens))
+         (n (min (or nlayers (plist-get cfg :layers))
+                 (plist-get cfg :layers)))
+         (x (make-vector (* seq dim) 0.0))
+         (i 0))
+    (dolist (tk tokens)
+      (let ((row (nl-llm-weights-embed wts tk)))
+        (dotimes (t0 dim) (aset x (+ (* i dim) t0) (aref row t0))))
+      (setq i (1+ i)))
+    (dotimes (ly n)
+      (let ((lay (nl-llm-wgpu-load-layer wts ly)))
+        (unwind-protect
+            (setq x (nl-llm-wgpu-block lay x seq cfg))
+          (nl-llm-wgpu-free-layer lay)))
+      (when progress (funcall progress ly)))
+    (let ((final (nl-llm-wf-final-norm wts x seq)))
+      (nl-llm-wf-argmax (nl-llm-wf-logits-all wts final seq (1- seq))))))
+
 (provide 'nl-llm-weights-gpu)
 ;;; nl-llm-weights-gpu.el ends here
