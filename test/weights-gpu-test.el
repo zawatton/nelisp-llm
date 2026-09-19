@@ -299,6 +299,83 @@
                                           "identical to the CPU backward")))
                             (nl-llm-wgpu-free-transposes tbl))))
 
+                      ;; --- a batch of positions in one dispatch ------------
+                      ;;
+                      ;; Equality here is exact, not approximate, and that is
+                      ;; the claim: batching changes how many dispatches carry
+                      ;; the arithmetic, not the arithmetic.  Each position is
+                      ;; still quantized with its own scale and each (position,
+                      ;; row) still accumulates the same way, so anything other
+                      ;; than a bit-for-bit match means a layout error -- which
+                      ;; a tolerance would hide, since a wrong position offset
+                      ;; still produces plausible numbers.
+                      ;;
+                      ;; Both handle forms are checked because both are live:
+                      ;; a bare integer sends the weight's constants inline,
+                      ;; a plist has them resident.
+                      (let* ((seq 6)
+                             (rows (nl-llm-weights-lin-rows lin))
+                             (cols (nl-llm-weights-lin-cols lin))
+                             (xs (make-vector (* seq cols) 0.0))
+                             (gs (make-vector (* seq rows) 0.0)))
+                        (dotimes (p seq)
+                          (dotimes (i cols)
+                            (aset xs (+ (* p cols) i)
+                                  (* (aref act i) (+ 1.0 (* 0.1 p))))))
+                        (dotimes (i (* seq rows))
+                          (aset gs i (* 0.001 (- (mod (* (1+ i) 7919) 211) 105.0))))
+                        (dolist (form '(bare resident))
+                          (let ((h (if (eq form 'bare)
+                                       (nl-llm-wgpu-upload lin)
+                                     (nl-llm-wgpu-upload-lin lin))))
+                            (unwind-protect
+                                (let* ((t0 (float-time))
+                                       (one (let (acc)
+                                              (dotimes (p seq)
+                                                (push (nl-llm-wgpu-apply lin h xs (* p cols))
+                                                      acc))
+                                              (nreverse acc)))
+                                       (t1 (float-time))
+                                       (many (nl-llm-wgpu-apply-seq lin h xs 0 seq))
+                                       (t2 (float-time))
+                                       (bad 0))
+                                  (dotimes (p seq)
+                                    (dotimes (o rows)
+                                      (unless (= (aref (nth p one) o)
+                                                 (aref many (+ (* p rows) o)))
+                                        (setq bad (1+ bad)))))
+                                  (wg--ck (format "%S handle: batched forward is exact" form)
+                                          (zerop bad)
+                                          (format "%d of %d differ, %.3fs -> %.3fs (%.1fx)"
+                                                  bad (* seq rows) (- t1 t0) (- t2 t1)
+                                                  (/ (- t1 t0) (max (- t2 t1) 1.0e-6))))
+                                  (let* ((t3 (float-time))
+                                         (ot (let (acc)
+                                               (dotimes (p seq)
+                                                 (let ((gp (make-vector rows 0.0)))
+                                                   (dotimes (o rows)
+                                                     (aset gp o (aref gs (+ (* p rows) o))))
+                                                   (push (nl-llm-wgpu-apply-t lin h gp) acc)))
+                                               (nreverse acc)))
+                                         (t4 (float-time))
+                                         (mt (nl-llm-wgpu-apply-t-seq lin h gs seq))
+                                         (t5 (float-time))
+                                         (badt 0))
+                                    (dotimes (p seq)
+                                      (dotimes (i cols)
+                                        (unless (= (aref (nth p ot) i)
+                                                   (aref mt (+ (* p cols) i)))
+                                          (setq badt (1+ badt)))))
+                                    (wg--ck (format "%S handle: batched transpose is exact" form)
+                                            (zerop badt)
+                                            (format "%d of %d differ, %.3fs -> %.3fs (%.1fx)"
+                                                    badt (* seq cols) (- t4 t3) (- t5 t4)
+                                                    (/ (- t4 t3) (max (- t5 t4) 1.0e-6))))))
+                              (if (eq form 'bare)
+                                  (nelisp-gpu-server-free h)
+                                (dolist (k '(:w :s :b))
+                                  (nelisp-gpu-server-free (plist-get h k))))))))
+
                       ;; --- the tied head, the other half of a step --------
                       ;;
                       ;; 151936 x 1024, the largest single matrix in the

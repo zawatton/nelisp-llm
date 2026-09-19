@@ -174,8 +174,80 @@ comparison to go with it."
                       (cons 'in (nl-llm-weights-lin-scales lin)))
                     (cons 'in g)
                     (cons 'out cols))
-              (list rows cols words)
+              (list rows cols words 1)
               (/ (+ cols 63) 64))))))
+
+;;;###autoload
+(defun nl-llm-wgpu-pack-act-seq (x base seq stride cols)
+  "Pack SEQ slices of X into one byte string; return (BYTES . GAMMAS).
+Slice P starts at BASE + P*STRIDE and is COLS wide.  The slices are quantized
+*independently*, each with its own scale, which is what the kernel expects --
+GAMMA is indexed by position there."
+  (let ((parts nil) (gammas (make-vector seq 0.0)))
+    (dotimes (p seq)
+      (let ((pk (nl-llm-wgpu-pack-act x (+ base (* p stride)) cols)))
+        (aset gammas p (cdr pk))
+        (push (car pk) parts)))
+    (cons (apply #'concat (nreverse parts)) gammas)))
+
+;;;###autoload
+(defun nl-llm-wgpu-apply-seq (lin handle x base seq &optional stride)
+  "Apply LIN to SEQ slices of X in one dispatch; return a SEQ x ROWS vector.
+STRIDE defaults to LIN's COLS, which is right when X is a packed sequence of
+this linear's inputs and wrong for `:wo', whose input is strided by the query
+width -- so the caller says.
+
+Arithmetic per (position, row) is what `nl-llm-wgpu-apply' does, so this is
+bit-identical to calling it SEQ times; what changes is that one round trip and
+one activation upload carry all of them instead of SEQ of each."
+  (let* ((cols (nl-llm-weights-lin-cols lin))
+         (rows (nl-llm-weights-lin-rows lin))
+         (words (nl-llm-weights-lin-words lin))
+         (res (nl-llm-wgpu--resident-p handle))
+         (pack (nl-llm-wgpu-pack-act-seq x (or base 0) seq (or stride cols) cols))
+         (hact (nelisp-gpu-server-upload-bytes (car pack))))
+    (unwind-protect
+        (nth 0 (nelisp-gpu-server-run2
+                'bitlinear-dp4a-rows
+                (list (list 'res hact (* seq words))
+                      (list 'res (if res (plist-get handle :w) handle)
+                            (* rows words))
+                      (if res
+                          (list 'res (plist-get handle :b) rows)
+                        (cons 'in (make-vector rows 0.0)))
+                      (if res
+                          (list 'res (plist-get handle :s) rows)
+                        (cons 'in (nl-llm-weights-lin-scales lin)))
+                      (cons 'in (cdr pack))
+                      (cons 'out (* seq rows)))
+                (list seq rows words)
+                (/ (+ (* seq rows) 63) 64)))
+      (nelisp-gpu-server-free hact))))
+
+;;;###autoload
+(defun nl-llm-wgpu-apply-t-seq (lin handle g seq)
+  "Apply LIN's transpose to SEQ gradients at once; return a SEQ x COLS vector.
+G is SEQ x ROWS.  Bit-identical to SEQ calls of `nl-llm-wgpu-apply-t', and the
+reason to prefer it is the same as for the forward: the caller pays a round
+trip and an Elisp-side float encoding of G per call, and this makes it one."
+  (let* ((rows (nl-llm-weights-lin-rows lin))
+         (cols (nl-llm-weights-lin-cols lin))
+         (words (nl-llm-weights-lin-words lin))
+         (res (nl-llm-wgpu--resident-p handle)))
+    (unless (= (length g) (* seq rows))
+      (error "nl-llm-wgpu-apply-t-seq: G is %d long, want %d x %d"
+             (length g) seq rows))
+    (nth 0 (nelisp-gpu-server-run2
+            'dp4a-rows-t
+            (list (list 'res (if res (plist-get handle :w) handle)
+                        (* rows words))
+                  (if res
+                      (list 'res (plist-get handle :s) rows)
+                    (cons 'in (nl-llm-weights-lin-scales lin)))
+                  (cons 'in g)
+                  (cons 'out (* seq cols)))
+            (list rows cols words seq)
+            (/ (+ (* seq cols) 63) 64)))))
 
 ;;; --- a whole layer, linears on the GPU -----------------------------------
 ;;
