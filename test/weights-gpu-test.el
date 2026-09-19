@@ -130,6 +130,51 @@
                                   (> rel 1.0e-6)
                                   (format "rel %.3e" rel))))
 
+                      ;; --- the transpose, which training needs ------------
+                      ;;
+                      ;; Two checks with different strengths.  Against the CPU
+                      ;; it can only be as tight as f32 allows -- this kernel
+                      ;; accumulates in float across every row, because the
+                      ;; per-row scale multiplies each term and cannot be
+                      ;; factored out of an integer dot product the way the
+                      ;; forward's can.  So the inner-product identity carries
+                      ;; the structural weight: it needs no reference at all and
+                      ;; no index error survives it.
+                      (let* ((gvec (make-vector (nl-llm-weights-lin-rows lin) 0.0)))
+                        (dotimes (i (length gvec))
+                          (aset gvec i (* 0.01 (- (mod (* (1+ i) 7919) 211) 105))))
+                        (let* ((t4 (float-time))
+                               (gt (nl-llm-wgpu-apply-t lin handle gvec))
+                               (gsec (- (float-time) t4))
+                               (t5 (float-time))
+                               (ct (nl-llm-weights-apply-t lin gvec))
+                               (csec (- (float-time) t5))
+                               (sc (wg--amax ct)))
+                          (wg--ck "GPU transpose == the CPU transpose"
+                                  (< (wg--rel gt ct sc) 1.0e-4)
+                                  (format "rel %.3e (f32 accumulate over %d rows)"
+                                          (wg--rel gt ct sc)
+                                          (nl-llm-weights-lin-rows lin)))
+                          (wg--ck "the GPU transpose is faster than the Elisp loop"
+                                  (< gsec csec)
+                                  (format "%.4fs vs %.4fs (%.0fx)"
+                                          gsec csec (/ csec (max gsec 1.0e-6))))
+                          ;; <W.x, g> = <x, W^T.g>, with W^T from the GPU.
+                          (let* ((wx (nl-llm-weights-apply lin act))
+                                 (lhs (let ((s 0.0))
+                                        (dotimes (i (length wx))
+                                          (setq s (+ s (* (aref wx i) (aref gvec i)))))
+                                        s))
+                                 (rhs (let ((s 0.0))
+                                        (dotimes (i (length gt))
+                                          (setq s (+ s (* (aref act i) (aref gt i)))))
+                                        s))
+                                 (rel (/ (abs (- lhs rhs))
+                                         (max (abs lhs) (abs rhs) 1.0e-30))))
+                            (wg--ck "GPU transpose satisfies <W.x, g> = <x, W^T.g>"
+                                    (< rel 1.0e-4)
+                                    (format "%.6f vs %.6f (rel %.2e)" lhs rhs rel)))))
+
                       ;; The acceptance criterion for this phase, behind an env
                       ;; var because it is a four-minute run: does the whole
                       ;; W8A8 GPU stack still predict what the CPU oracle

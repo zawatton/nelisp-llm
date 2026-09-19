@@ -408,10 +408,34 @@ than an impression.
 Two things that measurement says beyond the headline.  The backward is
 *cheaper* than the forward, ratio 0.73, because it is seven transposes against
 the forward's seven multiplies plus the adapter, and the transpose skips rows
-whose scale times gradient is zero.  And the fix is already half-built: the GPU
-gives 58x on the forward linears, so what is missing is a transposed DP4A
-kernel, not new numerics.  A rank-8 LoRA on one role is 16384 trainable
-parameters per layer, which was never the part that cost anything.
+whose scale times gradient is zero.  And a rank-8 LoRA on one role is 16384
+trainable parameters per layer, which was never the part that cost anything.
+
+*The transpose is now on the GPU too* -- =dp4a-rows-t= in nelisp-gpu, wrapped by
+=nl-llm-wgpu-apply-t=.  Measured on a real 2048 x 1024 imported weight:
+
+| measurement                            | result        |
+|----------------------------------------+---------------|
+| GPU vs the Elisp loop                  | 0.0124s vs 0.8315s, 67x |
+| GPU transpose vs the CPU transpose     | rel 1.6e-06   |
+| <W.x, g> = <x, W^T.g>, W^T on the GPU  | rel 5.2e-07   |
+
+One thread per input column, which is the awkward direction -- column i lives in
+word i/4, lane i%4 of every row, so a thread strides down the weight rather than
+along it.  DP4A does not apply despite the layout: BETA varies per row and
+multiplies each term, so it cannot be factored out of an integer dot product the
+way the forward's single accumulation can.  The sum is float, which is why this
+is only as tight as f32 against a float64 reference instead of the forward's
+8e-08.  A DP4A variant would need the gradient quantized as well, and a second,
+looser comparison to go with it.
+
+The inner-product identity carries the structural weight there: it needs no
+reference implementation at all, and no index error survives it -- which matters
+for the one access pattern that is easy to get backwards.
+
+So both directions of a linear now run on the GPU at 67x, and what stands
+between the loop and practicality is wiring the block backward through them --
+assembly again, not numerics.
 
 Independent and still open: the f32 autograd path's own migration, since
 =nl-llm-ag-block= *refuses* =:head-dim=, =:rope-style= and QK-norm.  That

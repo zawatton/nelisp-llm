@@ -116,6 +116,32 @@ ROWS-long result as a float vector."
                 (/ (+ rows 63) 64)))
       (nelisp-gpu-server-free hact))))
 
+;;;###autoload
+(defun nl-llm-wgpu-apply-t (lin handle g)
+  "Return W^T applied to G on the GPU, for LIN resident at HANDLE.
+The same quantity `nl-llm-weights-apply-t' computes on the CPU, and the one a
+frozen base has to supply for anything upstream of it to be trainable.
+
+Accumulation is float rather than DP4A: the per-row scale multiplies each term,
+so it cannot be factored out of an integer dot product.  That makes this
+comparable to the CPU path up to f32 rounding, which is what the suite checks
+-- a DP4A variant would need the gradient quantized too, and a second, looser
+comparison to go with it."
+  (let* ((rows (nl-llm-weights-lin-rows lin))
+         (cols (nl-llm-weights-lin-cols lin))
+         (words (nl-llm-weights-lin-words lin)))
+    (unless (= (length g) rows)
+      (error "nl-llm-wgpu-apply-t: G is %d long, weight has %d rows"
+             (length g) rows))
+    (nth 0 (nelisp-gpu-server-run2
+            'dp4a-rows-t
+            (list (list 'res handle (* rows words))
+                  (cons 'in (nl-llm-weights-lin-scales lin))
+                  (cons 'in g)
+                  (cons 'out cols))
+            (list rows cols words)
+            (/ (+ cols 63) 64)))))
+
 ;;; --- a whole layer, linears on the GPU -----------------------------------
 ;;
 ;; The linears are where the work is: at one position a layer is about 12.6M
