@@ -460,6 +460,21 @@ look merely slow."
     (if h (nl-llm-wgpu-apply-t lin h g) (nl-llm-weights-apply-t lin g))))
 
 ;;;###autoload
+(defun nl-llm-wgpu-transpose-seq (lin g seq)
+  "W^T.G for SEQ gradients on the GPU when LIN is resident, else on the CPU."
+  (let ((h (and nl-llm-wgpu--transposes (gethash lin nl-llm-wgpu--transposes))))
+    (if h (nl-llm-wgpu-apply-t-seq lin h g seq)
+      (let* ((rows (nl-llm-weights-lin-rows lin))
+             (cols (nl-llm-weights-lin-cols lin))
+             (out (make-vector (* seq cols) 0.0)))
+        (dotimes (p seq)
+          (let ((gp (make-vector rows 0.0)))
+            (dotimes (o rows) (aset gp o (aref g (+ (* p rows) o))))
+            (let ((dx (nl-llm-weights-apply-t lin gp)))
+              (dotimes (i cols) (aset out (+ (* p cols) i) (aref dx i))))))
+        out))))
+
+;;;###autoload
 (defun nl-llm-wgpu-apply-seq-resident (lin x seq stride)
   "Apply LIN to SEQ slices of X on the GPU, using the current table.
 Falls back to SEQ separate CPU applications when LIN is not resident, so a
@@ -493,6 +508,7 @@ when you want the verified f32 reference to still apply."
   (declare (indent 1))
   `(let ((nl-llm-wgpu--transposes ,table)
          (nl-llm-wb-transpose-fn #'nl-llm-wgpu-transpose)
+         (nl-llm-wb-transpose-seq-fn #'nl-llm-wgpu-transpose-seq)
          (nl-llm-wb-forward-fn #'nl-llm-wgpu-apply-resident)
          (nl-llm-wb-forward-seq-fn #'nl-llm-wgpu-apply-seq-resident))
      ,@body))
@@ -541,7 +557,8 @@ gradient difference could be either the wiring or the quantization.  Separating
 them keeps the comparison against the verified CPU backward direct."
   (declare (indent 1))
   `(let ((nl-llm-wgpu--transposes ,table)
-         (nl-llm-wb-transpose-fn #'nl-llm-wgpu-transpose))
+         (nl-llm-wb-transpose-fn #'nl-llm-wgpu-transpose)
+         (nl-llm-wb-transpose-seq-fn #'nl-llm-wgpu-transpose-seq))
      ,@body))
 
 ;;;###autoload

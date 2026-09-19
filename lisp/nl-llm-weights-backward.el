@@ -265,6 +265,69 @@ keeps the verified reference available for comparison.")
       (funcall nl-llm-wb-transpose-fn lin g)
     (nl-llm-weights-apply-t lin g)))
 
+(defvar nl-llm-wb-transpose-seq-fn nil
+  "When non-nil, a function (LIN G SEQ) computing W^T.G for SEQ gradients.
+G is SEQ x ROWS and the result SEQ x COLS.  Same reason as the forward\='s
+batched hook: the per-call cost is a round trip and an Elisp-side float
+encoding of G, so the number of calls is what there is to save.")
+
+(defun nl-llm-wb--transpose-seq (lin g seq)
+  "W^T.G for SEQ gradients at once; SEQ x ROWS in, SEQ x COLS out.
+Falls back to SEQ separate transposes -- through `nl-llm-wb--transpose\=', so
+the per-call hook still applies -- when no batched one is bound."
+  (if nl-llm-wb-transpose-seq-fn
+      (funcall nl-llm-wb-transpose-seq-fn lin g seq)
+    (let* ((rows (nl-llm-weights-lin-rows lin))
+           (cols (nl-llm-weights-lin-cols lin))
+           (out (make-vector (* seq cols) 0.0)))
+      (dotimes (p seq)
+        (let ((gp (make-vector rows 0.0)))
+          (dotimes (o rows) (aset gp o (aref g (+ (* p rows) o))))
+          (let ((dx (nl-llm-wb--transpose lin gp)))
+            (dotimes (i cols) (aset out (+ (* p cols) i) (aref dx i))))))
+      out)))
+
+(defun nl-llm-wb--lin-backward-seq (lay role loras saved-list g-all seq acc-all)
+  "Accumulate ROLE\='s input gradients for SEQ output gradients into ACC-ALL.
+G-ALL is SEQ x ROWS, ACC-ALL is SEQ x COLS and is added to in place.  Returns
+ROLE\='s LoRA gradients summed over positions, or nil.
+
+The base transpose runs once for the batch; the adapter then runs per position
+through `nl-llm-wlora-backward\=' itself, handed the precomputed column through
+its wt-fn -- the same arrangement as the forward, and for the same reason: the
+adapter\='s two halves have to agree about U and XS, and a second copy of that
+arithmetic here is what would drift.
+
+Accumulation into ACC-ALL is per position and in call order, so a caller that
+invokes this for :wq then :wk then :wv adds them in that order at every
+position, exactly as a position loop would.  That is not pedantry -- float
+addition is not associative, and the point of this function is to be
+indistinguishable from the loop it replaces."
+  (let* ((lin (nl-llm-wf-layer-lin lay role))
+         (lora (plist-get loras role))
+         (cols (nl-llm-weights-lin-cols lin))
+         (rows (nl-llm-weights-lin-rows lin))
+         (base (nl-llm-wb--transpose-seq lin g-all seq))
+         (merged nil))
+    (dotimes (p seq)
+      (if (null lora)
+          (dotimes (i cols)
+            (aset acc-all (+ (* p cols) i)
+                  (+ (aref acc-all (+ (* p cols) i)) (aref base (+ (* p cols) i)))))
+        (let ((gp (make-vector rows 0.0))
+              (dxp (make-vector cols 0.0)))
+          (dotimes (o rows) (aset gp o (aref g-all (+ (* p rows) o))))
+          (dotimes (i cols) (aset dxp i (aref base (+ (* p cols) i))))
+          (let* ((sv (nth p saved-list))
+                 (grads (nl-llm-wlora-backward lin lora (nth 2 sv) (nth 1 sv) gp
+                                               (lambda (_lin _g) dxp)))
+                 (dx (plist-get grads :dx)))
+            (dotimes (i cols)
+              (aset acc-all (+ (* p cols) i)
+                    (+ (aref acc-all (+ (* p cols) i)) (aref dx i))))
+            (setq merged (nl-llm-wb--merge-grads merged role grads))))))
+    (plist-get merged role)))
+
 (defun nl-llm-wb--lin-backward (lay role loras saved g acc)
   "Accumulate ROLE's input gradient for output gradient G into ACC.
 Returns the plist of LoRA gradients for ROLE, or nil.  SAVED is the (Y U XS)
@@ -404,7 +467,15 @@ built exactly as before, which is what leaves the backward untouched."
   "Gradients of one imported block for output gradient DOUT.
 TAPE is from `nl-llm-wb-block-forward'.  Returns (DX . LORA-GRADS): DX the
 gradient with respect to the block's input, LORA-GRADS a plist ROLE -> (:da :db)
-summed over positions.  The base collects nothing, by construction."
+summed over positions.  The base collects nothing, by construction.
+
+Like the forward, this goes a role at a time: the seven transposes are seven
+calls whatever SEQ is.  It has to be staged rather than simply reordered,
+because within a position the feed-forward's gradient runs wd, then the
+SwiGLU's vjp, then wg and wu -- so the batch for wd must complete before the
+batch for wg exists.  Four stages come out of that, and the accumulation order
+at each position is unchanged, which is what keeps the result identical rather
+than merely close."
   (let* ((dim (plist-get cfg :dim)) (heads (plist-get cfg :heads))
          (kv-heads (plist-get cfg :kv-heads)) (hd (plist-get cfg :head-dim))
          (rbase (plist-get cfg :rope-base))
@@ -414,53 +485,51 @@ summed over positions.  The base collects nothing, by construction."
          (dx (make-vector (* seq dim) 0.0))
          (dx1 (make-vector (* seq dim) 0.0))
          (dctx (make-vector (* seq qdim) 0.0))
+         (dh-all (make-vector (* seq ff) 0.0))
+         (db-all (make-vector (* seq dim) 0.0))
+         (da-all (make-vector (* seq dim) 0.0))
          (lg nil))
-    ;; the feed-forward half, and the residual into x1
+    ;; the feed-forward half: wd for every position, then the SwiGLU's vjp,
+    ;; then wg and wu, then the norm and the residual into x1
+    (setq lg (nl-llm-wb--merge-grads
+              lg :wd (nl-llm-wb--lin-backward-seq
+                      lay :wd loras (plist-get tape :fd) dout seq dh-all)))
+    (let ((sg0 (make-vector (* seq ff) 0.0))
+          (sg1 (make-vector (* seq ff) 0.0)))
+      (dotimes (i seq)
+        (let* ((dh (make-vector ff 0.0)))
+          (dotimes (t0 ff) (aset dh t0 (aref dh-all (+ (* i ff) t0))))
+          (let ((sg (nl-llm-wb-silu-mul-vjp
+                     (nth 0 (nth i (plist-get tape :fg)))
+                     (nth 0 (nth i (plist-get tape :fu)))
+                     dh ff)))
+            (dotimes (t0 ff)
+              (aset sg0 (+ (* i ff) t0) (aref (nth 0 sg) t0))
+              (aset sg1 (+ (* i ff) t0) (aref (nth 1 sg) t0))))))
+      (setq lg (nl-llm-wb--merge-grads
+                lg :wg (nl-llm-wb--lin-backward-seq
+                        lay :wg loras (plist-get tape :fg) sg0 seq db-all)))
+      (setq lg (nl-llm-wb--merge-grads
+                lg :wu (nl-llm-wb--lin-backward-seq
+                        lay :wu loras (plist-get tape :fu) sg1 seq db-all))))
     (dotimes (i seq)
-      (let* ((dh (make-vector ff 0.0))
-             (dout-i (let ((s (make-vector dim 0.0)))
-                       (dotimes (t0 dim) (aset s t0 (aref dout (+ (* i dim) t0))))
-                       s)))
-        (setq lg (nl-llm-wb--merge-grads
-                  lg :wd (nl-llm-wb--lin-backward
-                          lay :wd loras (nth i (plist-get tape :fd))
-                          dout-i dh)))
-        (let* ((sg (nl-llm-wb-silu-mul-vjp
-                    (nth 0 (nth i (plist-get tape :fg)))
-                    (nth 0 (nth i (plist-get tape :fu)))
-                    dh ff))
-               (db (make-vector dim 0.0)))
-          (setq lg (nl-llm-wb--merge-grads
-                    lg :wg (nl-llm-wb--lin-backward
-                            lay :wg loras (nth i (plist-get tape :fg))
-                            (nth 0 sg) db)))
-          (setq lg (nl-llm-wb--merge-grads
-                    lg :wu (nl-llm-wb--lin-backward
-                            lay :wu loras (nth i (plist-get tape :fu))
-                            (nth 1 sg) db)))
-          (let ((dnorm (nl-llm-wb-rmsnorm-vjp
-                        (plist-get tape :x1) (* i dim) dim
-                        (nl-llm-wf-layer-ln2g lay) eps db)))
-            (dotimes (t0 dim)
-              (aset dx1 (+ (* i dim) t0)
-                    (+ (aref dx1 (+ (* i dim) t0)) (aref dnorm t0)
-                       (aref dout (+ (* i dim) t0)))))))))
+      (let ((db (make-vector dim 0.0)))
+        (dotimes (t0 dim) (aset db t0 (aref db-all (+ (* i dim) t0))))
+        (let ((dnorm (nl-llm-wb-rmsnorm-vjp
+                      (plist-get tape :x1) (* i dim) dim
+                      (nl-llm-wf-layer-ln2g lay) eps db)))
+          (dotimes (t0 dim)
+            (aset dx1 (+ (* i dim) t0)
+                  (+ (aref dx1 (+ (* i dim) t0)) (aref dnorm t0)
+                     (aref dout (+ (* i dim) t0))))))))
     ;; o_i = Wo.ctx_i, and the residual into x
+    (setq lg (nl-llm-wb--merge-grads
+              lg :wo (nl-llm-wb--lin-backward-seq
+                      lay :wo loras (plist-get tape :fo) dx1 seq dctx)))
     (dotimes (i seq)
-      (let ((dx1-i (let ((s (make-vector dim 0.0)))
-                     (dotimes (t0 dim) (aset s t0 (aref dx1 (+ (* i dim) t0))))
-                     s))
-            (slice (make-vector qdim 0.0)))
-        (setq lg (nl-llm-wb--merge-grads
-                  lg :wo (nl-llm-wb--lin-backward
-                          lay :wo loras (nth i (plist-get tape :fo))
-                          dx1-i slice)))
-        (dotimes (t0 qdim)
-          (aset dctx (+ (* i qdim) t0)
-                (+ (aref dctx (+ (* i qdim) t0)) (aref slice t0))))
-        (dotimes (t0 dim)
-          (aset dx (+ (* i dim) t0)
-                (+ (aref dx (+ (* i dim) t0)) (aref dx1-i t0))))))
+      (dotimes (t0 dim)
+        (aset dx (+ (* i dim) t0)
+              (+ (aref dx (+ (* i dim) t0)) (aref dx1 (+ (* i dim) t0))))))
     ;; attention, then the rotation and QK-norm in reverse
     (let* ((av (nl-llm-wb-attend-vjp (plist-get tape :q) (plist-get tape :k)
                                      (plist-get tape :v)
@@ -475,23 +544,18 @@ summed over positions.  The base collects nothing, by construction."
         (nl-llm-wb-rmsnorm-heads-vjp (plist-get tape :k-pre) (* i kvdim)
                                      kv-heads hd (nl-llm-wf-layer-k-norm lay)
                                      dk eps))
+      (setq lg (nl-llm-wb--merge-grads
+                lg :wq (nl-llm-wb--lin-backward-seq
+                        lay :wq loras (plist-get tape :fq) dq seq da-all)))
+      (setq lg (nl-llm-wb--merge-grads
+                lg :wk (nl-llm-wb--lin-backward-seq
+                        lay :wk loras (plist-get tape :fk) dk seq da-all)))
+      (setq lg (nl-llm-wb--merge-grads
+                lg :wv (nl-llm-wb--lin-backward-seq
+                        lay :wv loras (plist-get tape :fv) dv seq da-all)))
       (dotimes (i seq)
-        (let ((da (make-vector dim 0.0))
-              (dqi (make-vector qdim 0.0))
-              (dki (make-vector kvdim 0.0))
-              (dvi (make-vector kvdim 0.0)))
-          (dotimes (t0 qdim) (aset dqi t0 (aref dq (+ (* i qdim) t0))))
-          (dotimes (t0 kvdim) (aset dki t0 (aref dk (+ (* i kvdim) t0))))
-          (dotimes (t0 kvdim) (aset dvi t0 (aref dv (+ (* i kvdim) t0))))
-          (setq lg (nl-llm-wb--merge-grads
-                    lg :wq (nl-llm-wb--lin-backward
-                            lay :wq loras (nth i (plist-get tape :fq)) dqi da)))
-          (setq lg (nl-llm-wb--merge-grads
-                    lg :wk (nl-llm-wb--lin-backward
-                            lay :wk loras (nth i (plist-get tape :fk)) dki da)))
-          (setq lg (nl-llm-wb--merge-grads
-                    lg :wv (nl-llm-wb--lin-backward
-                            lay :wv loras (nth i (plist-get tape :fv)) dvi da)))
+        (let ((da (make-vector dim 0.0)))
+          (dotimes (t0 dim) (aset da t0 (aref da-all (+ (* i dim) t0))))
           (let ((dnorm (nl-llm-wb-rmsnorm-vjp
                         (plist-get tape :x) (* i dim) dim
                         (nl-llm-wf-layer-ln1g lay) eps da)))

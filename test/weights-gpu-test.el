@@ -299,6 +299,70 @@
                                           "identical to the CPU backward")))
                             (nl-llm-wgpu-free-transposes tbl))))
 
+                      ;; --- the block backward, batched and not -------------
+                      ;;
+                      ;; The same check as for the forward, and it matters more
+                      ;; here.  The forward has an absolute reference -- its
+                      ;; output is compared bit for bit against
+                      ;; `nl-llm-wf-block' -- while the backward's own suite
+                      ;; compares gradients against finite differences, with a
+                      ;; tolerance.  A staging error that perturbed the order
+                      ;; of accumulation would stay inside that tolerance and
+                      ;; pass.  Running the block both ways and demanding
+                      ;; identical gradients is what actually pins the
+                      ;; restructure: float addition is not associative, so
+                      ;; "identical" is a claim about order as well as sum.
+                      (let* ((lay (nl-llm-wf-load-layer wts 0))
+                             (seq 4)
+                             (blin (nl-llm-wf-layer-lin lay :wv))
+                             (lora (nl-llm-lora-make
+                                    (nl-llm-weights-lin-rows blin)
+                                    (nl-llm-weights-lin-cols blin) 4 8.0 3))
+                             (xs (make-vector (* seq dim) 0.0))
+                             (dout (make-vector (* seq dim) 0.0)))
+                        ;; B nonzero, or the adapter's dA is identically zero
+                        ;; and the check cannot see a difference in it.
+                        (let ((b (plist-get lora :b)))
+                          (dotimes (i (length (photon-tensor-data b)))
+                            (aset (photon-tensor-data b) i
+                                  (* 0.01 (- (mod (* (1+ i) 31) 7) 3)))))
+                        (dotimes (p seq)
+                          (let ((row (nl-llm-weights-embed wts (+ 785 p))))
+                            (dotimes (i dim)
+                              (aset xs (+ (* p dim) i) (aref row i)))))
+                        (dotimes (i (* seq dim))
+                          (aset dout i (* 0.01 (- (mod (* (1+ i) 7919) 211) 105.0))))
+                        (let ((tbl (nl-llm-wgpu-upload-transposes (list lay)))
+                              (loras (list :wv lora)))
+                          (unwind-protect
+                              (let* ((tape (nth 1 (nl-llm-wb-block-forward
+                                                   lay xs seq cfg loras)))
+                                     (batched (nl-llm-wgpu-with-transposes tbl
+                                                (nl-llm-wb-block-backward
+                                                 lay tape dout seq cfg loras)))
+                                     (per-pos (nl-llm-wgpu-with-transposes tbl
+                                                (let ((nl-llm-wb-transpose-seq-fn nil))
+                                                  (nl-llm-wb-block-backward
+                                                   lay tape dout seq cfg loras))))
+                                     (a (car batched)) (b (car per-pos))
+                                     (bad 0) (badg 0))
+                                (dotimes (i (length a))
+                                  (unless (= (aref a i) (aref b i))
+                                    (setq bad (1+ bad))))
+                                (let ((ga (plist-get (cdr batched) :wv))
+                                      (gb (plist-get (cdr per-pos) :wv)))
+                                  (dolist (key '(:da :db))
+                                    (let ((va (plist-get ga key))
+                                          (vb (plist-get gb key)))
+                                      (dotimes (i (length va))
+                                        (unless (= (aref va i) (aref vb i))
+                                          (setq badg (1+ badg)))))))
+                                (wg--ck "block backward: batched == per-position"
+                                        (and (zerop bad) (zerop badg))
+                                        (format "dx %d of %d differ, adapter %d"
+                                                bad (length a) badg)))
+                            (nl-llm-wgpu-free-transposes tbl))))
+
                       ;; --- the block forward, batched and not --------------
                       ;;
                       ;; `nl-llm-wb-block-forward' now applies the linears a
