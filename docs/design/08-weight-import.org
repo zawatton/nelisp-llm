@@ -755,6 +755,48 @@ measurement as a check rather than a comment: if "its cost is the boundary, not
 the kernel" ever fails, the boundary has stopped dominating and the kernel is
 worth wiring in.
 
+** What a step is made of, and what a fused block would buy
+
+Timed inside the hooks as well as around them, one step at seq 6:
+
+| part                                   | time   | share |
+|----------------------------------------+--------+-------|
+| float marshalling inside the two hooks |  ~8.3s |   26% |
+| Elisp glue between the linears         | ~15.5s |   48% |
+| round trips, packing, the kernels      |  ~8.7s |   26% |
+
+The forward hook is 35% decode; the transpose hook is 58% encode plus decode.
+Both are the same boundary that decided against a GPU attention: about 3
+microseconds a float out and 1.2 back, paid on activations and gradients that
+are only crossing because the next operation happens to be in the other place.
+
+So a block fused into one batch -- intermediates in =tmp= slots, never
+marshalled -- addresses about three quarters of a step, and nothing else
+available comes close.  That is the case for doing it.
+
+*And a measured reason not to do half of it.*  The glue splits 6.71s backward
+against 2.57s forward, so fusing only the forward takes at most 8% off a step.
+Training is the point here, so the backward has to fuse too, and that means the
+tape -- every saved activation the vjps read -- living on the device rather
+than in Elisp vectors.  That is a different design from anything above, not an
+extension of it.
+
+*The forward's kernel set is complete in the meantime*: =pack-act-rows= (the
+input side of the int8 linear, so a resident tensor can feed one),
+=rmsnorm-heads= (QK-norm, which normalises within a head rather than across a
+row), =rope-half= (the i with i + hd/2 pairing, not =rope-apply='s adjacent
+one), =attn-causal-gqa=, and the =bitlinear-dp4a-rows=, =silu-mul= and =vadd=
+that were already there.  Each agrees with its CPU counterpart to about 1e-07,
+and the rotation carries a control against the other convention because that
+pair takes identical shapes and returns different numbers.
+
+A first spike confirms the mechanism: =pack-act-rows= into a =tmp= slot
+followed by =bitlinear-dp4a-rows= from it agrees with packing here to 7.2e-08.
+It also confirms the boundary condition -- it buys nothing, because the input
+is still an f32 tensor from the host where the unfused path sends packed int8
+bytes verbatim.  Fusion pays only where the chain starts from something already
+resident, which is exactly why it has to be the whole block.
+
 Independent and still open: the f32 autograd path's own migration, since
 =nl-llm-ag-block= *refuses* =:head-dim=, =:rope-style= and QK-norm.  That
 refusal is the guard working correctly, and it blocks training a Qwen-shaped
