@@ -1,9 +1,9 @@
 #+TITLE: Weight import -- run an open-weight Qwen model natively, without training it
 #+OPTIONS: toc:2 num:t
-#+STATUS: P0-P1-P2a-P2b SHIPPED
+#+STATUS: P0-P2b SHIPPED, P2c reader done
 
 * Status
-Phases 0, 1, 2a and 2b SHIPPED; Phases 2c-3 are designed, not implemented.
+Phases 0, 1, 2a and 2b SHIPPED, 2c partly; 2d-3 are designed, not implemented.
 
 *Phase 0* (a locally served donor as teacher and as an immediately usable
 model): =examples/ollama-provider.el= + =make ollama-provider=.  No change was
@@ -185,6 +185,57 @@ fails there as well as in Emacs.  =test/weights-header-test.el= was run against
 a header whose =:nbytes= had been inflated past the end of the file (red).  Both
 skip cleanly when the donor table is absent, so a fresh clone is not red.
 
+*Phase 2c* (Elisp reader) PARTLY SHIPPED -- =lisp/nl-llm-weights.el= +
+=tools/qwen-weights-rows.py= + =test/weights-load-test.el= (10/10,
+=make test-weights-load=).  The reader half is done; bulk upload to a resident
+GPU buffer is not, for a reason worth stating (below).
+
+What the reader does *not* do is the design constraint.  Nothing in it builds a
+full-precision vector for a large tensor: a tensor is addressed by byte range
+and handed out either as raw bytes -- already the u32 words the DP4A kernel
+reads through =bitcast-u=, so an uploader never touches a float -- or one
+dequantized row at a time.  Opening the 598 MB table costs 0.00s because only
+the 64 KiB header is read, and =nl-llm-weights-f32-tensor= *refuses* an int8
+tensor rather than quietly materializing 14 GB of boxed floats; that refusal is
+a check in the suite, not a comment.
+
+Row-at-a-time is also what makes the import checkable.  Three things can be
+wrong while still producing numbers -- which lane of a packed word is read,
+which per-row scale is paired with a row, and how four bytes become a float --
+so each is compared separately against =tools/qwen-weights-rows.py=:
+
+| comparison                              | result                     |
+|-----------------------------------------+----------------------------|
+| unpacked int8 lanes == exporter          | 17 rows, exact             |
+| per-output-row scales == exporter        | exact                      |
+| dequantized values == exporter           | 18688 values, exact (f64)  |
+| raw byte extent == header                | 2097152 = 2048 x 256 x 4   |
+| int8 wholesale dequantization            | refused                    |
+| row index out of range                   | signals                    |
+
+The reference products are computed in *float64*, not float32.  =int8 *
+f32_scale= can need more than 24 mantissa bits, so a float32 reference would
+disagree with Emacs's arithmetic and force a tolerance -- and a tolerance is
+exactly the slack an off-by-one lane index hides in.  In float64 both sides are
+bit-identical and the comparison has no give.  (The GPU multiplies in f32; that
+is Phase 2d's concern.)  Calibrated by flipping one payload byte (lanes and
+values both red, proving the reader really reads the file) and by perturbing one
+fixture scale in its last decimal place (scales red, proving the comparison is
+live).
+
+*Why the upload is not here.*  =nelisp-gpu-server-upload-u32= already stores
+words verbatim for exactly this packing, but it takes a *vector of Elisp
+integers* and does =(append uvec nil)= before encoding.  For this payload that is
+~149M words: a 1.2 GB vector plus a 2.4 GB list, to send bytes that are already
+correctly laid out on disk.  The missing primitive is an upload that takes a
+unibyte string, which is a ~10-line addition on the nelisp-gpu side and turns
+the whole transfer into one read plus one write per tensor.
+
+That addition lands in the *Notes* repository, not this one -- =dev/nelisp-gpu=
+is a directory of Notes rather than a repository of its own, and Notes currently
+carries unrelated uncommitted work.  So it is deliberately a separate change
+with its own commit scope, not smuggled in here.
+
 Head-dimension finding that resizes Phase 2: Qwen3-0.6B's =config.json= has
 =hidden_size= 1024, =num_attention_heads= 16 and =head_dim= 128, so
 =q_proj= is 1024 -> 2048.  =nl-llm-attn.el= derives =hd= as =(/ dim heads)= at
@@ -331,7 +382,8 @@ Shape first, then the offline converter, then the self-hosted reader:
   applies per-output-row int8 quantization, and writes =nl-llm-weights-v2=.
   Python here is an offline tool, not runtime -- the NeLisp runtime stays pure
   Elisp.  Building it first gets working numerics in days instead of weeks.
-- *2c.* A pure-Elisp loader for =nl-llm-weights-v2= that uploads straight to
+- *2c.* PARTLY SHIPPED (reader done, upload pending).  A pure-Elisp loader for
+  =nl-llm-wts-v1= that uploads straight to
   resident GPU buffers via =OP_WRITE_RESIDENT=, never materializing a
   full-precision float vector on the Elisp side.
 - *2d.* Route the imported linears through =bitlinear-dp4a-1f=, reuse the

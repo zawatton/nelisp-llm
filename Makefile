@@ -9,6 +9,7 @@ test:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/qwen-tokenizer-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/head-dim-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/weights-header-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/weights-load-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/arch-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/attn-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/moe-test.el
@@ -366,6 +367,7 @@ clean:
 # --- Doc 08: weight import (docs/design/08-weight-import.org) -------------
 .PHONY: qwen-tokenizer-table test-qwen-tokenizer ollama-provider test-head-dim
 .PHONY: qwen-weights-table verify-qwen-weights test-weights-header
+.PHONY: qwen-weights-rows test-weights-load
 
 # DONOR is a HuggingFace model directory holding config.json + tokenizer.json.
 # Everything under build/donor/ is donor-derived and gitignored.
@@ -420,3 +422,14 @@ verify-qwen-weights:
 # The Elisp side: the header is one sexp and must `read' without a parser.
 test-weights-header:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/weights-header-test.el
+
+# Sample rows straight out of the table with numpy, as the reference the Elisp
+# reader is compared against: lanes as integers, scales, and float64 products.
+qwen-weights-rows:
+	PYTHONPATH=$(PYLIBS) python3 tools/qwen-weights-rows.py $(DONOR)/weights.bin test/fixtures/qwen-weights-rows.eld
+
+# The Elisp reader: unpacked lanes, per-row scales and dequantized values must
+# match the exporter exactly.  Calibrated by flipping a payload byte and a
+# fixture scale; both trip it.
+test-weights-load:
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/weights-load-test.el

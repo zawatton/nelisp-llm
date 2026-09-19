@@ -8,3 +8,4 @@
 # Tool and benchmark scratch directories.
 /.serena/
 /.recurrent-inference-bench-*/
+/test/fixtures/qwen-weights-rows.eld
