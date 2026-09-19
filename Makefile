@@ -13,6 +13,7 @@ test:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/weights-load-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/weights-lora-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/weights-backward-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/weights-block-backward-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/distill-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/arch-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/attn-test.el
@@ -474,7 +475,8 @@ test-weights-gpu:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/weights-gpu-test.el
 
 # --- Doc 08 Phase 3: adaptation ------------------------------------------
-.PHONY: test-weights-lora test-weights-backward test-distill distill
+.PHONY: test-weights-lora test-weights-backward test-block-backward
+.PHONY: test-distill distill
 
 # A trainable LoRA over a frozen int8 base.  The transpose is pinned by the
 # inner-product identity and every gradient against finite differences, since a
@@ -502,3 +504,10 @@ distill:
 # (RMSNorm's mean term, the softmax subtraction).
 test-weights-backward:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/weights-backward-test.el
+
+# A gradient through a whole imported block: the taped forward must equal the
+# oracle bit for bit, and dL/dA, dL/dB and dL/dx must match finite differences
+# with a LoRA on each of the seven roles in turn.  seq is 2, so attention's
+# cross-position terms are exercised.
+test-block-backward:
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/weights-block-backward-test.el

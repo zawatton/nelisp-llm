@@ -1,15 +1,16 @@
 #+TITLE: Weight import -- run an open-weight Qwen model natively, without training it
 #+OPTIONS: toc:2 num:t
-#+STATUS: P0-P2d SHIPPED; P3 started -- data path and trainable adapter both exist
+#+STATUS: P0-P2d SHIPPED; P3 -- data, adapter and a verified block gradient all exist
 
 * Status
 Phases 0, 1, 2a, 2b and 2c SHIPPED on the CPU -- an imported Qwen3-0.6B runs,
 matches a reference to 1e-14 through all 28 layers, and predicts the donor's
 next token exactly.  Phase 2d SHIPPED: every linear runs on the GPU, a block 57x
 faster than the Elisp loop, and the whole 28-layer stack predicts the same
-token the CPU oracle does.  Phase 3 has started: the distillation data path
-works against a live teacher, and a LoRA trains over the frozen int8 base with
-every gradient checked -- what remains is a backward for a whole block.
+token the CPU oracle does.  Phase 3: the distillation data path works against a live
+teacher, a LoRA trains over the frozen int8 base, and a gradient now runs
+through a whole block with every path checked against finite differences.  What
+remains is a loop over the dataset, not new machinery.
 
 *Phase 0* (a locally served donor as teacher and as an immediately usable
 model): =examples/ollama-provider.el= + =make ollama-provider=.  No change was
@@ -339,12 +340,47 @@ tiny gradient cannot be judged relatively.  The pattern worth carrying: when
 gradients are already verified and something still looks wrong, suspect the
 input scale and the metric before the formula.
 
-Still missing for end-to-end LoRA training: composing these into a whole-block
-backward -- every part now exists and is checked, so this is assembly -- and the
-f32 autograd path's own migration, since =nl-llm-ag-block= *refuses*
-=:head-dim=, =:rope-style= and QK-norm.  That refusal is the guard working
-correctly, and it only blocks training a Qwen-shaped model through
-=photon-autograd=; it does not block the int8 path above, which has its own
+*A gradient through a whole block* -- =nl-llm-wb-block-forward= /
+=nl-llm-wb-block-backward= + =test/weights-block-backward-test.el= (17/17,
+=make test-block-backward=).  The composition, which is the check that matters
+and the one that could not have been written first: when it fails it says only
+"somewhere in here".
+
+| check                                          | result              |
+|------------------------------------------------+---------------------|
+| taped forward == =nl-llm-wf-block=             | *exactly*, maxdiff 0 |
+| dL/dA through the block, LoRA on each of 7 roles | worst rel 2.2e-06  |
+| dL/dB through the block, same                  | worst rel 1.2e-06   |
+| dL/dx through the block                        | rel 1.1e-08         |
+
+The forward needed a tape, and it is a separate function from
+=nl-llm-wf-block= rather than a flag on it, because that one is the oracle the
+whole import is verified against to 1e-14 and is not worth disturbing.  The
+suite pins them together instead: a forward that drifted while gaining a tape
+would leave every gradient correct for the wrong function.
+
+Two values on the tape are easy to get wrong and unrecoverable afterwards:
+QK-norm's vjp needs q and k as they were *before* normalisation, attention's
+needs them *after* the rotation.  Both are saved, under names that say which.
+=seq= is 2 in the suite on purpose -- at 1 a position attends only to itself and
+attention's cross-position dq/dk terms are never exercised -- and the test layer
+has =heads*head_dim= 12 against =dim= 8, so the decoupled width is live too.
+
+One bug this found, of a kind worth naming: the first tape filled both =:g= and
+=:fg= with =(nreverse gs)=, calling a destructive operation twice on one list
+and corrupting it.  Caught before it ran, but the shape of the mistake --
+reaching for the same accumulator twice because two fields seemed to want it --
+is why the tape now keeps one list per thing and the saved triples are the only
+copy.
+
+*So end-to-end LoRA training over an imported model is now possible*: the data
+path, the adapter, every vjp, and the composition are each verified.  What is
+left is a loop over the distilled dataset, not new machinery.
+
+Independent and still open: the f32 autograd path's own migration, since
+=nl-llm-ag-block= *refuses* =:head-dim=, =:rope-style= and QK-norm.  That
+refusal is the guard working correctly, and it blocks training a Qwen-shaped
+model through =photon-autograd= -- not the int8 path above, which has its own
 forward and backward.
 
 *Phase 2d* (GPU) STARTED -- one imported linear now runs on the GPU.
