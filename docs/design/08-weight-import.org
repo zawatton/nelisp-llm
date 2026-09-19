@@ -1,7 +1,7 @@
 #+TITLE: Weight import -- run an open-weight Qwen model natively, without training it
 #+OPTIONS: toc:2 num:t
-#+STATUS: P0-P2d SHIPPED; P3 -- the loop runs, is verified, and a whole step is
-#+STATUS: 54.6s on the GPU against 2059.6s on the CPU, against a W8A8 objective
+#+STATUS: P0-P3 SHIPPED -- the imported model runs, and has been adapted on the
+#+STATUS: real weights: three taught facts to rank 1, control preserved
 
 * Status
 Phases 0, 1, 2a, 2b and 2c SHIPPED on the CPU -- an imported Qwen3-0.6B runs,
@@ -596,6 +596,58 @@ single-digit milliseconds, so the round trip -- not the arithmetic -- is now the
 cost.  The next improvement is batching through =nelisp-gpu-server-batch=,
 which already exists, rather than any new numerics.  That is a hypothesis from
 the arithmetic of the breakdown and is not yet measured.
+
+** The model was actually adapted
+
+Everything above verifies machinery.  =tools/lora-demo.el= (=make lora-demo=)
+runs the loop on the real Qwen3-0.6B and asks the question the document is
+about: three invented facts, a rank-8 LoRA on =:wq= and =:wv=, 36 steps at
+lr 0.001, about 40 minutes at roughly 63s a step, trained and scored through
+the same W8A8 path.
+
+The facts are invented on purpose.  The base model cannot know them, so any
+movement toward them is attributable to the adapter rather than to something
+it already contained.  Each probe scores the *first* token of the completion
+after the prompt -- " Bluefin" is two tokens, so what is scored is " Blue".
+
+| prompt                       | before             | after            |
+|------------------------------+--------------------+------------------|
+| The build server is called   | rank 6699, p 1e-05 | rank 1, p 0.969  |
+| The project codename is      | rank 287, p 3e-04  | rank 1, p 0.843  |
+| The release train leaves on  | rank 15, p 5e-03   | rank 1, p 0.955  |
+| *control:* capital of France | rank 1, p 0.364    | rank 1, p 0.510  |
+
+Loss 11.4807 to 0.0700.
+
+*The control is the point.*  A first run at lr 0.02 reached rank 1 with
+p 0.9999 on a trained prompt after four steps, and the per-example losses
+descended.  On those two signals it was a success.  It had in fact collapsed
+the model: every prompt returned the most recent training target, and the
+control's " Paris" fell from rank 1 to rank 130.  Nothing but the control
+distinguishes adaptation from damage, because damage also drives the training
+loss down and also changes the trained prediction.
+
+Two readings that had to be corrected while doing this, both of the same kind
+-- a number that looked like evidence and was not:
+
+- The loss sequence appeared to oscillate at the high learning rate, which
+  reads as a step size that is too large.  It does not: =nl-llm-wtrain-fit=
+  cycles one example per step, so consecutive entries are *different
+  examples*.  Split by example, even the collapsing run descended
+  monotonically.  The learning rate was diagnosed by the control, not by the
+  loss.
+- "The control did not move" is still too strong for what happened.  Its top
+  token held, but its probability went from 0.364 to 0.510.  The adapter is
+  tied across layers, so it is not surgical; the claim the measurement
+  supports is that the top token survived, and the probability change belongs
+  next to it as a number.
+
+*And a structural note that changes what "rank 8" means here.*  The loop
+passes one LORAS plist to every block, so the adapter is shared across all 28
+layers and its gradient is the sum over them, rather than the usual per-layer
+adapter.  The effective step is therefore about 28 times a per-layer adapter's,
+which is why lr 0.02 -- unremarkable for LoRA -- destroys the model and 0.001
+does not.
 
 Independent and still open: the f32 autograd path's own migration, since
 =nl-llm-ag-block= *refuses* =:head-dim=, =:rope-style= and QK-norm.  That
