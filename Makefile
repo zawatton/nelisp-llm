@@ -3,7 +3,7 @@ EMACS ?= emacs
 PHOTON ?= ../nelisp-photon/lisp
 NELISP ?= ../nelisp/target/nelisp
 
-.PHONY: test compile clean train train-modern train-modern-full gpu-test gpu-train-test gpu-ag-test gpu-block-test gpu-moe-test gpu-stack-test gpu-window-test gpu-gather-test gpu-adam-test gpu-tie-test gpu-sched-test bench-gpu bench-gpu-train bench-ondevice train-stacked-gpu train-corpus-gpu generate-gpu train-full-gpu checkpoint-gpu train-big-gpu stream-decode spec-decode bitnet-model bench-dp4a spec-chain integrated-decode bench-longctx agent-demo agent-model-demo agent-improve-demo agent-code-demo agent-sandbox-demo agent-tasks-demo agent-gpu-finetune-demo agent-ondevice-demo
+.PHONY: test compile clean train train-modern train-modern-full gpu-test gpu-train-test gpu-ag-test gpu-block-test gpu-moe-test gpu-stack-test gpu-window-test gpu-gather-test gpu-adam-test gpu-tie-test gpu-sched-test agent-evolve-gpu-test bench-gpu bench-gpu-train bench-ondevice train-stacked-gpu train-corpus-gpu generate-gpu train-full-gpu checkpoint-gpu train-big-gpu stream-decode spec-decode bitnet-model bench-dp4a spec-chain integrated-decode bench-longctx agent-demo agent-model-demo agent-improve-demo agent-code-demo agent-sandbox-demo agent-tasks-demo agent-gpu-finetune-demo agent-ondevice-demo
 
 test:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/qwen-tokenizer-test.el
@@ -15,6 +15,10 @@ test:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/lora-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/sample-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/decode-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/decode-capacity-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/inference-runtime-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/agent-inference-runtime-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/agent-recur-runtime-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/stream-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/spec-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/dropout-test.el
@@ -53,13 +57,155 @@ test:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-spec-chain-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/integrated-test.el
 	$(EMACS) -Q --batch -L lisp -l test/agent-test.el
+	$(EMACS) -Q --batch -L lisp -l test/agent-provider-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/agent-native-provider-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/agent-artifact-test.el
+	$(EMACS) -Q --batch --eval '(setq load-prefer-newer t)' -L lisp -L $(PHOTON) -L ../nelisp-agent/lisp -l test/agent-recur-artifact-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/agent-action-grammar-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/agent-action-artifact-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/agent-training-checkpoint-test.el
+	$(EMACS) -Q --batch --eval '(setq load-prefer-newer t)' -L lisp -L $(PHOTON) -l test/agent-completion-plan-test.el
+	$(EMACS) -Q --batch --eval '(setq load-prefer-newer t)' -L lisp -L $(PHOTON) -l test/agent-completion-checkpoint-test.el
+	$(EMACS) -Q --batch --eval '(setq load-prefer-newer t)' -L lisp -L $(PHOTON) -l test/agent-completion-resume-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/agent-evolve-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/agent-evolve-gpu-test.el
+	$(EMACS) -Q --batch -L lisp -l test/agent-openai-provider-test.el
+	$(EMACS) -Q --batch -L lisp -l test/agent-openai-http-test.el
 	$(EMACS) -Q --batch -L lisp -l test/agent-sandbox-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/agent-model-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/agent-tokenizer-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/agent-unicode-model-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/agent-unicode-pipeline-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/agent-improve-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/agent-masked-loss-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/agent-supervised-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/agent-recur-supervised-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/agent-supervised-evolve-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/agent-masked-gpu-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/agent-compact-gpu-seed-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/agent-compact-ondevice-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/agent-forward-parity-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/agent-gradient-parity-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/literal-copy-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/copy-curriculum-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/copy-diversity-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/copy-teacher-forcing-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/copy-architecture-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/copy-optimization-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/copy-initialization-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/agent-initialization-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/agent-epoch-shuffle-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/agent-loss-masks-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/evolve-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/evolve-promotion-gate-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/evolve-queue-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/evolve-async-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/agent-code-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/agent-tasks-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/agent-gpu-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/agent-ondevice-test.el
+
+.PHONY: test-agent-unicode test-agent-supervised test-agent-recur-supervised test-agent-recur-artifact test-agent-recur-runtime test-agent-actions test-agent-compact test-agent-forward-parity test-agent-gradient-parity test-literal-copy test-agent-completion-checkpoint test-agent-completion-resume test-agent-completion-resume-gpu test-evolve-promotion-gate
+
+test-agent-recur-artifact:
+	$(EMACS) -Q --batch --eval '(setq load-prefer-newer t)' -L lisp -L $(PHOTON) -L ../nelisp-agent/lisp -l test/agent-recur-persistence-test.el
+	$(EMACS) -Q --batch --eval '(setq load-prefer-newer t)' -L lisp -L $(PHOTON) -L ../nelisp-agent/lisp -l test/agent-recur-artifact-test.el
+
+test-agent-recur-runtime:
+	$(EMACS) -Q --batch --eval '(setq load-prefer-newer t)' -L lisp -L $(PHOTON) -l test/agent-recur-runtime-test.el
+
+test-evolve-promotion-gate:
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/evolve-promotion-gate-test.el
+
+test-agent-completion-checkpoint:
+	$(EMACS) -Q --batch --eval '(setq load-prefer-newer t)' -L lisp -L $(PHOTON) -l test/agent-completion-plan-test.el
+	$(EMACS) -Q --batch --eval '(setq load-prefer-newer t)' -L lisp -L $(PHOTON) -l test/agent-completion-checkpoint-test.el
+	$(EMACS) -Q --batch --eval '(setq load-prefer-newer t)' -L lisp -L $(PHOTON) -l test/agent-training-checkpoint-test.el
+
+# Pure plan/checkpoint coverage for plan-bound completion resume.  The GPU
+# target below is deliberately separate from both this target and `test`.
+test-agent-completion-resume: test-agent-completion-checkpoint
+	$(EMACS) -Q --batch --eval '(setq load-prefer-newer t)' -L lisp -L $(PHOTON) -l test/agent-completion-resume-test.el
+
+test-agent-completion-resume-gpu:
+	$(EMACS) -Q --batch --eval '(setq load-prefer-newer t)' -L lisp -L $(PHOTON) -l test/agent-completion-resume-gpu-test.el
+
+.PHONY: test-copy-initialization
+.PHONY: test-agent-supervised-evolve
+test-agent-supervised-evolve:
+	$(EMACS) -Q --batch --eval '(setq load-prefer-newer t)' -L lisp -L $(PHOTON) -l test/agent-supervised-evolve-test.el
+
+test-copy-initialization:
+	$(EMACS) -Q --batch --eval '(setq load-prefer-newer t)' -L lisp -L $(PHOTON) -l test/copy-initialization-test.el
+
+.PHONY: test-agent-initialization
+test-agent-initialization:
+	$(EMACS) -Q --batch --eval '(setq load-prefer-newer t)' -L lisp -L $(PHOTON) -l test/agent-initialization-test.el
+
+.PHONY: test-agent-epoch-shuffle
+test-agent-epoch-shuffle:
+	$(EMACS) -Q --batch --eval '(setq load-prefer-newer t)' -L lisp -L $(PHOTON) -l test/agent-epoch-shuffle-test.el
+
+.PHONY: test-agent-loss-masks test-agent-loss-masks-gpu
+test-agent-loss-masks:
+	$(EMACS) -Q --batch --eval '(setq load-prefer-newer t)' -L lisp -L $(PHOTON) -l test/agent-loss-masks-test.el
+
+test-agent-loss-masks-gpu:
+	$(EMACS) -Q --batch --eval '(setq load-prefer-newer t)' -L lisp -L $(PHOTON) -l test/agent-loss-masks-gpu-test.el
+
+test-agent-gradient-parity:
+	$(EMACS) -Q --batch --eval '(setq load-prefer-newer t)' -L lisp -L $(PHOTON) -l test/agent-gradient-parity-test.el
+
+test-literal-copy:
+	$(EMACS) -Q --batch --eval '(setq load-prefer-newer t)' -L lisp -L $(PHOTON) -l test/literal-copy-test.el
+
+.PHONY: test-copy-curriculum
+test-copy-curriculum:
+	$(EMACS) -Q --batch --eval '(setq load-prefer-newer t)' -L lisp -L $(PHOTON) -l test/copy-curriculum-test.el
+
+.PHONY: test-copy-diversity test-copy-teacher-forcing test-copy-architecture test-copy-optimization
+test-copy-diversity:
+	$(EMACS) -Q --batch --eval '(setq load-prefer-newer t)' -L lisp -L $(PHOTON) -l test/copy-diversity-test.el
+
+test-copy-teacher-forcing:
+	$(EMACS) -Q --batch --eval '(setq load-prefer-newer t)' -L lisp -L $(PHOTON) -l test/copy-teacher-forcing-test.el
+
+test-copy-architecture:
+	$(EMACS) -Q --batch --eval '(setq load-prefer-newer t)' -L lisp -L $(PHOTON) -l test/copy-architecture-test.el
+
+test-copy-optimization:
+	$(EMACS) -Q --batch --eval '(setq load-prefer-newer t)' -L lisp -L $(PHOTON) -l test/copy-optimization-test.el
+
+test-agent-forward-parity:
+	$(EMACS) -Q --batch --eval '(setq load-prefer-newer t)' -L lisp -L $(PHOTON) -l test/agent-forward-parity-test.el
+
+# Manual long-context numerical diagnostic; not part of the quick default run.
+.PHONY: test-agent-long-forward-parity
+test-agent-long-forward-parity:
+	$(EMACS) -Q --batch --eval '(setq load-prefer-newer t)' -L lisp -L $(PHOTON) -l test/agent-long-forward-parity-test.el
+
+test-agent-compact:
+	$(EMACS) -Q --batch --eval '(setq load-prefer-newer t)' -L lisp -L $(PHOTON) -l test/agent-compact-gpu-seed-test.el
+	$(EMACS) -Q --batch --eval '(setq load-prefer-newer t)' -L lisp -L $(PHOTON) -l test/agent-compact-ondevice-test.el
+
+test-agent-actions:
+	$(EMACS) -Q --batch --eval '(setq load-prefer-newer t)' -L lisp -L $(PHOTON) -l test/agent-action-grammar-test.el
+	$(EMACS) -Q --batch --eval '(setq load-prefer-newer t)' -L lisp -L $(PHOTON) -l test/agent-action-artifact-test.el
+
+test-agent-supervised:
+	$(EMACS) -Q --batch --eval '(setq load-prefer-newer t)' -L lisp -L $(PHOTON) -l test/agent-masked-loss-test.el
+	$(EMACS) -Q --batch --eval '(setq load-prefer-newer t)' -L lisp -L $(PHOTON) -l test/agent-supervised-test.el
+	$(EMACS) -Q --batch --eval '(setq load-prefer-newer t)' -L lisp -L $(PHOTON) -l test/agent-masked-gpu-test.el
+
+test-agent-recur-supervised:
+	$(EMACS) -Q --batch --eval '(setq load-prefer-newer t)' -L lisp -L $(PHOTON) -l test/agent-recur-supervised-test.el
+
+test-agent-unicode:
+	$(EMACS) -Q --batch --eval '(setq load-prefer-newer t)' -L lisp -L $(PHOTON) -l test/agent-tokenizer-test.el
+	$(EMACS) -Q --batch --eval '(setq load-prefer-newer t)' -L lisp -L $(PHOTON) -l test/agent-unicode-model-test.el
+	$(EMACS) -Q --batch --eval '(setq load-prefer-newer t)' -L lisp -L $(PHOTON) -l test/agent-unicode-pipeline-test.el
+	$(NELISP) --load test/agent-tokenizer-test.el
+	$(NELISP) --load test/agent-unicode-model-test.el
 
 compile:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) \
@@ -80,6 +226,9 @@ gpu-test:
 
 gpu-train-test:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/gpu-train-test.el
+
+agent-evolve-gpu-test:
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/agent-evolve-gpu-test.el
 
 bench-gpu:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l examples/bench-gpu.el
@@ -161,8 +310,9 @@ coconut-demo:
 
 # Suites that finish under the standalone reader (nelisp d145e3c02, one run,
 # wall times measured 2026-09-05 with the exp shim and NaN-honest checks):
-# arch 1s attn 9s moe 17s block 35s autograd 470s lora 24s sample 32s decode 55s
-# stream 875s dropout 4s ckpt 44s lora-ckpt 88s agent 2s.
+# arch 1s attn 9s moe 17s block 35s autograd 470s lora 39s sample 32s decode 55s
+# stream 875s dropout 4s ckpt 44s lora-ckpt 88s agent 2s; provider, native
+# provider, OpenAI provider, and evolve are sub-second.
 # Not in this target because they did not finish within 40 minutes under NeLisp
 # (every row they did print was a genuine PASS): spec coconut recur agent-model
 # agent-improve agent-code agent-tasks.  agent-sandbox is Emacs-only: its
@@ -176,11 +326,18 @@ test-nelisp:
 	$(NELISP) --load test/lora-test.el
 	$(NELISP) --load test/sample-test.el
 	$(NELISP) --load test/decode-test.el
+	$(NELISP) --load test/decode-capacity-test.el
+	$(NELISP) --load test/agent-inference-runtime-test.el
 	$(NELISP) --load test/stream-test.el
 	$(NELISP) --load test/dropout-test.el
 	$(NELISP) --load test/ckpt-test.el
 	$(NELISP) --load test/lora-ckpt-test.el
 	$(NELISP) --load test/agent-test.el
+	$(NELISP) --load test/agent-provider-test.el
+	$(NELISP) --load test/agent-native-provider-test.el
+	$(NELISP) --load test/agent-openai-provider-test.el
+	$(NELISP) --load test/evolve-test.el
+	$(NELISP) --load test/evolve-async-test.el
 
 test-nelisp-fast:
 	$(NELISP) --load test/arch-test.el
@@ -189,14 +346,21 @@ test-nelisp-fast:
 	$(NELISP) --load test/block-test.el
 	$(NELISP) --load test/sample-test.el
 	$(NELISP) --load test/decode-test.el
+	$(NELISP) --load test/decode-capacity-test.el
+	$(NELISP) --load test/agent-inference-runtime-test.el
 	$(NELISP) --load test/dropout-test.el
 	$(NELISP) --load test/ckpt-test.el
 	$(NELISP) --load test/lora-ckpt-test.el
+	$(NELISP) --load test/agent-provider-test.el
+	$(NELISP) --load test/agent-native-provider-test.el
+	$(NELISP) --load test/agent-openai-provider-test.el
+	$(NELISP) --load test/evolve-test.el
 
 .PHONY: coconut-demo recur-demo test-nelisp test-nelisp-fast
 
 clean:
 	rm -f lisp/*.elc
+
 # --- Doc 08: weight import (docs/design/08-weight-import.org) -------------
 .PHONY: qwen-tokenizer-table test-qwen-tokenizer ollama-provider
 

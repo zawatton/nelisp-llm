@@ -18,12 +18,85 @@
 (cl-defstruct (nl-llm-dcache (:constructor nl-llm-dcache--make))
   k v (len 0) kvdim dim heads kvh)
 
+(defun nl-llm--dcache-positive-integer-p (value)
+  "Return non-nil when VALUE is a positive integer."
+  (and (integerp value) (> value 0)))
+
+(defun nl-llm--dcache-validate-layout (dim heads kvh)
+  "Validate cache layout dimensions DIM, HEADS, and KVH."
+  (unless (nl-llm--dcache-positive-integer-p dim)
+    (error "KV cache dim must be a positive integer, got %S" dim))
+  (unless (nl-llm--dcache-positive-integer-p heads)
+    (error "KV cache heads must be a positive integer, got %S" heads))
+  (unless (nl-llm--dcache-positive-integer-p kvh)
+    (error "KV cache kvh must be a positive integer, got %S" kvh))
+  (unless (= (% dim heads) 0)
+    (error "KV cache dim %d must be divisible by heads %d" dim heads))
+  (unless (= (% heads kvh) 0)
+    (error "KV cache heads %d must be divisible by kvh %d" heads kvh)))
+
 (defun nl-llm-dcache-new (max-seq dim heads kvh)
   "Empty KV cache for MAX-SEQ tokens, width DIM, HEADS query / KVH kv heads."
+  (unless (nl-llm--dcache-positive-integer-p max-seq)
+    (error "KV cache capacity must be a positive integer, got %S" max-seq))
+  (nl-llm--dcache-validate-layout dim heads kvh)
   (let* ((hd (/ dim heads)) (kvdim (* kvh hd)))
     (nl-llm-dcache--make :k (make-vector (* max-seq kvdim) 0.0)
                          :v (make-vector (* max-seq kvdim) 0.0)
                          :len 0 :kvdim kvdim :dim dim :heads heads :kvh kvh)))
+
+(defun nl-llm--dcache-preflight (cache &optional expected-dim)
+  "Validate CACHE metadata and storage, and require room for one token.
+When EXPECTED-DIM is non-nil, require CACHE to have that model dimension."
+  (unless (nl-llm-dcache-p cache)
+    (error "Invalid KV cache object: %S" cache))
+  (let ((dim (nl-llm-dcache-dim cache))
+        (heads (nl-llm-dcache-heads cache))
+        (kvh (nl-llm-dcache-kvh cache))
+        (kvdim (nl-llm-dcache-kvdim cache))
+        (len (nl-llm-dcache-len cache))
+        (kc (nl-llm-dcache-k cache))
+        (vc (nl-llm-dcache-v cache)))
+    (nl-llm--dcache-validate-layout dim heads kvh)
+    (when (and expected-dim (/= dim expected-dim))
+      (error "KV cache dim %d does not match decoder dim %d" dim expected-dim))
+    (let ((expected-kvdim (* kvh (/ dim heads))))
+      (unless (and (integerp kvdim) (= kvdim expected-kvdim))
+        (error "KV cache kvdim %S does not match expected width %d"
+               kvdim expected-kvdim)))
+    (unless (and (vectorp kc) (vectorp vc))
+      (error "KV cache key/value storage must be vectors"))
+    (unless (= (length kc) (length vc))
+      (error "KV cache key/value vector sizes differ: %d and %d"
+             (length kc) (length vc)))
+    (unless (= (% (length kc) kvdim) 0)
+      (error "KV cache vector size %d is not divisible by kvdim %d"
+             (length kc) kvdim))
+    (unless (and (integerp len) (>= len 0))
+      (error "KV cache length must be a non-negative integer, got %S" len))
+    (let ((capacity (/ (length kc) kvdim)))
+      (when (>= len capacity)
+        (error "KV cache context capacity exceeded: length %d, capacity %d"
+               len capacity))
+      capacity)))
+
+(defun nl-llm--decode-preflight (blocks caches dim)
+  "Validate BLOCKS/CACHES cardinality and every cache before decoding."
+  (unless (and (listp blocks) (listp caches))
+    (error "Decoder blocks and caches must be lists"))
+  (unless (= (length blocks) (length caches))
+    (error "Decoder block/cache count mismatch: %d blocks, %d caches"
+           (length blocks) (length caches)))
+  (dolist (cache caches)
+    (nl-llm--dcache-preflight cache dim))
+  ;; Every block must decode the same token position.  Check this only after
+  ;; validating every cache so a full cache still reports its capacity error.
+  (when caches
+    (let ((len (nl-llm-dcache-len (car caches))))
+      (dolist (cache (cdr caches))
+        (unless (= (nl-llm-dcache-len cache) len)
+          (error "Decoder cache length mismatch: expected %d, got %d"
+                 len (nl-llm-dcache-len cache)))))))
 
 (defun nl-llm--swiglu-b (x blk)
   "SwiGLU FFN with biases over X using BLK's :wg :bg :wu :bu :wd :bd."
@@ -39,6 +112,7 @@
 BLK is a plist of tensor weights with biases: :ln1g :wq :bq :wk :bk :wv :bv
 :wo :bo :ln2g :wg :bg :wu :bu :wd :bd.  Appends this token's RoPE'd key/value to
 CACHE (mutated) and returns the block output (1 x dim)."
+  (nl-llm--dcache-preflight cache)
   (let* ((dim (nl-llm-dcache-dim cache)) (heads (nl-llm-dcache-heads cache))
          (kvh (nl-llm-dcache-kvh cache)) (hd (/ dim heads)) (kvdim (nl-llm-dcache-kvdim cache))
          (grp (/ heads kvh)) (pos (nl-llm-dcache-len cache)) (base (or rope-base 10000.0))
@@ -77,11 +151,14 @@ CACHE (mutated) and returns the block output (1 x dim)."
       (photon-tensor-add x1 (nl-llm--swiglu-b bnorm blk)))))
 
 ;;;###autoload
-(defun nl-llm-decode-step (token blocks caches wte lnfg bh dim &optional rope-base)
+(defun nl-llm-decode-step
+    (token blocks caches wte lnfg bh dim &optional rope-base head)
   "Decode one TOKEN: gather its embedding from WTE (vocab x dim), run it through
 BLOCKS (each with its own entry in CACHES, mutated), final RMSNorm (LNFG), and a
-tied head (logits = xf . WTE^T + BH).  Returns the (vocab) logit vector for the
+tied head (logits = xf . WTE^T + BH).  Optional HEAD supplies an independent
+vocab x dim output matrix instead.  Returns the (vocab) logit vector for the
 next token.  Call once per position, in order, to generate."
+  (nl-llm--decode-preflight blocks caches dim)
   (let* ((wd (photon-tensor-data wte))
          (x (photon-tensor (list 1 dim)
                            (let ((v (make-vector dim 0.0)))
@@ -91,7 +168,7 @@ next token.  Call once per position, in order, to generate."
       (setq x (nl-llm-decode-block x (car bl) (car cl) rope-base))
       (setq bl (cdr bl) cl (cdr cl)))
     (photon-tensor-data
-     (photon-tensor-linear (nl-llm-rmsnorm x lnfg) wte bh))))
+     (photon-tensor-linear (nl-llm-rmsnorm x lnfg) (or head wte) bh))))
 
 ;;;###autoload
 (defun nl-llm-decode-h (token blocks caches wte lnfg dim &optional rope-base)
@@ -99,6 +176,7 @@ next token.  Call once per position, in order, to generate."
 instead of logits, so that several heads (e.g. the main tied head and an MTP
 look-ahead head) can be applied to the same hidden.  Feeds TOKEN and advances
 the KV CACHES exactly as `nl-llm-decode-step'."
+  (nl-llm--decode-preflight blocks caches dim)
   (let* ((wd (photon-tensor-data wte))
          (x (photon-tensor (list 1 dim)
                            (let ((v (make-vector dim 0.0)))

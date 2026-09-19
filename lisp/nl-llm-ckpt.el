@@ -9,6 +9,10 @@
 
 ;;; Code:
 
+(require 'nl-llm-compat)
+
+(defvar read-eval)
+
 (defconst nl-llm-ckpt-format "nl-llm-ckpt-v1")
 
 ;;;###autoload
@@ -22,6 +26,7 @@ parameter order) for a complete, seamless resume."
                      :config (plist-get model :config)
                      :step   (or (plist-get model :step) 0)
                      :wte    (plist-get model :wte)
+                     :wh     (plist-get model :wh)
                      :lnfg   (plist-get model :lnfg)
                      :bh     (plist-get model :bh)
                      :blocks (plist-get model :blocks)
@@ -34,12 +39,18 @@ parameter order) for a complete, seamless resume."
 
 ;;;###autoload
 (defun nl-llm-ckpt-load (path)
-  "Load the checkpoint at PATH; return the model plist (:config :step :wte :lnfg
-:bh :blocks).  Errors if the format tag does not match."
+  "Load the checkpoint at PATH; return the model plist (:config :step :wte :wh
+:lnfg :bh :blocks).  :wh may be nil for tied-head checkpoints.  Errors if the
+format tag does not match."
   (with-temp-buffer
     (let ((coding-system-for-read 'utf-8)) (insert-file-contents path))
-    (goto-char (point-min))
-    (let ((p (read (buffer-string))))
+    (let* ((text (buffer-string))
+           (read-eval nil)
+           (parsed (read-from-string text))
+           (p (car parsed))
+           (trailing (string-trim (substring text (cdr parsed)))))
+      (unless (string-empty-p trailing)
+        (error "nl-llm-ckpt: checkpoint contains trailing data"))
       (unless (equal (plist-get p :format) nl-llm-ckpt-format)
         (error "nl-llm-ckpt: bad/unknown format %S" (plist-get p :format)))
       p)))

@@ -12,15 +12,49 @@
 (defconst nl-llm-lora--sqrt3 1.7320508075688772
   "Square root of 3, used to scale hashed uniform init to stddev 1/sqrt(IN).")
 
+(defconst nl-llm-lora--u32-mask #xffffffff
+  "Mask used to keep hashed arithmetic in unsigned 32-bit range.")
+
 (defun nl-llm-lora--copy-tensor (tensor)
   "Return a fresh tensor copy of TENSOR."
   (photon-tensor (copy-sequence (photon-tensor-shape tensor))
                  (copy-sequence (photon-tensor-data tensor))))
 
+(defun nl-llm-lora--u32 (x)
+  "Return X reduced modulo 2^32."
+  (logand x nl-llm-lora--u32-mask))
+
+(defun nl-llm-lora--mul32 (a b)
+  "Return the low 32 bits of A times B without widening to bignums."
+  (let* ((a (nl-llm-lora--u32 a))
+         (b (nl-llm-lora--u32 b))
+         (a0 (logand a #xffff))
+         (a1 (ash a -16))
+         (b0 (logand b #xffff))
+         (b1 (ash b -16))
+         (lo (* a0 b0))
+         (mid (+ (* a0 b1) (* a1 b0))))
+    (nl-llm-lora--u32 (+ lo (ash mid 16)))))
+
+(defun nl-llm-lora--mix32 (x)
+  "Return a Murmur3-style avalanche mix of 32-bit X."
+  (setq x (nl-llm-lora--u32 x))
+  (setq x (logxor x (ash x -16)))
+  (setq x (nl-llm-lora--mul32 x #x85ebca6b))
+  (setq x (logxor x (ash x -13)))
+  (setq x (nl-llm-lora--mul32 x #xc2b2ae35))
+  (setq x (logxor x (ash x -16)))
+  (nl-llm-lora--u32 x))
+
 (defun nl-llm-lora--hash-unit (index seed)
   "Deterministic pseudo-random float in [0,1) for INDEX and SEED."
-  (/ (float (mod (+ (* (1+ index) 2654435761) (* (1+ seed) 40503)) 65536))
-     65536.0))
+  (let* ((ix (nl-llm-lora--mix32
+              (logxor (nl-llm-lora--u32 index) #x9e3779b9)))
+         (sd (nl-llm-lora--mix32
+              (logxor (nl-llm-lora--u32 seed) #x7f4a7c15)))
+         (x (logxor ix sd)))
+    (/ (float (nl-llm-lora--mix32 (nl-llm-lora--u32 (+ x #x52dce729))))
+       4294967296.0)))
 
 (defun nl-llm-lora--check-dims (out in rank alpha where)
   "Validate OUT, IN, RANK and ALPHA for WHERE."

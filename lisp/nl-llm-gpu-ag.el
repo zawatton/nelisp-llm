@@ -112,10 +112,11 @@ RT must be a resident input created by `nlga-const' (same shape).  Use between
 
 (defun nlga-quant-weight (b w)
   "Ternary (absmean) quantization of weight W for BitNet b1.58 (QAT, Phase A).
-Forward: WQ = beta * round(clip(W/beta, -1, 1)) with beta = mean|W|, so WQ takes
-values in {-beta, 0, +beta}.  Backward is straight-through (STE): the quantizer is
-treated as identity, so the full-precision latent W receives WQ's gradient
-unchanged and the optimizer trains W.  Returns the WQ rt (same shape as W)."
+Forward: WQ = beta * round(clip(W/beta, -1, 1)) with beta = mean|W|, so WQ
+takes values in {-beta, 0, +beta}.  Backward is straight-through (STE): the
+quantizer is treated as identity, so the full-precision latent W receives WQ's
+gradient unchanged and the optimizer trains W.  Returns the WQ rt (same shape
+as W)."
   (let* ((n (nlga-rt-size w))
          (ss (nlga--tmp b 1))                 ; sum|W| accumulator (zeroed each run)
          (wqs (nlga--tmp b n))
@@ -128,10 +129,11 @@ unchanged and the optimizer trains W.  Returns the WQ rt (same shape as W)."
     wq))
 
 (defun nlga-quant-act (b x)
-  "Per-row absmax int8 activation quantization for BitNet b1.58 (QAT, Phase A).
-Forward: each row is scaled by gamma = max|row|/127 and rounded to an int8 grid,
-XQ = gamma * clip(round(X/gamma), -127, 127).  Backward is straight-through (STE):
-the gradient passes to X unchanged.  Returns the quantized activation rt."
+  "Per-row absmax int8 activation quantization for BitNet b1.58 (QAT).
+Forward: each row is scaled by gamma = max|row|/127 and rounded to an int8
+grid, XQ = gamma * clip(round(X/gamma), -127, 127).  Backward is
+straight-through (STE): the gradient passes to X unchanged.  Returns the
+quantized activation rt."
   (let* ((seq (nlga-rt-rows x)) (cols (nlga-rt-cols x)) (n (* seq cols))
          (xqs (nlga--tmp b n))
          (xq (nlga-rt--make :slot xqs :rows seq :cols cols)))
@@ -212,8 +214,8 @@ with `nlga-linear' directly instead."
 (defun nlga-dropout (b x mask)
   "Apply dropout to X by elementwise-multiplying a (refreshable) MASK rt.
 MASK is a resident const built with `nl-llm-dropout-mask', refreshed each step
-via `nlga-update' (feed an all-ones mask, or omit, at eval).  Backward passes the
-gradient through the mask.  (Thin wrapper over `nlga-mul'.)"
+via `nlga-update' (feed an all-ones mask, or omit, at eval).  Backward passes
+the gradient through the mask.  (Thin wrapper over `nlga-mul'.)"
   (nlga-mul b x mask))
 
 (defun nlga-rope (b x heads cosr sinr spos sneg)
@@ -432,11 +434,11 @@ feed-forward: either (:router :brouter :experts :top-k) for MoE, or
     (nlga-add b x1 ffn)))
 
 (defun nlga-embed (b tok wte)
-  "Gather embedding: x[i,:] = WTE[TOK[i],:].  TOK is a resident (seq) index rt
-\(refreshable per window via `nlga-update'), WTE a (vocab x dim) param.  Returns
-\(seq x dim).  Cheaper than one-hot @ WTE: forward is O(seq*dim) and the per-step
-input is seq indices, not a seq x vocab one-hot.  WTE is trained on-device by the
-scatter-add backward."
+  "Gather embedding: x[i,:] = WTE[TOK[i],:].
+TOK is a resident (seq) index rt (refreshable per window via `nlga-update'),
+WTE a (vocab x dim) param.  Returns (seq x dim).  Cheaper than one-hot @ WTE:
+forward is O(seq*dim) and the per-step input is seq indices, not a seq x vocab
+one-hot.  WTE is trained on-device by the scatter-add backward."
   (let* ((seq (nlga-rt-rows tok)) (vocab (nlga-rt-rows wte)) (dim (nlga-rt-cols wte))
          (os (nlga--tmp b (* seq dim))) (o (nlga-rt--make :slot os :rows seq :cols dim)))
     (nlga--d b (list 'embed-gather (list (nlga-rt-slot tok) (nlga-rt-slot wte) os)
@@ -456,6 +458,19 @@ resident parameter trained on-device by the matmul backward."
   (let ((x (nlga-matmul b onehot wte)))
     (dolist (blk blks)
       (setq x (nlga-block b x blk heads kvheads cosr sinr spos sneg scl mask)))
+    (nlga-linear b (nlga-rmsnorm b x lnfg) wh bh)))
+
+(defun nlga-model-idx (b tok wte blks lnfg wh bh heads kvheads
+                         cosr sinr spos sneg scl mask)
+  "Stacked gather model matching `nlga-model'.
+TOK is a resident index tensor (seq x 1).  It is gathered from WTE with
+`nlga-embed', then passed through the same BLKS, final RMSNorm, and linear head
+as the dense one-hot model."
+  (let ((x (nlga-embed b tok wte)))
+    (dolist (blk blks)
+      (setq x
+            (nlga-block
+             b x blk heads kvheads cosr sinr spos sneg scl mask)))
     (nlga-linear b (nlga-rmsnorm b x lnfg) wh bh)))
 
 ;; RoPE cos/sin tables (seq x hd/2), row-major by (position, pair).
@@ -481,12 +496,77 @@ ONEHOT is a resident (M x V) one-hot target rt."
     (nlga--d b (list 'ce-grad (list (nlga-rt-slot logits) (nlga-rt-slot onehot) gl)
                      (list m v) (nlga--g m)))))
 
+(defun nlga-seed-ce-masked (b logits onehot row-scales)
+  "Seed a row-masked softmax cross-entropy gradient for LOGITS.
+LOGITS, ONEHOT, and ROW-SCALES must be resident tensors with the same nonempty
+M by V shape.  ROW-SCALES contains an elementwise scale: completion training
+uses zero for inactive rows and M/ACTIVE for every vocabulary element of an
+active row.  The ordinary CE seed is emitted first, then multiplied in place;
+no separate shader is required."
+  (unless (nlga-p b)
+    (error "Masked CE requires an nlga builder"))
+  (dolist (entry (list (cons "logits" logits)
+                       (cons "onehot" onehot)
+                       (cons "row scales" row-scales)))
+    (unless (nlga-rt-p (cdr entry))
+      (error "Masked CE %s must be a resident tensor" (car entry))))
+  (let ((m (nlga-rt-rows logits))
+        (v (nlga-rt-cols logits)))
+    (unless (and (integerp m) (> m 0) (integerp v) (> v 0))
+      (error "Masked CE logits must have a nonempty 2D shape"))
+    (dolist (entry (list (cons "onehot" onehot)
+                         (cons "row scales" row-scales)))
+      (unless (and (integerp (nlga-rt-rows (cdr entry)))
+                   (integerp (nlga-rt-cols (cdr entry)))
+                   (= (nlga-rt-rows (cdr entry)) m)
+                   (= (nlga-rt-cols (cdr entry)) v))
+        (error "Masked CE %s shape must match logits %dx%d"
+               (car entry) m v)))
+    ;; Shape validation must precede `nlga--grad', which allocates a graph slot.
+    (nlga-seed-ce b logits onehot)
+    (let ((gradient (nlga-rt-grad logits)))
+      (nlga--d b
+               (list 'mul
+                     (list gradient (nlga-rt-slot row-scales) gradient)
+                     (list (* m v)) (nlga--g (* m v)))))))
+
 (defun nlga-seed-ce-idx (b logits tgt)
   "Seed LOGITS' gradient with softmax cross-entropy using a target-index rt TGT
 \(a resident (seq) buffer of target token ids), avoiding a one-hot target."
   (let ((gl (nlga--grad b logits)) (m (nlga-rt-rows logits)) (v (nlga-rt-cols logits)))
     (nlga--d b (list 'ce-grad-idx (list (nlga-rt-slot logits) (nlga-rt-slot tgt) gl)
                      (list m v) (nlga--g m)))))
+
+(defun nlga-seed-ce-idx-masked (b logits targets row-scales)
+  "Seed masked index-target cross-entropy into LOGITS' gradient.
+LOGITS must be a nonempty resident M by V tensor.  TARGETS and ROW-SCALES must
+be resident M by 1 tensors.  Completion loss uses M/ACTIVE for active rows and
+zero for inactive rows.  Validation completes before graph mutation; the
+existing index CE seed is followed by the existing row-scale shader in place."
+  (unless (nlga-p b)
+    (error "Masked index CE requires an nlga builder"))
+  (dolist (entry (list (cons "logits" logits)
+                       (cons "targets" targets)
+                       (cons "row scales" row-scales)))
+    (unless (nlga-rt-p (cdr entry))
+      (error "Masked index CE %s must be a resident tensor" (car entry))))
+  (let ((m (nlga-rt-rows logits))
+        (v (nlga-rt-cols logits)))
+    (unless (and (integerp m) (> m 0) (integerp v) (> v 0))
+      (error "Masked index CE logits must have a nonempty M by V shape"))
+    (dolist (entry (list (cons "targets" targets)
+                         (cons "row scales" row-scales)))
+      (unless (and (integerp (nlga-rt-rows (cdr entry)))
+                   (integerp (nlga-rt-cols (cdr entry)))
+                   (= (nlga-rt-rows (cdr entry)) m)
+                   (= (nlga-rt-cols (cdr entry)) 1))
+        (error "Masked index CE %s must have shape %dx1" (car entry) m)))
+    (nlga-seed-ce-idx b logits targets)
+    (let ((gradient (nlga-rt-grad logits)))
+      (nlga--d b
+               (list 'scale-rows
+                     (list gradient (nlga-rt-slot row-scales) gradient)
+                     (list m v) (nlga--g (* m v)))))))
 
 (defun nlga-seed-mse (b y target invn)
   "Seed Y's gradient with (Y - TARGET) * INVN (MSE); TARGET, INVN are rt."
@@ -626,11 +706,11 @@ Uses the compiled command buffer when `nlga-compile' has been called."
       (while (< i n) (aset dst i (aref v i)) (setq i (1+ i))))))
 
 (defun nlga-free (b)
-  "Free the compiled batch (if any) and EVERY resident handle this builder
-uploaded -- params, consts, KV caches and the optimiser m/v/hyperparam buffers --
-each exactly once (all live as `res' slots).  Essential for builders that are
-created and freed repeatedly (e.g. per-round tree verify), and fixes a latent
-const/cache leak in the build-once decoders too."
+  "Free the compiled batch and every resident handle this builder uploaded.
+This includes params, consts, KV caches, and optimizer m/v/hyperparameter
+buffers, each exactly once (all live as `res' slots).  This is essential for
+builders created and freed repeatedly (for example per-round tree verify) and
+fixes a latent const/cache leak in build-once decoders too."
   (when (nlga-compiled b)
     (ignore-errors (nelisp-gpu-server-free-compiled (car (nlga-compiled b))))
     (setf (nlga-compiled b) nil))

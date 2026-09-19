@@ -19,6 +19,54 @@ Phase 2 (sandboxing + permission gating) SHIPPED -- =test/agent-sandbox-test.el=
 subprocess with a timeout, and destructive forms / shells / out-of-workdir edits
 are refused before they run.  (Fuzzy edit application is the remaining P2 item.)
 Phase 3 below is designed, not built.
+Service provider layer SHIPPED -- =lisp/nl-llm-agent-provider.el= +
+=test/agent-provider-test.el= (20/20) and the native adapter in
+=nl-llm-agent-model.el= + =test/agent-native-provider-test.el= (4/4).  A live
+session can change provider/model without replacing the agent loop; failed opens
+leave the previous backend active.
+OpenAI-compatible adapter SHIPPED -- =lisp/nl-llm-agent-openai.el= +
+=test/agent-openai-provider-test.el= (10/10).  Request translation and response
+extraction run on Emacs and standalone NeLisp with an injected transport; the
+default live HTTP transport uses Emacs URL and is pinned without network access
+by =test/agent-openai-http-test.el= (4/4).
+Transactional evolution and service artifacts SHIPPED -- =lisp/nl-llm-evolve.el=
++ =test/evolve-test.el= (13/13), and =lisp/nl-llm-agent-artifact.el= +
+=test/agent-artifact-test.el= (14/14).  A promotion publishes an immutable,
+digest-addressed checkpoint and atomically updates its data-only catalog before
+the champion changes.  The PAV exporter preserves the independently trained
+output head and matches training-model logits before real constrained inference.
+The sibling =nelisp-agent= service discovers a later generation and switches to
+it without restarting its standalone NeLisp worker.
+Evaluated improvement queue SHIPPED -- =lisp/nl-llm-evolve-queue.el= +
+=test/evolve-queue-test.el= (28/28 on Emacs and standalone NeLisp), with the real
+P5 composition in =lisp/nl-llm-agent-evolve.el= + =test/agent-evolve-test.el=
+(5/5).  Model output supplies bounded trajectory data only; trusted code chooses
+the CPU or GPU trainer and fixed benchmark.  GPU-resident challenger training is
+SHIPPED through the same data protocol: =test/agent-evolve-gpu-test.el= (7/7)
+trains the isolated copy in a dedicated compiled nlga graph and proves the old
+champion is unchanged before immutable publication.  With recovery disabled it
+reads back once; with recovery enabled bounded interval readbacks persist the
+weights, Adam m/v, optimizer step, and completed steps.  The test interrupts a
+lightweight job after 4 of 8 Adam steps and explicit resume matches continuous
+training exactly (maxdiff 0).  The =nelisp-agent= host exposes the queue
+through approval-gated typed tools.  Its cross-repository capstone pins one live
+run from proposal through training, evaluation, immutable publication, separately
+approved activation, catalog refresh, and the next inference on the new model.
+Private atomic queue checkpoints restore pending/audited jobs; an in-flight job
+becomes =interrupted= rather than being replayed.  A separate private training
+checkpoint is bound to the exact job, proposal, trusted configuration, parent,
+optimizer, and plan; only explicit =model.improvement.resume= can consume it.
+Interrupted jobs survive completed-history trimming, including zero retention,
+and consume the same admission budget as pending and running jobs.  Explicit
+cancellation releases the slot and cleans recovery state after durable queue
+persistence.  Resume and restore validate outstanding data against the current
+trusted handler before execution; cancellation can discard a revoked proposal.
+Promoted PAV artifacts reload as detached trainable champions and retain
+monotonic generation numbering.  The sibling CLI assembles those boundaries
+from bounded JSON without configurable callbacks.  Its optional autonomous
+scope pre-authorizes only queue mutations and activation of
+=PROVIDER/ID-PREFIX-gN=; unrelated tools and remote switches remain denied, and
+each grant is audited separately from human approval.
 
 * Why
 An LLM by itself only emits text.  What lets Claude Code / Codex *act* -- edit
@@ -144,6 +192,19 @@ turn the model gets better at using -- and improving -- itself.
   random baseline to a ~70% peak with the head weight provably changed only by the
   GPU training (a replay buffer stabilises the STaR step).  Whole loop -- generate,
   act, reward, learn -- runs in nelisp, on the GPU.
+- *P6 (SHIPPED, core)*: provider registry + provider-neutral session policy.  A
+  provider supplies a public model catalog and open / complete / close callbacks.
+  Switching opens the challenger backend before closing the current one, retains
+  provider-neutral messages, rejects ambiguous model ids, and records an audit
+  event.  The native adapter wraps =nl-llm-agent-model-policy=; OpenAI-compatible
+  request/response translation and an Emacs URL transport are also shipped.  The
+  promoted-artifact provider adds lazy, digest-verified checkpoint loading and a
+  live catalog; the sibling =nelisp-agent= host brokers that catalog into a running
+  standalone NeLisp worker.  Its guarded improvement tools let that worker submit
+  inert trajectory experiments and request trusted evaluation without receiving
+  trainer or evaluator callbacks.  An independently approved service directive
+  performs the transactional model switch in place.  Native NeLisp HTTP remains
+  service-layer work.
 
 * Sources
 mini-swe-agent (github.com/SWE-agent/mini-swe-agent); SWE-agent ACI

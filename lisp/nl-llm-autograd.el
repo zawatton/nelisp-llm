@@ -15,6 +15,103 @@
 (require 'nl-llm-moe)   ; for nl-llm--topk-indices
 
 ;;;###autoload
+(defun nl-llm-ag-masked-softmax-ce (logits targets mask)
+  "Mean softmax cross-entropy for the active rows of LOGITS.
+LOGITS is an autograd value whose tensor has shape (ROWS VOCAB).  TARGETS and
+MASK must be vectors of length ROWS.  Every target must be a valid vocabulary
+id, including targets for inactive rows; every mask element must be the integer
+0 or 1, and at least one row must be active.  TARGETS and MASK are copied before
+the backward closure retains them."
+  (unless (pav-p logits)
+    (error "Masked softmax CE logits must be an autograd value"))
+  (let ((lv (pav-value logits)))
+    (unless (and (vectorp lv) (= (length lv) 2))
+      (error "Masked softmax CE logits must contain a tensor"))
+    (let* ((shape (photon-tensor-shape lv))
+           (rows (and (consp shape) (car shape)))
+           (vocab (and (consp shape) (consp (cdr shape)) (nth 1 shape))))
+      (unless (and (consp shape) (consp (cdr shape)) (null (cddr shape))
+                   (integerp rows) (> rows 0)
+                   (integerp vocab) (> vocab 0)
+                   (vectorp (photon-tensor-data lv))
+                   (= (length (photon-tensor-data lv)) (* rows vocab)))
+        (error "Masked softmax CE logits must have a nonempty 2D shape"))
+      (unless (and (vectorp targets) (= (length targets) rows))
+        (error "Masked softmax CE targets must be a vector of length %d" rows))
+      (unless (and (vectorp mask) (= (length mask) rows))
+        (error "Masked softmax CE mask must be a vector of length %d" rows))
+      ;; Validate the complete request before allocating forward state or
+      ;; recording anything on the autograd tape.
+      (let ((i 0) (active 0))
+        (while (< i rows)
+          (let ((target (aref targets i)) (bit (aref mask i)))
+            (unless (and (integerp target) (<= 0 target) (< target vocab))
+              (error "Masked softmax CE target %S at row %d is out of range"
+                     target i))
+            (unless (and (integerp bit) (or (= bit 0) (= bit 1)))
+              (error "Masked softmax CE mask value %S at row %d is not 0 or 1"
+                     bit i))
+            (setq active (+ active bit)))
+          (setq i (1+ i)))
+        (when (= active 0)
+          (error "Masked softmax CE requires at least one active row"))
+        (let* ((saved-targets (copy-sequence targets))
+               (saved-mask (copy-sequence mask))
+               (ld (photon-tensor-data lv))
+               (probs (make-vector (* rows vocab) 0.0))
+               (loss 0.0)
+               (row 0))
+          (while (< row rows)
+            (when (= (aref saved-mask row) 1)
+              (let* ((base (* row vocab))
+                     (mx (aref ld base))
+                     (j 1)
+                     (sum 0.0))
+                (while (< j vocab)
+                  (setq mx (max mx (aref ld (+ base j))))
+                  (setq j (1+ j)))
+                (setq j 0)
+                (while (< j vocab)
+                  (let ((weight (exp (- (aref ld (+ base j)) mx))))
+                    (aset probs (+ base j) weight)
+                    (setq sum (+ sum weight)))
+                  (setq j (1+ j)))
+                (setq j 0)
+                (while (< j vocab)
+                  (aset probs (+ base j) (/ (aref probs (+ base j)) sum))
+                  (setq j (1+ j)))
+                (setq loss
+                      (+ loss
+                         (+ (- mx
+                               (aref ld
+                                     (+ base
+                                        (aref saved-targets row))))
+                            (log sum))))))
+            (setq row (1+ row)))
+          (setq loss (/ loss (float active)))
+          (photon-autograd--record
+           (photon-tensor (list 1 1) (vector loss))
+           (lambda (g)
+             (let* ((upstream (aref (photon-tensor-data g) 0))
+                    (scale (/ upstream (float active)))
+                    (dl (make-vector (* rows vocab) 0.0))
+                    (i 0))
+               (while (< i rows)
+                 (when (= (aref saved-mask i) 1)
+                   (let ((base (* i vocab))
+                         (target (aref saved-targets i))
+                         (j 0))
+                     (while (< j vocab)
+                       (aset dl (+ base j)
+                             (* scale
+                                (- (aref probs (+ base j))
+                                   (if (= j target) 1.0 0.0))))
+                       (setq j (1+ j)))))
+                 (setq i (1+ i)))
+               (photon-autograd--addgrad
+                logits (photon-tensor (list rows vocab) dl))))))))))
+
+;;;###autoload
 (defun nl-llm-ag-rmsnorm (x gamma &optional eps)
   "Autograd row-wise RMSNorm of X (m x n) with trainable GAMMA (n), no mean sub."
   (let* ((xv (pav-value x)) (sh (photon-tensor-shape xv)) (m (car sh)) (n (nth 1 sh))
@@ -240,11 +337,12 @@ KV-HEADS must divide HEADS (MHA is KV-HEADS = HEADS)."
 (defun nl-llm-ag-moe (x router brouter experts top-k)
   "Autograd top-K sparse MoE over X (seq x dim).
 ROUTER is pav (E x dim), BROUTER pav (E) bias; EXPERTS is a list of E plists
-each with :wg :bg :wu :bu :wd :bd pav for a SwiGLU expert.  The top-K *selection*
-per token is read from the forward router logits and held constant; the gate
+each with :wg :bg :wu :bu :wd :bd pav for a SwiGLU expert.  The top-K
+*selection* per token is read from the forward router logits and held constant;
+the gate
 weights (softmax over the selected experts) and the expert FFNs are fully
 differentiated.  Returns pav (seq x dim)."
-  (let* ((xv (pav-value x)) (sh (photon-tensor-shape xv)) (seq (car sh)) (dim (nth 1 sh))
+  (let* ((xv (pav-value x)) (sh (photon-tensor-shape xv)) (seq (car sh))
          (ne (length experts))
          (logits (photon-autograd-linear x router brouter))   ; pav (seq x E)
          (ld (photon-tensor-data (pav-value logits)))

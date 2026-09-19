@@ -26,15 +26,19 @@
                                 :wg (ck--t (list ff dim) (+ s 11)) :bg (ck--t (list ff) (+ s 12))
                                 :wu (ck--t (list ff dim) (+ s 13)) :bu (ck--t (list ff) (+ s 14))
                                 :wd (ck--t (list dim ff) (+ s 15)) :bd (ck--t (list dim) (+ s 16)))))
-       (model (list :config (list :dim dim :heads 4 :kv-heads 2 :ff ff :vocab vocab :nblocks 2)
-                    :step 137 :wte (ck--t (list vocab dim) 100) :lnfg (ck--t (list dim) 200) :bh (ck--t (list vocab) 300)
-                    :blocks (list (funcall mkblk 1000) (funcall mkblk 2000))))
+	       (model (list :config (list :dim dim :heads 4 :kv-heads 2 :ff ff :vocab vocab :nblocks 2)
+	                    :step 137 :wte (ck--t (list vocab dim) 100)
+	                    :wh (ck--t (list vocab dim) 150)
+	                    :lnfg (ck--t (list dim) 200) :bh (ck--t (list vocab) 300)
+	                    :blocks (list (funcall mkblk 1000) (funcall mkblk 2000))))
        (path (make-temp-file "nl-llm-ckpt" nil ".sexp")))
   (nl-llm-ckpt-save path model)
   (let ((m2 (nl-llm-ckpt-load path)))
     (ck--ck "config round-trips" (equal (plist-get m2 :config) (plist-get model :config)))
     (ck--ck "step round-trips" (= (plist-get m2 :step) 137))
-    (ck--ck "wte exact" (ck--teq (plist-get m2 :wte) (plist-get model :wte)))
+	    (ck--ck "wte exact" (ck--teq (plist-get m2 :wte) (plist-get model :wte)))
+	    (ck--ck "untied output head exact"
+	            (ck--teq (plist-get m2 :wh) (plist-get model :wh)))
     (ck--ck "lnfg exact" (ck--teq (plist-get m2 :lnfg) (plist-get model :lnfg)))
     (ck--ck "bh exact" (ck--teq (plist-get m2 :bh) (plist-get model :bh)))
     (let ((ok t) (b1 (plist-get model :blocks)) (b2 (plist-get m2 :blocks)))
@@ -46,6 +50,23 @@
   (write-region (prin1-to-string (list :format "bogus" :step 0))
                 nil path nil 'silent)
   (ck--ck "bad format rejected" (condition-case nil (progn (nl-llm-ckpt-load path) nil) (error t)))
+  (write-region
+   (concat (prin1-to-string (list :format nl-llm-ckpt-format)) " (:extra t)")
+   nil path nil 'silent)
+  (ck--ck "trailing forms rejected"
+          (condition-case nil
+              (progn (nl-llm-ckpt-load path) nil)
+            (error t)))
+  (let ((side-effect nil))
+    (write-region
+     "#.(progn (setq side-effect t) '(:format \"nl-llm-ckpt-v1\"))"
+     nil path nil 'silent)
+    (ck--ck "read-time evaluation disabled"
+            (and
+             (condition-case nil
+                 (progn (nl-llm-ckpt-load path) nil)
+               (error t))
+             (null side-effect))))
   (delete-file path))
 
 (princ (format "NL-LLM-CKPT %s (%d failures)\n" (if (= ck--fail 0) "ALL-PASS" "HAS-FAILURES") ck--fail))

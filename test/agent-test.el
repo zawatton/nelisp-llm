@@ -13,14 +13,43 @@
 
 ;; --- unit: action parsing ---------------------------------------------------
 (ag--ck "parse: elisp CodeAct block"
-        (equal (nl-llm-agent--parse "thinking...\n```elisp\n(+ 40 2)\n```\n") '(elisp "(+ 40 2)")))
+        (equal (nl-llm-agent-parse-action
+                "thinking...\n```elisp\n(+ 40 2)\n```\n")
+               '(elisp "(+ 40 2)")))
 (ag--ck "parse: SEARCH/REPLACE edit"
-        (equal (nl-llm-agent--parse "foo.el\n<<<<<<< SEARCH\nold\n=======\nnew\n>>>>>>> REPLACE\n")
+        (equal (nl-llm-agent-parse-action
+                "foo.el\n<<<<<<< SEARCH\nold\n=======\nnew\n>>>>>>> REPLACE\n")
                '(edit "foo.el" "old" "new")))
 (ag--ck "parse: shell block"
-        (equal (nl-llm-agent--parse "```sh\nls -1\n```") '(shell "ls -1")))
-(ag--ck "parse: DONE with answer" (equal (nl-llm-agent--parse "DONE all set") '(done "all set")))
-(ag--ck "parse: plain prose -> none" (equal (nl-llm-agent--parse "I am thinking.") '(none)))
+        (equal (nl-llm-agent-parse-action "```sh\nls -1\n```")
+               '(shell "ls -1")))
+(ag--ck "parse: generic typed tool block"
+        (equal
+         (nl-llm-agent-parse-action
+          "```tool\n(:name \"mcp.notes.search\" :arguments (:query \"x\"))\n```")
+         '(tool "mcp.notes.search" (:query "x"))))
+(ag--ck "parse: generic tool rejects trailing forms"
+        (equal
+         (nl-llm-agent-parse-action
+          "```tool\n(:name \"safe\") (:name \"second\")\n```")
+         '(none)))
+(let ((side-effect nil))
+  (ag--ck "parse: generic tool disables read-time evaluation"
+          (and
+           (equal
+            (nl-llm-agent-parse-action
+             "```tool\n#.(setq side-effect t)\n```")
+            '(none))
+           (null side-effect))))
+(ag--ck "parse: DONE with answer"
+        (equal (nl-llm-agent-parse-action "DONE all set")
+               '(done "all set")))
+(ag--ck "parse: plain prose -> none"
+        (equal (nl-llm-agent-parse-action "I am thinking.") '(none)))
+(ag--ck "parse: public API rejects non-text input"
+        (condition-case nil
+            (progn (nl-llm-agent-parse-action 42) nil)
+          (error t)))
 
 ;; --- integration: a full scripted episode -----------------------------------
 (let* ((dir (make-temp-file "nl-agent-" t))

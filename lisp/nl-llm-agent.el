@@ -29,6 +29,8 @@
 (require 'cl-lib)
 (require 'subr-x)
 
+(defvar read-eval)
+
 (defconst nl-llm-agent-system-prompt
   "You are an agent that solves a task by emitting ONE action per message.
 Available actions (use exactly one, then stop and wait for the observation):
@@ -51,7 +53,12 @@ new text
 command
 ```
 
-4. Finish, on its own line:
+4. Invoke a registered typed tool with Lisp data:
+```tool
+(:name \"tool.name\" :arguments (:key \"value\"))
+```
+
+5. Finish, on its own line:
 DONE <final answer>
 
 After each action you receive an OBSERVATION.  Edits that do not parse are
@@ -73,9 +80,39 @@ rejected -- read the error and try again."
         (nl-llm-agent--strip1-nl
          (substring text start (match-beginning 0)))))))
 
+(defun nl-llm-agent--tool-action (text)
+  "Return a generic typed tool action parsed from TEXT, or nil."
+  (let ((body (nl-llm-agent--fenced text "tool")))
+    (when body
+      (condition-case nil
+          (let* ((read-eval nil)
+                 (parsed (read-from-string body))
+                 (form (car parsed))
+                 (trailing
+                  (string-trim (substring body (cdr parsed))))
+                 (name (and (listp form) (plist-get form :name)))
+                 (arguments
+                  (and (listp form) (plist-get form :arguments))))
+            (when (and (string-empty-p trailing)
+                       (listp form)
+                       (= (% (length form) 2) 0)
+                       (cl-every
+                        (lambda (key) (memq key '(:name :arguments)))
+                        (let ((tail form) (keys nil))
+                          (while tail
+                            (setq keys (cons (car tail) keys))
+                            (setq tail (cddr tail)))
+                          keys))
+                       (stringp name)
+                       (not (string-empty-p name))
+                       (or (null arguments) (listp arguments)))
+              (list 'tool name (copy-tree arguments))))
+        (error nil)))))
+
 (defun nl-llm-agent--parse (text)
-  "Parse assistant TEXT into one action: (edit PATH SEARCH REPLACE) | (elisp CODE)
-| (shell CMD) | (done ANSWER) | (none).  Concrete actions take priority over DONE."
+  "Parse assistant TEXT into one action.
+Return (edit PATH SEARCH REPLACE), (elisp CODE), (shell CMD), (done ANSWER),
+or (none).  Concrete actions take priority over DONE."
   (cond
    ;; SEARCH/REPLACE edit
    ((string-match "^<<<<<<< SEARCH[ \t]*$" text)
@@ -106,10 +143,22 @@ rejected -- read the error and try again."
    ((let ((body (or (nl-llm-agent--fenced text "sh")
                     (nl-llm-agent--fenced text "bash"))))
       (and body (list 'shell body))))
+   ;; generic typed tool
+   ((nl-llm-agent--tool-action text))
    ;; finish
    ((string-match "^DONE\\(?:[ \t]+\\(.*\\)\\)?$" text)
     (list 'done (string-trim (or (match-string 1 text) ""))))
    (t (list 'none))))
+
+;;;###autoload
+(defun nl-llm-agent-parse-action (text)
+  "Parse assistant TEXT into one public CodeAct action.
+The result is one of (EDIT PATH SEARCH REPLACE), (ELISP CODE), (SHELL CMD),
+(TOOL NAME ARGUMENTS), (DONE ANSWER), or (NONE).  Parsing never evaluates
+model output."
+  (unless (stringp text)
+    (error "nl-llm-agent-parse-action: TEXT must be a string"))
+  (nl-llm-agent--parse text))
 
 ;; ---- action execution ------------------------------------------------------
 
@@ -247,14 +296,17 @@ in-process per PERMS' :eval."
 ;; ---- the agent loop --------------------------------------------------------
 
 ;;;###autoload
-(cl-defun nl-llm-agent-run (task policy &key (max-steps 12) (workdir default-directory) system trace permissions)
+(cl-defun nl-llm-agent-run
+    (task policy &key (max-steps 12) (workdir default-directory)
+          system trace permissions)
   "Run the agent on TASK using POLICY (a function MESSAGES -> assistant-text).
-MESSAGES is the linear history as a list of (ROLE . CONTENT) in order.  Each step
-the policy emits one action, which is executed under PERMISSIONS (default
-`nl-llm-agent-permissive-permissions'; pass `nl-llm-agent-safe-permissions' for
-untrusted policies); the OBSERVATION is appended and the loop repeats until DONE or
-MAX-STEPS.  TRACE, if set, is called with (STEP ROLE CONTENT) for each turn.
-Returns a plist (:status done/limit :steps N :result STRING :messages LIST)."
+MESSAGES is the linear history as a list of (ROLE . CONTENT) in order.  Each
+step the policy emits one action, which is executed under PERMISSIONS.  It
+defaults to `nl-llm-agent-permissive-permissions'; use
+`nl-llm-agent-safe-permissions' for untrusted policies.  The observation is
+appended and the loop repeats until DONE or MAX-STEPS.  TRACE, if set, is called
+with (STEP ROLE CONTENT) for each turn.  Return a plist containing status,
+steps, result, and messages."
   (let ((messages (list (cons 'system (or system nl-llm-agent-system-prompt))
                         (cons 'user (concat "TASK: " task))))
         (perms (or permissions (nl-llm-agent-permissive-permissions)))
@@ -263,7 +315,7 @@ Returns a plist (:status done/limit :steps N :result STRING :messages LIST)."
     (while (< step max-steps)
       (setq step (1+ step))
       (let* ((out (funcall policy messages))
-             (action (nl-llm-agent--parse out)))
+             (action (nl-llm-agent-parse-action out)))
         (setq messages (append messages (list (cons 'assistant out))))
         (when trace (funcall trace step 'assistant out))
         (let ((res (nl-llm-agent--observe action workdir perms)))
@@ -277,9 +329,9 @@ Returns a plist (:status done/limit :steps N :result STRING :messages LIST)."
 
 ;;;###autoload
 (defun nl-llm-agent-repo-map (dir &optional ext)
-  "Return a compact map of DIR: each *.EXT (default \"el\") file with its top-level
-definition names.  A cheap stand-in for Aider's tree-sitter/PageRank repo map, to
-give the policy structure without dumping whole files."
+  "Return a compact map of DIR.
+List the top-level definition names in each *.EXT file, where EXT defaults to
+\"el\".  This cheaply gives the policy structure without dumping whole files."
   (let ((ext (or ext "el")) (lines nil))
     (dolist (f (sort (directory-files-recursively dir (concat "\\." ext "\\'")) #'string<))
       (let ((defs nil))
@@ -301,9 +353,9 @@ give the policy structure without dumping whole files."
 
 ;;;###autoload
 (defun nl-llm-agent-scripted-policy (responses)
-  "Return a policy that yields the queued RESPONSES (a list of strings) in order,
-then repeats the last.  A deterministic stand-in for an LLM, used to exercise the
-harness without a model."
+  "Return a policy that yields queued RESPONSES in order.
+RESPONSES is a list of strings.  After exhausting it, repeat the last response.
+This deterministic LLM stand-in exercises the harness without a model."
   (let ((q (copy-sequence responses)) (last ""))
     (lambda (_messages)
       (if q (setq last (pop q)) last))))

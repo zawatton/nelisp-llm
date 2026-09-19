@@ -608,6 +608,131 @@ loop.  An nelisp-llm model now writes Lisp to act on itself, runs it under a
 sandbox, scores it by running tests, and retrains itself on the GPU -- end to end,
 in nelisp.
 
+The harness is now *runtime model-switchable* through
+~nl-llm-agent-provider.el~.  Providers publish a model catalog and implement a
+small open / complete / close contract; the agent consumes a provider-neutral
+session policy.  A live session can switch from a local NeLisp model to any later
+remote adapter without rebuilding the agent loop or losing its message history.
+Switching is transactional: the new backend must open before the old one closes,
+and an open failure leaves the previous model usable.  Ambiguous unqualified
+model ids are rejected, every switch is audited, and backend-specific state never
+enters the public message history.  ~nl-llm-agent-model-provider~ exposes existing
+nelisp-llm models through that same contract while keeping model and grammar
+objects private.  ~nl-llm-agent-openai-provider~ adds OpenAI-compatible remote
+endpoints with slash-containing model ids, rotating API-key functions, generation
+options, structured content responses, and an injectable HTTP transport.  Its
+default Emacs transport keeps credentials in request headers rather than process
+arguments; a native NeLisp HTTP transport is the next service-integration step.
+
+Self-improvement can now run as *transactional generations* instead of mutating
+the only live model (~nl-llm-evolve.el~).  An evolution state owns an isolated
+champion; every attempt copies it without breaking tied parameters, applies a
+proposal and optional training only to that challenger, and evaluates it against a
+fixed score function.  A challenger is promoted only when its measured gain is
+strictly above the configured minimum.  Regressions, insufficient gains, and
+errors are discarded while the champion stays unchanged, and every attempt is
+recorded in an audit history.  ~test/evolve-test.el~ pins promotion, rollback,
+error containment, parent isolation, preservation of weight tying, and a
+publish-before-commit hook.  A publication error cancels the promotion while the
+old champion remains active.  The same boundary is model-agnostic: later proposals
+may attach an expert or rewrite a model configuration, while the promotion rule
+remains fixed outside the model.
+
+~nl-llm-agent-artifact.el~ connects that gate to a service-safe native model
+artifact.  Each accepted challenger is first validated, saved under an immutable
+generation filename with mode 0600, hashed with SHA-256, and appended through an
+atomic replacement of a data-only JSON catalog.  The provider discovers later
+catalog revisions dynamically, but loads a checkpoint only when its generation is
+opened and rechecks the digest before inference.  Catalog grammars use a small
+constrained data language; they cannot inject executable Lisp.  The public model
+descriptor exposes provenance (generation, score, digest) but not paths, model
+objects, or grammar functions.  ~test/agent-artifact-test.el~ exercises the real
+evolution publish hook, transactional catalog updates, lazy loading, live discovery,
+and tamper rejection.  ~nl-llm-agent-artifact-export-pav~ snapshots the trainable
+PAV model used by the P5 and on-device loops, including its independently trained
+~:wh~ output head; exported incremental-decode logits are pinned against the
+training model before the artifact is exercised through real constrained inference.
+The sibling ~nelisp-agent~ host consumes this provider and refreshes the standalone
+worker's model catalog without restarting it.
+
+#+begin_src elisp
+(setq evolution
+      (nl-llm-evolution-new
+       initial-model #'evaluate-model
+       :min-delta 0.01
+       :publish
+       (nl-llm-agent-artifact-publisher
+        "artifacts/catalog.json"
+        :id-prefix "champion"
+        :grammar '(:type "done" :length 256)
+        :export #'nl-llm-agent-artifact-export-pav)))
+(nl-llm-evolution-step evolution #'propose-change :train #'train-candidate)
+#+end_src
+
+The current checkpoint validator and built-in exporter target the dense
+char-policy architecture used by ~nl-llm-agent-model-policy~.  Other training
+architectures need an explicit export/validation adapter rather than bypassing
+this boundary.
+
+Model-generated improvement requests now cross a separate evaluated queue
+(~nl-llm-evolve-queue.el~).  Proposal payloads are bounded data trees; executable
+callbacks are selected only from trusted handlers registered by the host.  Queue
+priority is stable, outstanding capacity is bounded, and promotion/rejection/error/
+cancellation remain auditable without exposing payloads or callbacks in public
+status.  Optional mode-0600 atomic checkpoints preserve bounded pending and
+terminal jobs across restart.  A job that was running at a crash becomes
+=interrupted= and is never replayed automatically.  The same implementation and
+its 28 checks run on Emacs and standalone NeLisp.
+
+Interrupted jobs are outstanding work, not terminal history: =max-history= never
+evicts them, including at zero retention.  =max-pending= limits pending, running,
+and interrupted jobs together.  Cancelling pending or interrupted work releases
+capacity; interrupted cancellation cleans private recovery state only after
+the cancellation is persisted.  Running work cannot be cancelled by this
+synchronous API.  Restored outstanding payloads and execution requests must
+pass the current trusted handler validator before execution changes job state.
+
+~nl-llm-agent-evolve-p5-queue~ is the first real handler composition.  It accepts
+only bounded printable-ASCII trajectory vectors plus capped learning rate and
+epoch values, fine-tunes an isolated P5-compatible challenger on the CPU or in a
+dedicated resident nlga GPU graph, evaluates it with a fixed caller-owned
+benchmark, and publishes it through the immutable artifact gate.  The trusted
+host selects =:training-backend=, fixed GPU sequence, and SGD/Adam; model output
+cannot select code.  GPU weights and optimizer stay resident across every step,
+then =nlga-readback= synchronizes the isolated candidate before the gate.  With
+recovery disabled this is one final readback; with recovery enabled, bounded
+interval readbacks atomically persist mode-0600 candidate weights, Adam m/v,
+optimizer step, and completed flattened trajectory steps.  Oversized
+trajectories are rejected before upload and a missing device or training error
+leaves the old champion untouched.  =test/agent-evolve-gpu-test.el= pins the
+actual Vulkan path, old-champion isolation, promotion, and publication.  It also
+interrupts a deliberately lightweight P5 job after 4 of 8 Adam steps, rebuilds
+the queue, verifies there is no automatic replay, resumes explicitly, and
+matches continuous 8-step training exactly (maxdiff 0).
+
+The recovery checkpoint is bound to the job id, proposal SHA-256, trusted
+configuration SHA-256, parent generation/score, sequence, optimizer, and total
+steps.  It cannot be reused across jobs, changed profiles, or later champions.
+Terminal queue state is persisted before checkpoint cleanup.  Tests pin the
+full path:
+trajectory -> real gradient update -> score gain -> promotion -> digest catalog
+-> constrained inference.
+The sibling
+~nelisp-agent~ exposes status/submit/run/resume/cancel as typed host tools, with
+normal write/execute approval, so model intent never becomes direct training
+authority.
+Successful evolution audit entries include the public publication descriptor;
+the agent can use it in a separately approved =service.model.switch= request.
+The cross-repository capstone pins the uninterrupted sequence through the next
+inference on the newly exported model.
+
+Published PAV artifacts can be digest-verified and reloaded as detached
+trainable parameters with =nl-llm-agent-artifact-load-pav=.  Their generation
+metadata initializes a later champion/challenger queue, so a restarted service
+publishes =gN+1= instead of colliding with an immutable earlier checkpoint.  The
+sibling CLI's data-only =nl-agent-improvement-v1= profile composes this recovery,
+a fixed held-out-text evaluator, the durable queue, and the dynamic provider.
+
 *** Capstone: a real(er) run with mid-run checkpoint + resume
 
 ~examples/train-big-gpu.el~ exercises the whole stack at once at a larger scale: a
@@ -652,6 +777,15 @@ size, while on-device keeps everything resident and only moves the loss out.
 - ~lisp/nl-llm-bitnet.el~   -- BitNet b1.58 packed ternary-weight inference (Phase B)
 - ~lisp/nl-llm-gpu-decode.el~ -- on-GPU KV-cache decode (resident cache, runtime pos)
 - ~lisp/nl-llm-ckpt.el~      -- checkpoint save / load (config, step, all tensors)
+- ~lisp/nl-llm-agent.el~     -- model-neutral action loop, tools, and permission gate
+- ~lisp/nl-llm-agent-provider.el~ -- provider registry, sessions, live model switch
+- ~lisp/nl-llm-agent-model.el~ -- constrained NeLisp policy + native provider adapter
+- ~lisp/nl-llm-agent-openai.el~ -- OpenAI-compatible remote provider adapter
+- ~lisp/nl-llm-evolve.el~    -- isolated challenger evaluation, promotion, rollback
+- ~lisp/nl-llm-agent-artifact.el~ -- immutable promoted checkpoints + live catalog
+- ~lisp/nl-llm-agent-training-checkpoint.el~ -- bound private GPU recovery state
+- ~lisp/nl-llm-evolve-queue.el~ -- bounded data proposals + fixed eval dispatch
+- ~lisp/nl-llm-agent-evolve.el~ -- P5 trajectory training to promoted artifact
 - ~lisp/nl-llm-autograd.el~ -- reverse-mode backward for all of the above
 - ~lisp/nl-llm-gpu.el~      -- GPU backend wiring (enable / invalidate)
 - ~lisp/nl-llm-gpu-train.el~ -- on-device (resident) training step + SGD (MLP)
@@ -807,7 +941,7 @@ The CPU-only code also runs with the standalone reader built from the sibling
 ~nelisp~ repository.  Override ~NELISP~ when the binary is elsewhere:
 
 #+begin_src sh
-make test-nelisp-fast                    # nine quick suites, ~5 minutes
+make test-nelisp-fast                    # thirteen quick suites, ~5 minutes
 make test-nelisp                         # every suite that finishes under NeLisp, ~30 minutes
 make test-nelisp NELISP=/path/to/nelisp # use another standalone binary
 #+end_src
