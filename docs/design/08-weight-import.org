@@ -236,6 +236,32 @@ is a directory of Notes rather than a repository of its own, and Notes currently
 carries unrelated uncommitted work.  So it is deliberately a separate change
 with its own commit scope, not smuggled in here.
 
+*Two more silent convention mismatches*, found while building toward a
+reference forward and fixed in =lisp/nl-llm-attn.el= with
+=test/rope-style-test.el= (10/10, =make test-rope-style=):
+
+- *RoPE pairing.*  =nl-llm--rope-block= rotates adjacent pairs (2m, 2m+1), the
+  GPT-J convention.  Qwen3 and Llama rotate half-split pairs (i, i + hd/2), the
+  GPT-NeoX convention HuggingFace calls =rotate_half=.  Same angles, different
+  pairing.  Measured before assuming: an 8-wide head at position 3 differs by
+  *5.82* between the two.  Nothing raises, because the vector is the right
+  length either way.  Now selected by =:rope-style=, `interleaved' (unchanged
+  default) or `half'; an unrecognised name signals rather than falling back.
+- *QK-norm.*  Qwen3 RMSNorms each head's q and k with a learned per-head-width
+  gain *before* the rotation.  Omitted, the attention scores are simply scaled
+  wrong.  Now applied from =:q-norm= / =:k-norm= on the layer, nil being a
+  no-op so a donor without them behaves exactly as before.  The exporter
+  already carries both tensors as f32 (=q_norm= / =k_norm=, 128 wide).
+
+That is three conventions in this family -- =:head-dim=, =:rope-style=,
+=:q-norm= / =:k-norm= -- each of which produces confident wrong numbers when
+ignored, and none of which the shapes catch.  They share one contract:
+=nl-llm-attn-reject-decoupled-head-dim= refuses all three in the paths that do
+not implement them (stream, integrated, autograd, GPU decode), so a forgotten
+migration is an error.  The suite's calibration made the point plainly: before
+the change, "the two rope styles differ" failed with *maxdiff 0.000* -- the key
+was not merely mishandled, it was read by nothing at all.
+
 Head-dimension finding that resizes Phase 2: Qwen3-0.6B's =config.json= has
 =hidden_size= 1024, =num_attention_heads= 16 and =head_dim= 128, so
 =q_proj= is 1024 -> 2048.  =nl-llm-attn.el= derives =hd= as =(/ dim heads)= at
@@ -332,9 +358,9 @@ Gaps, in descending order of size:
    =nl-llm-weights-v2= binary format is required: a small sexp or JSON header
    followed by packed int8 blocks, loadable without materializing an
    intermediate float vector per tensor.
-3. *QK-norm.*  Qwen3 applies a per-head RMSNorm to q and k before RoPE.  Not
-   implemented (no match in =lisp/=).  About 20 lines, plus its autograd
-   backward if it is to be trainable.  Choosing a Qwen2.5 donor avoids it.
+3. *QK-norm.*  SHIPPED alongside the rotation convention; see Status.  The
+   forward path applies it from =:q-norm= / =:k-norm=; the autograd backward,
+   needed only to train through it, is not written.
 4. *Tokenizer.*  =photon-bpe= is byte-level BPE with its own merges, so it is
    structurally compatible with Qwen's vocabulary and can take its merge table
    directly.  But =photon-bpe= has no pre-tokenizer: Qwen splits text with a

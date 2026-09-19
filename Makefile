@@ -8,6 +8,7 @@ NELISP ?= ../nelisp/target/nelisp
 test:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/qwen-tokenizer-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/head-dim-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/rope-style-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/weights-header-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/weights-load-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/arch-test.el
@@ -367,7 +368,7 @@ clean:
 # --- Doc 08: weight import (docs/design/08-weight-import.org) -------------
 .PHONY: qwen-tokenizer-table test-qwen-tokenizer ollama-provider test-head-dim
 .PHONY: qwen-weights-table verify-qwen-weights test-weights-header
-.PHONY: qwen-weights-rows test-weights-load
+.PHONY: qwen-weights-rows test-weights-load test-rope-style
 
 # DONOR is a HuggingFace model directory holding config.json + tokenizer.json.
 # Everything under build/donor/ is donor-derived and gitignored.
@@ -433,3 +434,9 @@ qwen-weights-rows:
 # fixture scale; both trip it.
 test-weights-load:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/weights-load-test.el
+
+# The donor's rotation convention (half-split, not interleaved) and Qwen3's
+# QK-norm.  Both are silent when ignored, so both are pinned against the
+# suite's own reference.
+test-rope-style:
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/rope-style-test.el
