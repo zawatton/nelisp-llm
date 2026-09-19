@@ -349,6 +349,59 @@ look merely slow."
     (if h (nl-llm-wgpu-apply-t lin h g) (nl-llm-weights-apply-t lin g))))
 
 ;;;###autoload
+(defun nl-llm-wgpu-apply-resident (lin x base)
+  "Apply LIN to X at BASE on the GPU, using the handle from the current table.
+Falls back to the CPU when LIN is not resident, so a partially uploaded model
+runs and is merely slower."
+  (let ((h (and nl-llm-wgpu--transposes (gethash lin nl-llm-wgpu--transposes))))
+    (if h (nl-llm-wgpu-apply lin h x base) (nl-llm-weights-apply lin x base))))
+
+;;;###autoload
+(defmacro nl-llm-wgpu-with-linears (table &rest body)
+  "Run BODY with BOTH directions of every resident linear on the GPU.
+Unlike `nl-llm-wgpu-with-transposes' this also moves the forward, which is a
+*different computation* and not merely a faster one: the kernel quantizes the
+activation to int8, so a result computed here and one computed on the f32 path
+differ by about 7e-03 per block, not by rounding.  Use it when the comparison
+you intend is against the same W8A8 arithmetic; use the transposes-only macro
+when you want the verified f32 reference to still apply."
+  (declare (indent 1))
+  `(let ((nl-llm-wgpu--transposes ,table)
+         (nl-llm-wb-transpose-fn #'nl-llm-wgpu-transpose)
+         (nl-llm-wb-forward-fn #'nl-llm-wgpu-apply-resident))
+     ,@body))
+
+;;;###autoload
+(defun nl-llm-wgpu-open-model (wts &optional nlayers)
+  "Load NLAYERS of WTS and upload every matrix once; return a session plist.
+(:layers LIST :table HASH :cfg PLIST).  The point is the `once': a step that
+uploads per block pays about five seconds a block, which for 28 layers is more
+than the arithmetic it enables.  Qwen3-0.6B is 568 MiB of int8, so the whole
+model is resident inside a 6 GB card with room for the rest."
+  (let* ((cfg (nl-llm-weights-config wts))
+         (n (min (or nlayers (plist-get cfg :layers)) (plist-get cfg :layers)))
+         (layers nil))
+    (dotimes (ly n) (push (nl-llm-wf-load-layer wts ly) layers))
+    (setq layers (nreverse layers))
+    (let ((tbl (nl-llm-wgpu-upload-transposes layers))
+          ;; The tied head goes in the same table.  It is one more linear --
+          ;; 151936 x 1024, 155 MiB -- and both directions of it are the same
+          ;; two kernels, so scoring the vocabulary and pushing the gradient
+          ;; back from it need no new machinery.  Leaving it on the CPU would
+          ;; make it the whole cost: 70s against the blocks' 7.5s.
+          (head (nl-llm-weights-linear wts :wte)))
+      (puthash head (nl-llm-wgpu-upload head) tbl)
+      (list :layers layers :table tbl :cfg cfg
+            :head (list :lin head
+                        :lnf (nl-llm-weights-row
+                              wts (nl-llm-weights-tensor wts :lnf) 0))))))
+
+;;;###autoload
+(defun nl-llm-wgpu-close-model (session)
+  "Free SESSION's resident buffers."
+  (nl-llm-wgpu-free-transposes (plist-get session :table)))
+
+;;;###autoload
 (defmacro nl-llm-wgpu-with-transposes (table &rest body)
   "Run BODY with every frozen base's W^T.g routed through TABLE to the GPU.
 TABLE is from `nl-llm-wgpu-upload-transposes'; a linear absent from it falls

@@ -1,6 +1,7 @@
 #+TITLE: Weight import -- run an open-weight Qwen model natively, without training it
 #+OPTIONS: toc:2 num:t
-#+STATUS: P0-P2d SHIPPED; P3 -- the loop runs and is verified; CPU cost is the limit
+#+STATUS: P0-P2d SHIPPED; P3 -- the loop runs, is verified, and both directions
+#+STATUS: of every matrix including the head are on the GPU
 
 * Status
 Phases 0, 1, 2a, 2b and 2c SHIPPED on the CPU -- an imported Qwen3-0.6B runs,
@@ -463,9 +464,96 @@ transpose and the attention.  Everything downstream of a transpose inherits its
 f32 accumulation.
 
 So a training step's arithmetic is now GPU-side in both directions: the forward
-linears at 57x per block, the backward at 37x.  What remains between that and a
-practical loop is the upload, which this version pays per block per step, and
-the head.
+linears at 57x per block, the backward at 37x.  What remained between that and
+a practical loop was the upload, which that version paid per block per step,
+and the head.  Both are dealt with below.
+
+*The head is resident too, and finding that out cost a defect* --
+=nl-llm-wgpu-open-model= uploads the 28 layers' 196 matrices and the tied head
+once, 197 buffers and 723 MiB, in about 140s.  The head is one more linear,
+151936 x 1024, and both its directions are the two kernels already built, so
+nothing new was needed -- but leaving it on the CPU would have made it the
+whole cost of a step: 68s against the blocks' 7.5s.
+
+| measurement                                | result              |
+|--------------------------------------------+---------------------|
+| resident, 28 layers + head                 | 197 buffers, ~140s  |
+| head forward, GPU vs CPU f32               | 1.85s vs 67.9s, 37x |
+| head forward vs the same W8A8 on the CPU   | rel 3.7e-08         |
+| activation quantization at the head        | rel 2.2e-03         |
+| argmax preserved                           | yes                 |
+| head transpose, GPU vs CPU                 | 1.24s vs 58.7s, 47x |
+| head transpose vs the CPU transpose        | rel 9.5e-08         |
+| <W.x, g> = <x, W^T.g> at the head          | rel 4.8e-08         |
+
+The transpose is measured against a *real* gradient, softmax minus one-hot,
+of which 148068 of 151936 entries are subnormal in float32.  That detail is
+the whole of the next section.
+
+And =nl-llm-wtrain-step= now applies the head through =nl-llm-wb--apply= and
+=nl-llm-wb--transpose=, the same two hooks a block's linears use, so a caller
+that has uploaded it gets it on the GPU without that file knowing there is one.
+
+** The float32 encoder was wrapping, not clamping
+
+The first transpose of the head disagreed with the CPU by *rel 7.7e+30*, and
+the inner-product identity agreed that the GPU side was the wrong one.  The
+obvious suspect was the kernel at a size it had never seen -- 151936 rows
+against the 2048 it was written against.
+
+A row-count bisect said otherwise.  At 2048, 16384, 32768, 65536, 131072 and
+151936 rows the transpose was *correct every time*, rel 9.0e-07 to 1.2e-05,
+repeatable.  There was no threshold.  What differed between the bisect and the
+failure was not the size but the *values*: the bisect used a pseudo-random
+gradient, the failure a real one.
+
+=nelisp-gpu--f32-bits= masked the exponent with =#xff= and did nothing else,
+which is correct only while every value is of order one.  Outside float32's
+range it wrapped:
+
+| value  | encoded as |
+|--------+------------|
+| 1e-39  | 1.16e+38   |
+| 3.7e-44| 4.28e+33   |
+| 1e-60  | 1.16e+17   |
+| 1e+39  | 5.52e-39   |
+| 1e+300 | 5.56e-09   |
+
+A NaN did not encode at all -- it raised =overflow-error= out of the encoder.
+The decoder matched it in hiding things: an exponent of 255 came back as
+=1.0e30=, so a kernel that overflowed looked like one that returned a large
+number, which a comparison against a reference reports as a plausible relative
+error rather than a failure.
+
+The gradient of a completion-only cross-entropy is =softmax - onehot= over
+151936 entries.  Most of that softmax lies below float32's smallest normal, so
+most of the gradient arrived as numbers around 1e+33.
+
+*Why it had not been hit before.*  The floats this project sends are bias
+(zeros), the weight's per-row scales (about 1e-3) and one activation scale --
+all comfortably normal.  The quantized activation and the weight itself go
+through =nelisp-gpu-server-upload-bytes=, verbatim, and never touch the
+encoder.  The gradient was the first small-valued float buffer to cross it.
+
+Fixed in nelisp-gpu =ee1d37c=: subnormals encode as subnormals, underflow
+flushes to zero, overflow saturates to a signed infinity, NaN stays NaN, and
+the decoder returns infinities and NaNs as themselves.  =test/f32-test.el=
+(=make f32=) needs no GPU, because a defect in the encoding is invisible to
+any kernel comparison -- both sides of one are already wrong.  Against the
+previous encoder it fails four checks and aborts on the NaN one.
+
+*The lesson is the bisect, not the arithmetic.*  "It broke at a larger size"
+and "it broke on different values" look identical from one failing number.
+The bisect separated them in five minutes and pointed away from the code that
+looked guilty.  When a kernel agrees with its reference on synthetic input and
+disagrees on real input, suspect the transport before the computation.
+
+*What the GPU still does not reproduce.*  The device flushes subnormal inputs
+to zero, so a gradient whose entries are *all* subnormal returns zeros where
+the CPU returns something of order 1e-41.  That is a different answer, not a
+rounding difference.  It is harmless because a real gradient carries its mass
+in the entries that are normal -- the softmax-shaped case agrees to 6.9e-07 --
+but both cases are now in the suite rather than left to be discovered.
 
 Independent and still open: the f32 autograd path's own migration, since
 =nl-llm-ag-block= *refuses* =:head-dim=, =:rope-style= and QK-norm.  That

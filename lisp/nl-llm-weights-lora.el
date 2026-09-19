@@ -63,8 +63,11 @@
     y))
 
 ;;;###autoload
-(defun nl-llm-wlora-forward (lin lora x &optional base)
+(defun nl-llm-wlora-forward (lin lora x &optional base apply-fn)
   "Apply LIN with LORA to the COLS-long slice of X at BASE.
+APPLY-FN, when given, applies the base linear in place of
+`nl-llm-weights-apply' -- the hook a GPU path uses.  It is called with
+(LIN X BASE).
 Returns (Y U): Y the ROWS-long output, U the rank-long A.x kept so the backward
 pass does not recompute it.  With a fresh adapter B is zero, so Y equals the
 base's output exactly -- an invariant rather than an approximation."
@@ -80,7 +83,8 @@ base's output exactly -- an invariant rather than an approximation."
                (let ((v (make-vector cols 0.0)))
                  (dotimes (i cols) (aset v i (aref x (+ off i))))
                  v)))
-         (y (nl-llm-weights-apply lin x off)))
+         (y (if apply-fn (funcall apply-fn lin x off)
+              (nl-llm-weights-apply lin x off))))
     (unless (and (= (plist-get lora :out) rows) (= (plist-get lora :in) cols))
       (error "nl-llm-wlora-forward: adapter is %dx%d, weight is %dx%d"
              (plist-get lora :out) (plist-get lora :in) rows cols))

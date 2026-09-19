@@ -186,14 +186,28 @@ subtraction is forgotten and still looks like a gradient."
 ;; declaration would let the two drift apart silently.
 (require 'nl-llm-weights-forward)
 
+(defvar nl-llm-wb-forward-fn nil
+  "When non-nil, a function (LIN X BASE) applying a linear in place of the CPU.
+Bound alongside `nl-llm-wb-transpose-fn' to put a block's forward on the GPU
+too.  Note that it is a *different computation*, not merely a faster one: the
+GPU path quantizes the activation to int8, so a tape taken through it and one
+taken through the f32 path do not agree to rounding.  Bind it only when the
+comparison you intend is against the same W8A8 arithmetic.")
+
+(defun nl-llm-wb--apply (lin x base)
+  "Apply LIN to X at BASE, through `nl-llm-wb-forward-fn' if one is bound."
+  (if nl-llm-wb-forward-fn
+      (funcall nl-llm-wb-forward-fn lin x base)
+    (nl-llm-weights-apply lin x base)))
+
 (defun nl-llm-wb--lin-forward (lay role loras x base)
   "Apply LAY's ROLE to X at BASE, through a LoRA from LORAS if one is attached.
 Returns (Y U XS), U and XS nil when there is no adapter."
   (let ((lin (nl-llm-wf-layer-lin lay role))
         (lora (plist-get loras role)))
     (if lora
-        (nl-llm-wlora-forward lin lora x base)
-      (list (nl-llm-weights-apply lin x base) nil nil))))
+        (nl-llm-wlora-forward lin lora x base #'nl-llm-wb--apply)
+      (list (nl-llm-wb--apply lin x base) nil nil))))
 
 (defvar nl-llm-wb-transpose-fn nil
   "When non-nil, a function (LIN G) computing W^T.G in place of the CPU loop.

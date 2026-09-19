@@ -163,6 +163,48 @@
                                   (< gsec csec)
                                   (format "%.4fs vs %.4fs (%.0fx)"
                                           gsec csec (/ csec (max gsec 1.0e-6))))
+                          ;; What the GPU does NOT reproduce, stated as a
+                          ;; measurement rather than left to be discovered.
+                          ;; The device flushes subnormal inputs to zero, so a
+                          ;; gradient whose every entry is subnormal comes back
+                          ;; as zeros while the CPU returns something of order
+                          ;; 1e-41.  That is not a defect and not a rounding
+                          ;; difference -- it is a different answer -- and it
+                          ;; is harmless only because no real gradient looks
+                          ;; like that.  Pinning it here means the day one does,
+                          ;; this check says so instead of the training loop
+                          ;; quietly learning nothing.
+                          (let* ((tiny (make-vector (nl-llm-weights-lin-rows lin) 0.0)))
+                            (dotimes (i (length tiny))
+                              (aset tiny i (* 1.0e-42 (1+ (mod i 7)))))
+                            (let* ((tg (nl-llm-wgpu-apply-t lin handle tiny))
+                                   (tc (nl-llm-weights-apply-t lin tiny))
+                                   (gmax (wg--amax tg)) (cmax (wg--amax tc)))
+                              (wg--ck "subnormal inputs flush to zero on the GPU"
+                                      (and (= gmax 0.0) (> cmax 0.0))
+                                      (format "GPU amax %.3e, CPU amax %.3e"
+                                              gmax cmax))))
+                          ;; And the mixed case, which is what actually occurs:
+                          ;; a softmax tail is mostly subnormal but its mass
+                          ;; sits in the entries that are not, so the agreement
+                          ;; survives.  Before the encoder in nelisp-gpu was
+                          ;; fixed this disagreed by 7.7e+30, because every
+                          ;; subnormal was encoded as a number around 1e+33.
+                          (let* ((soft (make-vector (nl-llm-weights-lin-rows lin) 0.0))
+                                 (sub 0))
+                            (dotimes (i (length soft))
+                              (aset soft i (exp (- (* 0.05 i)))))
+                            (dotimes (i (length soft))
+                              (when (and (> (aref soft i) 0.0)
+                                         (< (aref soft i) 1.1754943508222875e-38))
+                                (setq sub (1+ sub))))
+                            (let* ((sg (nl-llm-wgpu-apply-t lin handle soft))
+                                   (sc2 (nl-llm-weights-apply-t lin soft))
+                                   (sm (wg--amax sc2)))
+                              (wg--ck "a softmax-shaped gradient still agrees"
+                                      (and (> sub 0) (< (wg--rel sg sc2 sm) 1.0e-4))
+                                      (format "rel %.3e, %d of %d entries subnormal"
+                                              (wg--rel sg sc2 sm) sub (length soft)))))
                           ;; <W.x, g> = <x, W^T.g>, with W^T from the GPU.
                           (let* ((wx (nl-llm-weights-apply lin act))
                                  (lhs (let ((s 0.0))
@@ -256,6 +298,165 @@
                                                  (append (car cpu) nil))
                                           "identical to the CPU backward")))
                             (nl-llm-wgpu-free-transposes tbl))))
+
+                      ;; --- the tied head, the other half of a step --------
+                      ;;
+                      ;; 151936 x 1024, the largest single matrix in the
+                      ;; model.  It is the same two kernels as a block's
+                      ;; linears, so there is no new arithmetic here; what is
+                      ;; new is that leaving it on the CPU makes it the whole
+                      ;; cost of a step, since every training position has to
+                      ;; score the vocabulary and push a gradient back.
+                      ;;
+                      ;; Two traps this section exists to pin down, both of
+                      ;; which produced confident wrong numbers first:
+                      ;;
+                      ;;   * the head's input is a *normalised* hidden state.
+                      ;;     An embedding row is lane*scale and therefore
+                      ;;     already int8-exact, so measuring activation
+                      ;;     quantization on one measures nothing -- it
+                      ;;     reported 3.9e-08 and meant it.
+                      ;;   * the gradient the head receives is dense.  A probe
+                      ;;     with 64 nonzeros out of 151936 made the CPU
+                      ;;     transpose look ten times *faster* than the GPU,
+                      ;;     because `nl-llm-weights-apply-t' skips rows whose
+                      ;;     scale times gradient is zero and that gradient
+                      ;;     gave it almost nothing to do.
+                      (let* ((hlin (nl-llm-weights-linear wts :wte))
+                             (lnf (nl-llm-weights-row
+                                   wts (nl-llm-weights-tensor wts :lnf) 0))
+                             (vocab (nl-llm-weights-lin-rows hlin))
+                             (hid (nl-llm-wf--rmsnorm emb 0 dim lnf 1.0e-6))
+                             (t6 (float-time))
+                             (hh (nl-llm-wgpu-upload hlin))
+                             (hup (- (float-time) t6)))
+                        (unwind-protect
+                            (progn
+                              (wg--ck "the tied head uploads as one buffer"
+                                      (integerp hh)
+                                      (format "%d x %d, %.0f MiB in %.1fs"
+                                              vocab dim
+                                              (/ (length (nl-llm-weights-lin-bytes hlin))
+                                                 1048576.0)
+                                              hup))
+                              (let* ((pack (nl-llm-wgpu-pack-act hid 0 dim))
+                                     (gam (cdr pack)) (ex t))
+                                (dotimes (i dim)
+                                  (let ((q (/ (aref hid i) gam)))
+                                    (when (> (abs (- q (round q))) 1.0e-9)
+                                      (setq ex nil))))
+                                (wg--ck "the head's input is NOT int8-exact"
+                                        (not ex)
+                                        "normalised hidden state, not an embedding row"))
+                              (let* ((t7 (float-time))
+                                     (gl (nl-llm-wgpu-apply hlin hh hid 0))
+                                     (fsec (- (float-time) t7)))
+                                (wg--ck "the head scores the vocabulary on the GPU"
+                                        (= (length gl) vocab)
+                                        (format "%d logits in %.2fs" vocab fsec))
+                                ;; The gradient of a completion-only
+                                ;; cross-entropy is softmax minus one-hot.
+                                ;; Count it rather than assume it: the sparse
+                                ;; probe above is only wrong because this is
+                                ;; true.
+                                (let* ((sm (copy-sequence gl)) (mx (aref sm 0))
+                                       (sum 0.0) (nz 0))
+                                  (dotimes (i vocab) (setq mx (max mx (aref sm i))))
+                                  (dotimes (i vocab)
+                                    (aset sm i (exp (- (aref sm i) mx)))
+                                    (setq sum (+ sum (aref sm i))))
+                                  (dotimes (i vocab)
+                                    (aset sm i (/ (aref sm i) sum))
+                                    (when (/= (aref sm i) 0.0) (setq nz (1+ nz))))
+                                  (wg--ck "the gradient a head receives is dense"
+                                          (> nz (/ vocab 2))
+                                          (format "%d of %d nonzero after softmax"
+                                                  nz vocab)))
+                                ;; The gradient for the identity below is the
+                                ;; head's own output, which makes the left side
+                                ;; <W.x, W.x> -- a sum of squares.  A signed
+                                ;; pseudo-random gradient was tried first and
+                                ;; is the wrong instrument here: over 151936
+                                ;; terms it cancels down to about 4.6 out of
+                                ;; individual terms near 1.8, so the forward's
+                                ;; 0.2% activation-quantization error lands on
+                                ;; a small difference of large numbers and the
+                                ;; identity reads 8e-02.  That is arithmetic,
+                                ;; not a defect -- the same transpose satisfies
+                                ;; the identity to 4.8e-08 against an f32
+                                ;; forward -- but a check whose tolerance has
+                                ;; to be loosened to 0.2 is not checking much.
+                                (let* ((gv (copy-sequence gl)))
+                                  (let* ((t8 (float-time))
+                                         (gt (nl-llm-wgpu-apply-t hlin hh gv))
+                                         (tsec (- (float-time) t8)))
+                                    (wg--ck "the head's transpose runs on the GPU"
+                                            (= (length gt) dim)
+                                            (format "%d x %d in %.2fs" dim vocab tsec))
+                                    ;; Structural, and cheap: no reference
+                                    ;; implementation, and no index error
+                                    ;; survives it.  Loose because the two
+                                    ;; sides are not the same arithmetic --
+                                    ;; the forward quantizes the activation,
+                                    ;; the transpose accumulates in f32.
+                                    (let* ((lhs 0.0) (rhs 0.0))
+                                      (dotimes (i vocab)
+                                        (setq lhs (+ lhs (* (aref gl i) (aref gv i)))))
+                                      (dotimes (i dim)
+                                        (setq rhs (+ rhs (* (aref hid i) (aref gt i)))))
+                                      (let ((rel (/ (abs (- lhs rhs))
+                                                    (max (abs lhs) (abs rhs) 1.0e-30))))
+                                        (wg--ck "the head satisfies <W.x, g> = <x, W^T.g>"
+                                                (< rel 1.0e-2)
+                                                (format "%.1f vs %.1f (rel %.2e, W8A8 vs f32)"
+                                                        lhs rhs rel))))
+                                    ;; The comparison against the CPU is
+                                    ;; behind an env var only because it is
+                                    ;; two minutes of Elisp over 151936 rows.
+                                    (if (not (getenv "NL_LLM_GPU_HEAD"))
+                                        (princ (format "%-50s %s  %s\n"
+                                                       "head vs the CPU reference" "----"
+                                                       "set NL_LLM_GPU_HEAD=1 to run (~2 min)"))
+                                      (let* ((t9 (float-time))
+                                             (w8 (nl-llm-weights-apply-w8a8 hlin hid 0))
+                                             (f32 (nl-llm-weights-apply hlin hid 0))
+                                             (csec (- (float-time) t9))
+                                             (sc (wg--amax f32))
+                                             (ta (float-time))
+                                             (ct (nl-llm-weights-apply-t hlin gv))
+                                             (tcsec (- (float-time) ta))
+                                             (tsc (wg--amax ct)))
+                                        (wg--ck "head forward == the same W8A8 on the CPU"
+                                                (< (wg--rel gl w8 sc) 1.0e-4)
+                                                (format "rel %.3e" (wg--rel gl w8 sc)))
+                                        (wg--ck "head forward picks the f32 argmax"
+                                                (= (car (nl-llm-wf-argmax gl))
+                                                   (car (nl-llm-wf-argmax f32)))
+                                                (format "%d, activation quantization rel %.3e, \
+CPU %.0fs" (car (nl-llm-wf-argmax gl)) (wg--rel gl f32 sc) csec))
+                                        (wg--ck "head transpose == the CPU transpose"
+                                                (< (wg--rel gt ct tsc) 1.0e-4)
+                                                (format "rel %.3e, CPU %.0fs (dense gradient)"
+                                                        (wg--rel gt ct tsc) tcsec))
+                                        ;; The identity again, now with the f32
+                                        ;; forward on the left, so the only
+                                        ;; approximation in it is the
+                                        ;; transpose's own f32 accumulation.
+                                        ;; This is the tight form; the cheap
+                                        ;; one above pays for avoiding a
+                                        ;; two-minute CPU pass.
+                                        (let ((lhs 0.0) (rhs 0.0))
+                                          (dotimes (i vocab)
+                                            (setq lhs (+ lhs (* (aref f32 i) (aref gv i)))))
+                                          (dotimes (i dim)
+                                            (setq rhs (+ rhs (* (aref hid i) (aref gt i)))))
+                                          (let ((rel (/ (abs (- lhs rhs))
+                                                        (max (abs lhs) (abs rhs) 1.0e-30))))
+                                            (wg--ck "the identity against an f32 forward"
+                                                    (< rel 1.0e-4)
+                                                    (format "%.1f vs %.1f (rel %.2e)"
+                                                            lhs rhs rel))))))))))
+                          (nelisp-gpu-server-free hh)))
 
                       ;; The acceptance criterion for this phase, behind an env
                       ;; var because it is a four-minute run: does the whole

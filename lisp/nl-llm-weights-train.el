@@ -131,10 +131,15 @@ updating, so a caller can check it."
     ;; completion token, so those are where the loss lives.
     (let ((p (max 0 (1- loss-start))))
       (while (< p (1- seq))
-        (let* ((logits (nl-llm-weights-apply (plist-get head :lin)
-                                             hidden (* p dim)))
+        ;; The head goes through the same two hooks as a block's linears, so
+        ;; a caller that has uploaded it gets it on the GPU without this file
+        ;; knowing there is one.  It matters more here than anywhere else: the
+        ;; head is 151936 x 1024, the largest matrix in the model, and every
+        ;; scored position pays it twice.
+        (let* ((logits (nl-llm-wb--apply (plist-get head :lin)
+                                         hidden (* p dim)))
                (lg (nl-llm-wtrain-xent logits vocab (aref ids-v (1+ p))))
-               (dh (nl-llm-weights-apply-t (plist-get head :lin) (cdr lg)))
+               (dh (nl-llm-wb--transpose (plist-get head :lin) (cdr lg)))
                (dn (nl-llm-wb-rmsnorm-vjp pre (* p dim) dim gain eps dh)))
           (setq total (+ total (car lg)) count (1+ count))
           (dotimes (t0 dim)
