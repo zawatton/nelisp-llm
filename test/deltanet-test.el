@@ -221,6 +221,64 @@ python3 tools/deltanet-ref.py\n" dn--fixture))
           (dn--ck (nth 0 sp) (< worst 1.0e-5)
                   (format "worst rel %.2e" worst))))))
 
+  ;; --- the whole block ---------------------------------------------------
+  ;;
+  ;; Projections, convolution, the recurrence per head, the gated norm and the
+  ;; output projection, checked end to end against finite differences for
+  ;; every input and every weight.
+  ;;
+  ;; nv/nk is 2 here on purpose.  With one key head per value head the repeat
+  ;; is an identity and an implementation that forgot to *accumulate* dq and dk
+  ;; across the value heads sharing them would pass; with two it does not.
+  (let* ((seq 4) (hidden 6) (nk 2) (nv 4) (hd 3) (kern 4)
+         (kd (* nk hd)) (vd (* nv hd)) (cd (+ kd kd vd))
+         (cfg (list :seq seq :hidden hidden :nk nk :nv nv :hd hd :kern kern
+                    :eps 1.0e-6))
+         (det (lambda (v mul md sc)
+                (dotimes (i (length v))
+                  (aset v i (* sc (- (mod (* (1+ i) mul) md) (/ md 2)))))
+                v))
+         (x (funcall det (make-vector (* seq hidden) 0.0) 7919 11 0.4))
+         (wts (list :wqkvz (funcall det (make-vector (* hidden (+ cd vd)) 0.0)
+                                    5387 9 0.15)
+                    :wba (funcall det (make-vector (* hidden 2 nv) 0.0) 3319 7 0.2)
+                    :conv-w (funcall det (make-vector (* cd kern) 0.0) 6151 7 0.25)
+                    :conv-b (funcall det (make-vector cd 0.0) 13 5 0.1)
+                    :a-log (funcall det (make-vector nv 0.0) 17 5 0.2)
+                    :dt-bias (funcall det (make-vector nv 0.0) 19 5 0.15)
+                    :norm-w (let ((w (make-vector hd 0.0)))
+                              (dotimes (i hd) (aset w i (+ 0.8 (* 0.1 i)))) w)
+                    :wout (funcall det (make-vector (* vd hidden) 0.0) 4271 9 0.18)))
+         (wt (funcall det (make-vector (* seq hidden) 0.0) 2749 9 0.3))
+         (h 1.0e-6))
+    (let* ((loss (lambda ()
+                   (let ((o (nth 0 (nl-llm-dn-block x cfg wts))) (acc 0.0))
+                     (dotimes (i (* seq hidden))
+                       (setq acc (+ acc (* (aref wt i) (aref o i)))))
+                     acc)))
+           (fw (nl-llm-dn-block x cfg wts))
+           (gr (nl-llm-dn-block-backward x cfg wts (nth 1 fw) wt)))
+      (dolist (sp (list (list "block dL/dx" x (plist-get gr :dx))
+                        (list "block dL/dwqkvz" (plist-get wts :wqkvz)
+                              (plist-get gr :dwqkvz))
+                        (list "block dL/dwba" (plist-get wts :wba)
+                              (plist-get gr :dwba))
+                        (list "block dL/dconv-w" (plist-get wts :conv-w)
+                              (plist-get gr :dconv-w))
+                        (list "block dL/dconv-b" (plist-get wts :conv-b)
+                              (plist-get gr :dconv-b))
+                        (list "block dL/da-log" (plist-get wts :a-log)
+                              (plist-get gr :da-log))
+                        (list "block dL/ddt-bias" (plist-get wts :dt-bias)
+                              (plist-get gr :ddt-bias))
+                        (list "block dL/dnorm-w" (plist-get wts :norm-w)
+                              (plist-get gr :dnorm-w))
+                        (list "block dL/dwout" (plist-get wts :wout)
+                              (plist-get gr :dwout))))
+        (let ((worst (dn--fd loss (nth 1 sp) (nth 2 sp) h)))
+          (dn--ck (nth 0 sp) (< worst 1.0e-5)
+                  (format "worst rel %.2e over %d" worst (length (nth 1 sp))))))))
+
   (princ (format "\n%s: %d failure(s)\n"
                  (if (zerop dn--fail) "deltanet OK" "deltanet") dn--fail))
   (when (> dn--fail 0) (kill-emacs 1)))

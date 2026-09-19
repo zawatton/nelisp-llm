@@ -325,5 +325,211 @@ NRM is the normalised value before the weight, which the backward reads."
                       (/ (* inv inv inv (aref x i) dot) (float n))))))
     (list :dx dx :dgate dgate :dweight dweight)))
 
+
+;;; --- the whole block ------------------------------------------------------
+;;
+;; in_proj -> causal conv + SiLU -> L2 norm -> the recurrence -> gated norm ->
+;; out_proj, which is the order the reference runs them in.  q and k have fewer
+;; heads than v and z and are repeated to match; at Qwen3.8-27B that is 16 QK
+;; heads against 48 value heads, so each key head serves three value heads.
+;;
+;; The projections are taken as plain f32 matrices rather than read from a
+;; weight file, so the block can be verified before anything can read the
+;; formats these models actually ship in.  Whatever supplies them later --
+;; ternary with group scales, or int8, or bf16 -- does not change what is
+;; below it.
+
+(defun nl-llm-dn--matmul (x w rows in out)
+  "X (ROWS x IN) times W (IN x OUT)."
+  (let ((y (make-vector (* rows out) 0.0)))
+    (dotimes (r rows)
+      (dotimes (o out)
+        (let ((acc 0.0))
+          (dotimes (i in)
+            (setq acc (+ acc (* (aref x (+ (* r in) i)) (aref w (+ (* i out) o))))))
+          (aset y (+ (* r out) o) acc))))
+    y))
+
+(defun nl-llm-dn--matmul-vjp (x w dy rows in out)
+  "Gradients of `nl-llm-dn--matmul'.  Returns (DX DW)."
+  (let ((dx (make-vector (* rows in) 0.0))
+        (dw (make-vector (* in out) 0.0)))
+    (dotimes (r rows)
+      (dotimes (i in)
+        (let ((acc 0.0))
+          (dotimes (o out)
+            (let ((d (aref dy (+ (* r out) o))))
+              (setq acc (+ acc (* d (aref w (+ (* i out) o)))))
+              (aset dw (+ (* i out) o)
+                    (+ (aref dw (+ (* i out) o))
+                       (* d (aref x (+ (* r in) i)))))))
+          (aset dx (+ (* r in) i) acc))))
+    (list dx dw)))
+
+(defun nl-llm-dn--slice (x rows stride off n)
+  "ROWS slices of N columns at OFF from X, which has STRIDE columns a row."
+  (let ((out (make-vector (* rows n) 0.0)))
+    (dotimes (r rows)
+      (dotimes (i n) (aset out (+ (* r n) i) (aref x (+ (* r stride) off i)))))
+    out))
+
+(defun nl-llm-dn--unslice (dst rows stride off src n)
+  "Add SRC (ROWS x N) into DST at column OFF, DST having STRIDE columns."
+  (dotimes (r rows)
+    (dotimes (i n)
+      (aset dst (+ (* r stride) off i)
+            (+ (aref dst (+ (* r stride) off i)) (aref src (+ (* r n) i))))))
+  dst)
+
+;;;###autoload
+(defun nl-llm-dn-block (x cfg wts)
+  "One Gated DeltaNet block over X (SEQ x HIDDEN); return (OUT TAPE).
+CFG is (:seq :hidden :nk :nv :hd :kern :eps).  WTS is (:wqkvz :wba :conv-w
+:conv-b :a-log :dt-bias :norm-w :wout)."
+  (let* ((seq (plist-get cfg :seq)) (hidden (plist-get cfg :hidden))
+         (nk (plist-get cfg :nk)) (nv (plist-get cfg :nv))
+         (hd (plist-get cfg :hd)) (kern (plist-get cfg :kern))
+         (eps (or (plist-get cfg :eps) 1.0e-6))
+         (kd (* nk hd)) (vd (* nv hd)) (cd (+ kd kd vd))
+         (qkvz-out (+ cd vd)) (grp (/ nv nk))
+         (qkvz (nl-llm-dn--matmul x (plist-get wts :wqkvz) seq hidden qkvz-out))
+         (ba (nl-llm-dn--matmul x (plist-get wts :wba) seq hidden (* 2 nv)))
+         ;; q, k and v are the first CD columns, laid out exactly as the
+         ;; convolution wants them, so no copy is needed to build its input
+         (mixed (nl-llm-dn--slice qkvz seq qkvz-out 0 cd))
+         (cv (nl-llm-dn-conv mixed (plist-get wts :conv-w) (plist-get wts :conv-b)
+                             seq cd kern))
+         (conv-out (nth 0 cv)) (conv-pre (nth 1 cv))
+         (z (nl-llm-dn--slice qkvz seq qkvz-out cd vd))
+         (ctx (make-vector (* seq vd) 0.0))
+         (heads nil))
+    ;; one recurrence per value head, its q and k coming from the key head it
+    ;; shares with GRP-1 others
+    (dotimes (h nv)
+      (let* ((kh (/ h grp))
+             (qh (make-vector (* seq hd) 0.0))
+             (kh-v (make-vector (* seq hd) 0.0))
+             (vh (make-vector (* seq hd) 0.0))
+             (ah (make-vector seq 0.0)) (bh (make-vector seq 0.0)))
+        (dotimes (tt seq)
+          (dotimes (i hd)
+            (aset qh (+ (* tt hd) i) (aref conv-out (+ (* tt cd) (* kh hd) i)))
+            (aset kh-v (+ (* tt hd) i) (aref conv-out (+ (* tt cd) kd (* kh hd) i)))
+            (aset vh (+ (* tt hd) i)
+                  (aref conv-out (+ (* tt cd) kd kd (* h hd) i))))
+          (aset ah tt (aref ba (+ (* tt 2 nv) h)))
+          (aset bh tt (aref ba (+ (* tt 2 nv) nv h))))
+        (let* ((fw (nl-llm-dn-forward qh kh-v vh ah bh
+                                      (aref (plist-get wts :a-log) h)
+                                      (aref (plist-get wts :dt-bias) h)
+                                      seq hd hd))
+               (oh (nth 0 fw)))
+          (push (list :h h :tape (nth 1 fw) :q qh :k kh-v :v vh :a ah :b bh
+                      :out oh)
+                heads)
+          (dotimes (tt seq)
+            (dotimes (i hd)
+              (aset ctx (+ (* tt vd) (* h hd) i) (aref oh (+ (* tt hd) i))))))))
+    (setq heads (nreverse heads))
+    ;; the gated norm, per (position, value head), then the output projection
+    (let ((gated (make-vector (* seq vd) 0.0)) (nrms nil))
+      (dotimes (tt seq)
+        (dotimes (h nv)
+          (let* ((xs (make-vector hd 0.0)) (gs (make-vector hd 0.0)))
+            (dotimes (i hd)
+              (aset xs i (aref ctx (+ (* tt vd) (* h hd) i)))
+              (aset gs i (aref z (+ (* tt vd) (* h hd) i))))
+            (let ((r (nl-llm-dn-norm-gated xs gs (plist-get wts :norm-w) hd eps)))
+              (push (list tt h xs gs (nth 1 r)) nrms)
+              (dotimes (i hd)
+                (aset gated (+ (* tt vd) (* h hd) i) (aref (nth 0 r) i)))))))
+      (let ((out (nl-llm-dn--matmul gated (plist-get wts :wout) seq vd hidden)))
+        (list out
+              (list :qkvz qkvz :ba ba :mixed mixed :conv-out conv-out
+                    :conv-pre conv-pre :z z :ctx ctx :gated gated
+                    :heads heads :nrms (nreverse nrms)))))))
+
+
+;;;###autoload
+(defun nl-llm-dn-block-backward (x cfg wts tape dout)
+  "Gradient of `nl-llm-dn-block' for output gradient DOUT.
+Returns a plist (:dx :dwqkvz :dwba :dconv-w :dconv-b :da-log :ddt-bias
+:dnorm-w :dwout).  Everything is the reverse of the forward in order; the
+only part that is not a straight composition is that q and k are shared
+across GRP value heads, so their gradients accumulate rather than assign."
+  (let* ((seq (plist-get cfg :seq)) (hidden (plist-get cfg :hidden))
+         (nk (plist-get cfg :nk)) (nv (plist-get cfg :nv))
+         (hd (plist-get cfg :hd)) (kern (plist-get cfg :kern))
+         (eps (or (plist-get cfg :eps) 1.0e-6))
+         (kd (* nk hd)) (vd (* nv hd)) (cd (+ kd kd vd))
+         (qkvz-out (+ cd vd)) (grp (/ nv nk))
+         (mm (nl-llm-dn--matmul-vjp (plist-get tape :gated) (plist-get wts :wout)
+                                    dout seq vd hidden))
+         (dgated (nth 0 mm)) (dwout (nth 1 mm))
+         (dctx (make-vector (* seq vd) 0.0))
+         (dz (make-vector (* seq vd) 0.0))
+         (dnorm-w (make-vector hd 0.0))
+         (dconv-out (make-vector (* seq cd) 0.0))
+         (dba (make-vector (* seq 2 nv) 0.0))
+         (da-log (make-vector nv 0.0)) (ddt (make-vector nv 0.0)))
+    ;; the gated norm, per (position, head)
+    (dolist (rec (plist-get tape :nrms))
+      (let* ((tt (nth 0 rec)) (h (nth 1 rec)) (xs (nth 2 rec)) (gs (nth 3 rec))
+             (nrm (nth 4 rec))
+             (dd (make-vector hd 0.0)))
+        (dotimes (i hd) (aset dd i (aref dgated (+ (* tt vd) (* h hd) i))))
+        (let ((g (nl-llm-dn-norm-gated-vjp xs gs (plist-get wts :norm-w)
+                                           nrm dd hd eps)))
+          (dotimes (i hd)
+            (aset dctx (+ (* tt vd) (* h hd) i) (aref (plist-get g :dx) i))
+            (aset dz (+ (* tt vd) (* h hd) i) (aref (plist-get g :dgate) i))
+            (aset dnorm-w i (+ (aref dnorm-w i) (aref (plist-get g :dweight) i)))))))
+    ;; each head's recurrence
+    (dolist (hr (plist-get tape :heads))
+      (let* ((h (plist-get hr :h)) (kh (/ h grp))
+             (doh (make-vector (* seq hd) 0.0)))
+        (dotimes (tt seq)
+          (dotimes (i hd)
+            (aset doh (+ (* tt hd) i) (aref dctx (+ (* tt vd) (* h hd) i)))))
+        (let ((g (nl-llm-dn-backward (plist-get hr :q) (plist-get hr :k)
+                                     (plist-get hr :v) (plist-get hr :a)
+                                     (plist-get hr :b)
+                                     (aref (plist-get wts :a-log) h)
+                                     (aref (plist-get wts :dt-bias) h)
+                                     seq hd hd (plist-get hr :tape) doh)))
+          (dotimes (tt seq)
+            (dotimes (i hd)
+              ;; q and k are shared by GRP value heads: accumulate
+              (aset dconv-out (+ (* tt cd) (* kh hd) i)
+                    (+ (aref dconv-out (+ (* tt cd) (* kh hd) i))
+                       (aref (plist-get g :dq) (+ (* tt hd) i))))
+              (aset dconv-out (+ (* tt cd) kd (* kh hd) i)
+                    (+ (aref dconv-out (+ (* tt cd) kd (* kh hd) i))
+                       (aref (plist-get g :dk) (+ (* tt hd) i))))
+              (aset dconv-out (+ (* tt cd) kd kd (* h hd) i)
+                    (aref (plist-get g :dv) (+ (* tt hd) i))))
+            (aset dba (+ (* tt 2 nv) h) (aref (plist-get g :da) tt))
+            (aset dba (+ (* tt 2 nv) nv h) (aref (plist-get g :db) tt)))
+          (aset da-log h (plist-get g :da-log))
+          (aset ddt h (plist-get g :ddt-bias)))))
+    ;; the convolution, then the two projections
+    (let* ((cg (nl-llm-dn-conv-vjp (plist-get tape :mixed) (plist-get wts :conv-w)
+                                   (plist-get tape :conv-pre) dconv-out
+                                   seq cd kern))
+           (dqkvz (make-vector (* seq qkvz-out) 0.0)))
+      (nl-llm-dn--unslice dqkvz seq qkvz-out 0 (plist-get cg :dx) cd)
+      (nl-llm-dn--unslice dqkvz seq qkvz-out cd dz vd)
+      (let* ((m1 (nl-llm-dn--matmul-vjp x (plist-get wts :wqkvz) dqkvz
+                                        seq hidden qkvz-out))
+             (m2 (nl-llm-dn--matmul-vjp x (plist-get wts :wba) dba
+                                        seq hidden (* 2 nv)))
+             (dx (make-vector (* seq hidden) 0.0)))
+        (dotimes (i (* seq hidden))
+          (aset dx i (+ (aref (nth 0 m1) i) (aref (nth 0 m2) i))))
+        (list :dx dx :dwqkvz (nth 1 m1) :dwba (nth 1 m2)
+              :dconv-w (plist-get cg :dw) :dconv-b (plist-get cg :dbias)
+              :da-log da-log :ddt-bias ddt
+              :dnorm-w dnorm-w :dwout dwout)))))
+
 (provide 'nl-llm-deltanet)
 ;;; nl-llm-deltanet.el ends here
