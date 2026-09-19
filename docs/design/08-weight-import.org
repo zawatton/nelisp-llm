@@ -1,7 +1,7 @@
 #+TITLE: Weight import -- run an open-weight Qwen model natively, without training it
 #+OPTIONS: toc:2 num:t
-#+STATUS: P0-P2d SHIPPED; P3 -- the loop runs, is verified, and both directions
-#+STATUS: of every matrix including the head are on the GPU
+#+STATUS: P0-P2d SHIPPED; P3 -- the loop runs, is verified, and a whole step is
+#+STATUS: 54.6s on the GPU against 2059.6s on the CPU, against a W8A8 objective
 
 * Status
 Phases 0, 1, 2a, 2b and 2c SHIPPED on the CPU -- an imported Qwen3-0.6B runs,
@@ -554,6 +554,48 @@ the CPU returns something of order 1e-41.  That is a different answer, not a
 rounding difference.  It is harmless because a real gradient carries its mass
 in the entries that are normal -- the softmax-shaped case agrees to 6.9e-07 --
 but both cases are now in the suite rather than left to be discovered.
+
+** One whole step, measured
+
+Six tokens, one scored position, a rank-8 LoRA on =:wv=, everything resident:
+
+| step                                    | time    | loss   |
+|-----------------------------------------+---------+--------|
+| all on the GPU (=with-linears=)         | 54.6s   | 1.0093 |
+| the CPU reference (nothing bound)       | 2059.6s | 0.5592 |
+
+*37.7x, and the two do not compute the same loss.*  Both evaluate the same
+base model -- a fresh adapter has B at zero, so it is exactly the identity --
+so the whole of 0.5592 against 1.0093 is activation quantization, compounded
+through 28 blocks and the head.  It is the same effect the end-to-end token
+showed earlier, where the argmax survived but the winning logit moved about 5%;
+here it is expressed as a loss, and as a loss it is not a small difference.
+
+That is a decision rather than a defect, and it is worth stating which
+decision.  The fast forward *must* quantize activations: DP4A multiplies int8
+by int8, and there is no f32-activation kernel for an int8 weight.  So:
+
+- If the model will be *served* through this same W8A8 path -- which is what
+  =nl-llm-wgpu-next-token= does -- then training against the W8A8 forward is
+  train/test match, and training against the f32 forward would be the
+  mismatch.
+- If the adaptation is meant for an f32 deployment, bind only
+  =nl-llm-wgpu-with-transposes=.  The backward still runs on the GPU and the
+  forward stays on the verified f32 path, which costs most of the 2059s back,
+  because the forward is the larger half.
+
+The suite keeps both honest: =with-linears= is compared against the same W8A8
+arithmetic on the CPU (rel 3.7e-08 at the head), and =with-transposes= against
+the f32 reference (rel 1.1e-06 for a block's dx).  What is *not* claimed
+anywhere is that they agree with each other.
+
+*Where the time goes now.*  =nl-llm-wgpu-apply= handles one position per call,
+so a step at seq 6 issues 7 linears x 6 positions x 28 layers = 1176 dispatches
+each way.  At 54.6s that is about 23ms a dispatch against kernels measured in
+single-digit milliseconds, so the round trip -- not the arithmetic -- is now the
+cost.  The next improvement is batching through =nelisp-gpu-server-batch=,
+which already exists, rather than any new numerics.  That is a hypothesis from
+the arithmetic of the breakdown and is not yet measured.
 
 Independent and still open: the f32 autograd path's own migration, since
 =nl-llm-ag-block= *refuses* =:head-dim=, =:rope-style= and QK-norm.  That
