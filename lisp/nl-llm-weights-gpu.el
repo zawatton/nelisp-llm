@@ -460,6 +460,20 @@ look merely slow."
     (if h (nl-llm-wgpu-apply-t lin h g) (nl-llm-weights-apply-t lin g))))
 
 ;;;###autoload
+(defun nl-llm-wgpu-apply-seq-resident (lin x seq stride)
+  "Apply LIN to SEQ slices of X on the GPU, using the current table.
+Falls back to SEQ separate CPU applications when LIN is not resident, so a
+partially uploaded model runs and is merely slower."
+  (let ((h (and nl-llm-wgpu--transposes (gethash lin nl-llm-wgpu--transposes))))
+    (if h (nl-llm-wgpu-apply-seq lin h x 0 seq stride)
+      (let* ((rows (nl-llm-weights-lin-rows lin))
+             (out (make-vector (* seq rows) 0.0)))
+        (dotimes (p seq)
+          (let ((y (nl-llm-weights-apply lin x (* p stride))))
+            (dotimes (o rows) (aset out (+ (* p rows) o) (aref y o)))))
+        out))))
+
+;;;###autoload
 (defun nl-llm-wgpu-apply-resident (lin x base)
   "Apply LIN to X at BASE on the GPU, using the handle from the current table.
 Falls back to the CPU when LIN is not resident, so a partially uploaded model
@@ -479,7 +493,8 @@ when you want the verified f32 reference to still apply."
   (declare (indent 1))
   `(let ((nl-llm-wgpu--transposes ,table)
          (nl-llm-wb-transpose-fn #'nl-llm-wgpu-transpose)
-         (nl-llm-wb-forward-fn #'nl-llm-wgpu-apply-resident))
+         (nl-llm-wb-forward-fn #'nl-llm-wgpu-apply-resident)
+         (nl-llm-wb-forward-seq-fn #'nl-llm-wgpu-apply-seq-resident))
      ,@body))
 
 ;;;###autoload

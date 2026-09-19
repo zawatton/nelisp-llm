@@ -299,6 +299,44 @@
                                           "identical to the CPU backward")))
                             (nl-llm-wgpu-free-transposes tbl))))
 
+                      ;; --- the block forward, batched and not --------------
+                      ;;
+                      ;; `nl-llm-wb-block-forward' now applies the linears a
+                      ;; role at a time rather than a position at a time.  The
+                      ;; direct check on that restructure is to run it both
+                      ;; ways on the same GPU table and demand the outputs be
+                      ;; identical: unbinding the batched hook inside
+                      ;; `with-linears' puts the position loop back, and
+                      ;; everything else is the same code.  A difference here
+                      ;; is a layout error in the batching, which is the one
+                      ;; mistake that still produces plausible numbers.
+                      (let* ((lay (nl-llm-wf-load-layer wts 0))
+                             (seq 4)
+                             (xs (make-vector (* seq dim) 0.0)))
+                        (dotimes (p seq)
+                          (let ((row (nl-llm-weights-embed wts (+ 785 p))))
+                            (dotimes (i dim)
+                              (aset xs (+ (* p dim) i) (aref row i)))))
+                        (let ((tbl (nl-llm-wgpu-upload-transposes (list lay))))
+                          (unwind-protect
+                              (let* ((batched (nl-llm-wgpu-with-linears tbl
+                                                (nl-llm-wb-block-forward
+                                                 lay xs seq cfg)))
+                                     (per-pos (nl-llm-wgpu-with-linears tbl
+                                                (let ((nl-llm-wb-forward-seq-fn nil))
+                                                  (nl-llm-wb-block-forward
+                                                   lay xs seq cfg))))
+                                     (a (nth 0 batched)) (b (nth 0 per-pos))
+                                     (bad 0))
+                                (dotimes (i (length a))
+                                  (unless (= (aref a i) (aref b i))
+                                    (setq bad (1+ bad))))
+                                (wg--ck "block forward: batched == per-position"
+                                        (zerop bad)
+                                        (format "%d of %d differ, seq %d"
+                                                bad (length a) seq)))
+                            (nl-llm-wgpu-free-transposes tbl))))
+
                       ;; --- a batch of positions in one dispatch ------------
                       ;;
                       ;; Equality here is exact, not approximate, and that is

@@ -200,6 +200,49 @@ comparison you intend is against the same W8A8 arithmetic.")
       (funcall nl-llm-wb-forward-fn lin x base)
     (nl-llm-weights-apply lin x base)))
 
+(defvar nl-llm-wb-forward-seq-fn nil
+  "When non-nil, a function (LIN X SEQ STRIDE) applying LIN to SEQ slices.
+Slice P is COLS wide at P*STRIDE, and the result is SEQ x ROWS.  Bound
+alongside the per-call hooks when the backing store can carry a batch of
+positions in one call, which is where the cost of these calls actually is.")
+
+(defun nl-llm-wb--apply-seq (lin x seq stride)
+  "Apply LIN to SEQ slices of X, returning SEQ x ROWS.
+Falls back to SEQ separate applications -- through `nl-llm-wb--apply', so the
+per-call hook still applies -- when no batched one is bound.  The two agree
+exactly: batching changes how the arithmetic is carried, not what it is."
+  (if nl-llm-wb-forward-seq-fn
+      (funcall nl-llm-wb-forward-seq-fn lin x seq stride)
+    (let* ((rows (nl-llm-weights-lin-rows lin))
+           (out (make-vector (* seq rows) 0.0)))
+      (dotimes (p seq)
+        (let ((y (nl-llm-wb--apply lin x (* p stride))))
+          (dotimes (o rows) (aset out (+ (* p rows) o) (aref y o)))))
+      out)))
+
+(defun nl-llm-wb--lin-forward-seq (lay role loras x seq stride)
+  "LAY's ROLE over SEQ slices of X; returns a list of SEQ (Y U XS) triples.
+The base is applied once for all positions and the adapter is then run per
+position through `nl-llm-wlora-forward' itself, handed the precomputed base
+output.  Reusing that function rather than repeating its arithmetic is
+deliberate: the adapter's forward and its backward have to agree about what U
+and XS are, and a second copy of it here is exactly the kind of thing that
+drifts."
+  (let* ((lin (nl-llm-wf-layer-lin lay role))
+         (lora (plist-get loras role))
+         (rows (nl-llm-weights-lin-rows lin))
+         (base (nl-llm-wb--apply-seq lin x seq stride))
+         (out nil))
+    (dotimes (p seq)
+      (let ((yp (make-vector rows 0.0)))
+        (dotimes (o rows) (aset yp o (aref base (+ (* p rows) o))))
+        (push (if lora
+                  (nl-llm-wlora-forward lin lora x (* p stride)
+                                        (lambda (_lin _x _base) yp))
+                (list yp nil nil))
+              out)))
+    (nreverse out)))
+
 (defun nl-llm-wb--lin-forward (lay role loras x base)
   "Apply LAY's ROLE to X at BASE, through a LoRA from LORAS if one is attached.
 Returns (Y U XS), U and XS nil when there is no adapter."
@@ -257,8 +300,15 @@ backward can be taken over a layer loaded either way."
 (defun nl-llm-wb-block-forward (lay x seq cfg &optional loras)
   "Run one imported block over X, keeping what the backward needs.
 Returns (OUT TAPE).  LORAS is a plist ROLE -> adapter; roles without one use
-the frozen base alone.  OUT is identical to `nl-llm-wf-block's output, which
-the suite checks bit for bit."
+the frozen base alone.  OUT is identical to `nl-llm-wf-block\='s output, which
+the suite checks bit for bit.
+
+The linears go a *role* at a time rather than a position at a time, so the
+seven of them are seven calls whatever SEQ is.  That reads less naturally than
+the position loop it replaces, and it is the point: the cost of one of these
+calls is a round trip plus an Elisp-side float encoding rather than the kernel,
+so a block at seq 6 was paying 42 of them to apply 7 matrices.  The tape is
+built exactly as before, which is what leaves the backward untouched."
   (let* ((dim (plist-get cfg :dim)) (heads (plist-get cfg :heads))
          (kv-heads (plist-get cfg :kv-heads)) (hd (plist-get cfg :head-dim))
          (rbase (plist-get cfg :rope-base))
@@ -268,66 +318,75 @@ the suite checks bit for bit."
          (q (make-vector (* seq qdim) 0.0))
          (k (make-vector (* seq kvdim) 0.0))
          (v (make-vector (* seq kvdim) 0.0))
-         (as nil) (qsaved nil) (ksaved nil) (vsaved nil))
+         (as nil))
     (dotimes (i seq)
-      (let* ((a (nl-llm-wf--rmsnorm x (* i dim) dim
-                                    (nl-llm-wf-layer-ln1g lay) eps))
-             (fq (nl-llm-wb--lin-forward lay :wq loras a 0))
-             (fk (nl-llm-wb--lin-forward lay :wk loras a 0))
-             (fv (nl-llm-wb--lin-forward lay :wv loras a 0)))
-        (push a as) (push fq qsaved) (push fk ksaved) (push fv vsaved)
-        (dotimes (t0 qdim) (aset q (+ (* i qdim) t0) (aref (nth 0 fq) t0)))
-        (dotimes (t0 kvdim) (aset k (+ (* i kvdim) t0) (aref (nth 0 fk) t0)))
-        (dotimes (t0 kvdim) (aset v (+ (* i kvdim) t0) (aref (nth 0 fv) t0)))))
-    (setq as (nreverse as) qsaved (nreverse qsaved)
-          ksaved (nreverse ksaved) vsaved (nreverse vsaved))
-    ;; QK-norm's vjp needs these; the rotation's does not, but attention's
-    ;; needs the post-rotation values, so both are kept.
-    (let ((q-pre (copy-sequence q)) (k-pre (copy-sequence k)))
+      (push (nl-llm-wf--rmsnorm x (* i dim) dim
+                                (nl-llm-wf-layer-ln1g lay) eps)
+            as))
+    (setq as (nreverse as))
+    (let* ((a-all (apply #'vconcat as))
+           (qsaved (nl-llm-wb--lin-forward-seq lay :wq loras a-all seq dim))
+           (ksaved (nl-llm-wb--lin-forward-seq lay :wk loras a-all seq dim))
+           (vsaved (nl-llm-wb--lin-forward-seq lay :wv loras a-all seq dim)))
       (dotimes (i seq)
-        (nl-llm--rmsnorm-heads q (* i qdim) heads hd
-                               (photon-tensor (list hd)
-                                              (nl-llm-wf-layer-q-norm lay)) eps)
-        (nl-llm--rmsnorm-heads k (* i kvdim) kv-heads hd
-                               (photon-tensor (list hd)
-                                              (nl-llm-wf-layer-k-norm lay)) eps)
-        (nl-llm--rope-heads q (* i qdim) heads hd i rbase 'half)
-        (nl-llm--rope-heads k (* i kvdim) kv-heads hd i rbase 'half))
-      (let* ((ctx (nl-llm-wf--attend q k v seq heads kv-heads hd))
-             (x1 (make-vector (* seq dim) 0.0))
-             (osaved nil))
+        (let ((fq (nth i qsaved)) (fk (nth i ksaved)) (fv (nth i vsaved)))
+          (dotimes (t0 qdim) (aset q (+ (* i qdim) t0) (aref (nth 0 fq) t0)))
+          (dotimes (t0 kvdim) (aset k (+ (* i kvdim) t0) (aref (nth 0 fk) t0)))
+          (dotimes (t0 kvdim) (aset v (+ (* i kvdim) t0) (aref (nth 0 fv) t0)))))
+      ;; QK-norm's vjp needs these; the rotation's does not, but attention's
+      ;; needs the post-rotation values, so both are kept.
+      (let ((q-pre (copy-sequence q)) (k-pre (copy-sequence k)))
         (dotimes (i seq)
-          (let ((fo (nl-llm-wb--lin-forward lay :wo loras ctx (* i qdim))))
-            (push fo osaved)
-            (dotimes (t0 dim)
-              (aset x1 (+ (* i dim) t0)
-                    (+ (aref x (+ (* i dim) t0)) (aref (nth 0 fo) t0))))))
-        (setq osaved (nreverse osaved))
-        (let ((out (make-vector (* seq dim) 0.0))
-              (bs nil) (gs nil) (us nil) (hs nil) (ds nil))
+          (nl-llm--rmsnorm-heads q (* i qdim) heads hd
+                                 (photon-tensor (list hd)
+                                                (nl-llm-wf-layer-q-norm lay)) eps)
+          (nl-llm--rmsnorm-heads k (* i kvdim) kv-heads hd
+                                 (photon-tensor (list hd)
+                                                (nl-llm-wf-layer-k-norm lay)) eps)
+          (nl-llm--rope-heads q (* i qdim) heads hd i rbase 'half)
+          (nl-llm--rope-heads k (* i kvdim) kv-heads hd i rbase 'half))
+        (let* ((ctx (nl-llm-wf--attend q k v seq heads kv-heads hd))
+               (osaved (nl-llm-wb--lin-forward-seq lay :wo loras ctx seq qdim))
+               (x1 (make-vector (* seq dim) 0.0)))
           (dotimes (i seq)
-            (let* ((b (nl-llm-wf--rmsnorm x1 (* i dim) dim
-                                          (nl-llm-wf-layer-ln2g lay) eps))
-                   (fg (nl-llm-wb--lin-forward lay :wg loras b 0))
-                   (fu (nl-llm-wb--lin-forward lay :wu loras b 0))
-                   (h (nl-llm-wf--silu-mul (nth 0 fg) (nth 0 fu) ff))
-                   (fd (nl-llm-wb--lin-forward lay :wd loras h 0)))
-              (push b bs) (push fg gs) (push fu us) (push h hs) (push fd ds)
+            (let ((yo (nth 0 (nth i osaved))))
               (dotimes (t0 dim)
-                (aset out (+ (* i dim) t0)
-                      (+ (aref x1 (+ (* i dim) t0)) (aref (nth 0 fd) t0))))))
-          ;; One nreverse per list.  `nreverse' is destructive, so calling it
-          ;; twice on the same list -- which an earlier version did, to fill
-          ;; both :g and :fg -- corrupts it.  Each list is reversed once here
-          ;; and the saved (Y U XS) triples are the only copy kept.
-          (list out
-                (list :x x :a as :q-pre q-pre :k-pre k-pre
-                      :q q :k k :v v :ctx ctx :x1 x1
-                      :b (nreverse bs) :h (nreverse hs)
-                      :fq qsaved :fk ksaved :fv vsaved :fo osaved
-                      :fg (nreverse gs) :fu (nreverse us) :fd (nreverse ds)
-                      :ff ff)))))))
-
+                (aset x1 (+ (* i dim) t0)
+                      (+ (aref x (+ (* i dim) t0)) (aref yo t0))))))
+          (let ((bs nil))
+            (dotimes (i seq)
+              (push (nl-llm-wf--rmsnorm x1 (* i dim) dim
+                                        (nl-llm-wf-layer-ln2g lay) eps)
+                    bs))
+            (setq bs (nreverse bs))
+            (let* ((b-all (apply #'vconcat bs))
+                   (gs (nl-llm-wb--lin-forward-seq lay :wg loras b-all seq dim))
+                   (us (nl-llm-wb--lin-forward-seq lay :wu loras b-all seq dim))
+                   (hs nil))
+              (dotimes (i seq)
+                (push (nl-llm-wf--silu-mul (nth 0 (nth i gs))
+                                           (nth 0 (nth i us)) ff)
+                      hs))
+              (setq hs (nreverse hs))
+              (let* ((h-all (apply #'vconcat hs))
+                     (ds (nl-llm-wb--lin-forward-seq lay :wd loras h-all seq ff))
+                     (out (make-vector (* seq dim) 0.0)))
+                (dotimes (i seq)
+                  (let ((yd (nth 0 (nth i ds))))
+                    (dotimes (t0 dim)
+                      (aset out (+ (* i dim) t0)
+                            (+ (aref x1 (+ (* i dim) t0)) (aref yd t0))))))
+                ;; Every list here is reversed exactly once, above, and handed
+                ;; over as it stands.  `nreverse' is destructive, so reversing
+                ;; one twice -- which an earlier version did, filling both :g
+                ;; and :fg -- corrupts it.
+                (list out
+                      (list :x x :a as :q-pre q-pre :k-pre k-pre
+                            :q q :k k :v v :ctx ctx :x1 x1
+                            :b bs :h hs
+                            :fq qsaved :fk ksaved :fv vsaved :fo osaved
+                            :fg gs :fu us :fd ds
+                            :ff ff))))))))))
 (defun nl-llm-wb--merge-grads (into role grads)
   "Accumulate GRADS for ROLE into the plist INTO.  Returns the new plist."
   (if (null grads) into
