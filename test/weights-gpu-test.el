@@ -934,6 +934,88 @@ CPU %.0fs" (car (nl-llm-wf-argmax gl)) (wg--rel gl f32 sc) csec))
                                                             lhs rhs rel))))))))))
                           (nelisp-gpu-server-free hh)))
 
+                      ;; --- the decomposed attention, and its vjps ----------
+                      ;;
+                      ;; `attn-causal-gqa' computes the context and throws the
+                      ;; probabilities away, which is right for inference and
+                      ;; useless for a backward: every attention vjp kernel
+                      ;; takes P.  So a training path has to use the decomposed
+                      ;; form -- scores, softmax, context -- and the question
+                      ;; is whether that form computes the same thing this
+                      ;; project means by attention.
+                      ;;
+                      ;; It is a question about conventions and none of them
+                      ;; show up in shapes: where the 1/sqrt(hd) is applied,
+                      ;; how the causal mask is expressed, how P is laid out
+                      ;; across heads.  Hence numbers rather than reading.
+                      (let* ((aseq2 6)
+                             (ahe (plist-get cfg :heads))
+                             (akv (plist-get cfg :kv-heads))
+                             (ahd (plist-get cfg :head-dim))
+                             (aqd (* ahe ahd)) (akd (* akv ahd))
+                             (aq (make-vector (* aseq2 aqd) 0.0))
+                             (ak (make-vector (* aseq2 akd) 0.0))
+                             (av (make-vector (* aseq2 akd) 0.0))
+                             (adc (make-vector (* aseq2 aqd) 0.0))
+                             (ns (* ahe aseq2 aseq2)))
+                        (dotimes (i (* aseq2 aqd))
+                          (aset aq i (* 0.05 (- (mod (* (1+ i) 7919) 101) 50)))
+                          (aset adc i (* 0.02 (- (mod (* (1+ i) 6151) 101) 50))))
+                        (dotimes (i (* aseq2 akd))
+                          (aset ak i (* 0.05 (- (mod (* (1+ i) 5387) 101) 50)))
+                          (aset av i (* 0.05 (- (mod (* (1+ i) 3319) 101) 50))))
+                        (let* ((fw (nelisp-gpu-server-batch
+                                    (list (cons 'in aq) (cons 'in ak) (cons 'in av)
+                                          (cons 'tmp ns) (cons 'out ns)
+                                          (cons 'out (* aseq2 aqd)))
+                                    (list (list 'attn-scores '(0 1 3)
+                                                (list aseq2 aqd ahe akv)
+                                                (/ (+ ns 63) 64))
+                                          (list 'softmax '(3 4)
+                                                (list (* ahe aseq2) aseq2)
+                                                (/ (+ (* ahe aseq2) 63) 64))
+                                          (list 'attn-context '(4 2 5)
+                                                (list aseq2 aqd ahe akv)
+                                                (/ (+ (* aseq2 aqd) 63) 64)))))
+                               (pp (nth 0 fw)) (cc (nth 1 fw))
+                               (oracle (nl-llm-wf--attend aq ak av aseq2 ahe akv ahd)))
+                          (wg--ck "decomposed attention == nl-llm-wf--attend"
+                                  (< (wg--rel cc oracle (wg--amax oracle)) 1.0e-5)
+                                  (format "rel %.3e"
+                                          (wg--rel cc oracle (wg--amax oracle))))
+                          (let* ((bw (nelisp-gpu-server-batch
+                                      (list (cons 'in adc) (cons 'in av) (cons 'in pp)
+                                            (cons 'in aq) (cons 'in ak)
+                                            (cons 'tmp ns) (cons 'tmp ns)
+                                            (cons 'out (* aseq2 aqd))
+                                            (cons 'out (* aseq2 akd))
+                                            (cons 'out (* aseq2 akd)))
+                                      (list (list 'attn-ctx-dp '(0 1 5)
+                                                  (list aseq2 aqd ahe akv)
+                                                  (/ (+ ns 63) 64))
+                                            (list 'attn-ctx-dv '(0 2 9)
+                                                  (list aseq2 aqd ahe akv)
+                                                  (/ (+ (* aseq2 akd) 63) 64))
+                                            (list 'softmax-bwd '(2 5 6)
+                                                  (list (* ahe aseq2) aseq2)
+                                                  (/ (+ (* ahe aseq2) 63) 64))
+                                            (list 'attn-sc-dq '(6 4 7)
+                                                  (list aseq2 aqd ahe akv)
+                                                  (/ (+ (* aseq2 aqd) 63) 64))
+                                            (list 'attn-sc-dk '(6 3 8)
+                                                  (list aseq2 aqd ahe akv)
+                                                  (/ (+ (* aseq2 akd) 63) 64)))))
+                                 (ref (nl-llm-wb-attend-vjp aq ak av aseq2 ahe akv
+                                                            ahd adc))
+                                 (worst 0.0))
+                            (dotimes (i 3)
+                              (setq worst (max worst
+                                                (wg--rel (nth i bw) (nth i ref)
+                                                         (wg--amax (nth i ref))))))
+                            (wg--ck "and its vjps == nl-llm-wb-attend-vjp"
+                                    (< worst 1.0e-4)
+                                    (format "dq/dk/dv worst rel %.3e" worst)))))
+
                       ;; --- the fused block end to end, behind an env var ---
                       ;;
                       ;; One block matching is not the claim that matters; 28
