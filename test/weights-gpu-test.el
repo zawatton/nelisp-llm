@@ -934,6 +934,35 @@ CPU %.0fs" (car (nl-llm-wf-argmax gl)) (wg--rel gl f32 sc) csec))
                                                             lhs rhs rel))))))))))
                           (nelisp-gpu-server-free hh)))
 
+                      ;; --- the fused block end to end, behind an env var ---
+                      ;;
+                      ;; One block matching is not the claim that matters; 28
+                      ;; of them matching is.  The f32 glue differs from the
+                      ;; f64 glue by 6e-07 a block, and whether that compounds
+                      ;; into a different token over a stack is a question, not
+                      ;; a formality.
+                      (if (not (getenv "NL_LLM_GPU_E2E"))
+                          (princ (format "%-50s %s  %s\n"
+                                         "fused blocks end to end" "----"
+                                         "set NL_LLM_GPU_E2E=1 to run (~4 min)"))
+                        (let* ((t0 (float-time))
+                               (fl (nl-llm-wfuse-open-model wts))
+                               (t1 (float-time)))
+                          (unwind-protect
+                              (let* ((t2 (float-time))
+                                     (hid (nl-llm-wfuse-run fl wts
+                                                            '(785 6722 315 9625 374)))
+                                     (t3 (float-time))
+                                     (best (nl-llm-wf-argmax
+                                            (nl-llm-wf-logits-all wts hid 5 4))))
+                                (wg--ck "fused blocks predict the oracle's token"
+                                        (= (car best) 12095)
+                                        (format "got %d want 12095, logit %.6f vs \
+16.324242 unfused; 28 blocks %.2fs, resident %.0fs"
+                                                (car best) (cdr best)
+                                                (- t3 t2) (- t1 t0))))
+                            (nl-llm-wfuse-close-model fl))))
+
                       ;; The acceptance criterion for this phase, behind an env
                       ;; var because it is a four-minute run: does the whole
                       ;; W8A8 GPU stack still predict what the CPU oracle

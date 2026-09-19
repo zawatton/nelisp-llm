@@ -197,5 +197,69 @@ quantization those two differ by is measured separately."
                  (funcall g64 (* seq dim))))))
     (car (nelisp-gpu-server-batch slots disps))))
 
+
+;;;###autoload
+(defun nl-llm-wfuse-open-model (wts &optional nlayers)
+  "Upload every layer once and return a list of layer plists.
+A block's arithmetic is a fraction of what uploading its weights costs, so
+opening and closing a layer per block hides the fusion entirely -- measured
+end to end that way, fused and unfused blocks came out 1.1x apart while one
+block alone is 5.4x.  The upload has to happen once, like everything else in
+this file."
+  (let* ((cfg (nl-llm-weights-config wts))
+         (n (min (or nlayers (plist-get cfg :layers)) (plist-get cfg :layers)))
+         (out nil))
+    (dotimes (ly n) (push (nl-llm-wfuse-open-layer wts ly) out))
+    (nreverse out)))
+
+;;;###autoload
+(defun nl-llm-wfuse-close-model (layers)
+  "Free every layer in LAYERS."
+  (dolist (lay layers) (nl-llm-wfuse-close-layer lay)))
+
+;;;###autoload
+(defun nl-llm-wfuse-run (layers wts tokens)
+  "Run TOKENS through resident LAYERS; return the post-final-norm hidden state."
+  (let* ((cfg (nl-llm-weights-config wts))
+         (dim (plist-get cfg :dim))
+         (seq (length tokens))
+         (x (make-vector (* seq dim) 0.0))
+         (i 0))
+    (dolist (tk tokens)
+      (let ((row (nl-llm-weights-embed wts tk)))
+        (dotimes (t0 dim) (aset x (+ (* i dim) t0) (aref row t0))))
+      (setq i (1+ i)))
+    (dolist (lay layers) (setq x (nl-llm-wfuse-block lay x seq)))
+    (nl-llm-wf-final-norm wts x seq)))
+
+;;;###autoload
+(defun nl-llm-wfuse-next-token (wts tokens &optional nlayers progress)
+  "Greedy next token for TOKENS with each block run as one batch.
+Returns (ID . LOGIT).  Layers are opened, used and closed one at a time, so
+peak residency is one layer rather than the whole model -- the same shape as
+`nl-llm-wgpu-next-token', which this is meant to be compared against.
+
+The head is scored on the CPU here, exactly as that function does, so the
+difference between the two is the blocks and nothing else."
+  (let* ((cfg (nl-llm-weights-config wts))
+         (dim (plist-get cfg :dim))
+         (seq (length tokens))
+         (n (min (or nlayers (plist-get cfg :layers))
+                 (plist-get cfg :layers)))
+         (x (make-vector (* seq dim) 0.0))
+         (i 0))
+    (dolist (tk tokens)
+      (let ((row (nl-llm-weights-embed wts tk)))
+        (dotimes (t0 dim) (aset x (+ (* i dim) t0) (aref row t0))))
+      (setq i (1+ i)))
+    (dotimes (ly n)
+      (let ((lay (nl-llm-wfuse-open-layer wts ly)))
+        (unwind-protect
+            (setq x (nl-llm-wfuse-block lay x seq))
+          (nl-llm-wfuse-close-layer lay)))
+      (when progress (funcall progress ly)))
+    (let ((final (nl-llm-wf-final-norm wts x seq)))
+      (nl-llm-wf-argmax (nl-llm-wf-logits-all wts final seq (1- seq))))))
+
 (provide 'nl-llm-weights-fused)
 ;;; nl-llm-weights-fused.el ends here
