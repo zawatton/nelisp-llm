@@ -304,10 +304,48 @@ data, not the code, and it is also the honest shape of =nl-llm-wlora-fit=, which
 is unclipped SGD and says so now.  Real adaptation wants the Adam and clipping
 =nl-llm-gpu-ag.el= already has for the f32 path.
 
-Still missing for end-to-end LoRA training: a backward for the whole block (this
-is one linear's worth), and the autograd path's own migration -- =nl-llm-ag-block=
-currently *refuses* =:head-dim=, =:rope-style= and QK-norm, which is the guard
-working correctly and also a prerequisite.
+*The pieces between the linears* -- =lisp/nl-llm-weights-backward.el= +
+=test/weights-backward-test.el= (12/12, =make test-weights-backward=).  Every
+vjp a block needs, each checked against finite differences on its own:
+
+| vjp                       | worst rel vs central differences |
+|---------------------------+----------------------------------|
+| RMSNorm                   | 1.9e-07                          |
+| RoPE, interleaved         | 1.8e-08                          |
+| RoPE, half-split          | 1.0e-08                          |
+| QK-norm                   | 1.4e-07                          |
+| SwiGLU, d/dgate           | 3.7e-07                          |
+| SwiGLU, d/dup             | 5.5e-07                          |
+| attention, d/dq d/dk d/dv | agreement to 5e-10 absolute      |
+
+Individually before composing, deliberately.  A composed check is stronger --
+a correct gradient through a whole block implies every vjp inside it -- but when
+it fails it says only "somewhere in here", and these are functions where a sign
+or a missing term hides while still producing something that looks like a
+descent direction.  Two controls put numbers on that: dropping RMSNorm's
+non-diagonal mean term makes its gradient wrong by 417x, and dropping the
+softmax Jacobian's =- <p, dp>= subtraction makes d/dq wrong by 7e8 while
+leaving d/dv untouched -- so a suite that checked only d/dv would pass.
+
+A third finding about scale, after the LoRA divergence and now this.  The
+attention check first reported d/dq wrong at rel 1.4e-03.  It was not: at the
+input scale used, one head's scores reached 22.4 against -10.1, a spread of
+32.5, so the softmax saturated and the true gradient was *-1.4e-12*.  A
+relative comparison against a central difference at 1e-6 was measuring
+rounding.  Fixed two ways -- inputs at a scale where scores are O(1), which is
+where RMSNorm and QK-norm actually put them, and a checker that passes on
+either small relative *or* small absolute disagreement, since a legitimately
+tiny gradient cannot be judged relatively.  The pattern worth carrying: when
+gradients are already verified and something still looks wrong, suspect the
+input scale and the metric before the formula.
+
+Still missing for end-to-end LoRA training: composing these into a whole-block
+backward -- every part now exists and is checked, so this is assembly -- and the
+f32 autograd path's own migration, since =nl-llm-ag-block= *refuses*
+=:head-dim=, =:rope-style= and QK-norm.  That refusal is the guard working
+correctly, and it only blocks training a Qwen-shaped model through
+=photon-autograd=; it does not block the int8 path above, which has its own
+forward and backward.
 
 *Phase 2d* (GPU) STARTED -- one imported linear now runs on the GPU.
 =lisp/nl-llm-weights-gpu.el= + =test/weights-gpu-test.el= (7/7,

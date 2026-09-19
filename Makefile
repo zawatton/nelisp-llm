@@ -12,6 +12,7 @@ test:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/weights-header-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/weights-load-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/weights-lora-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/weights-backward-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/distill-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/arch-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/attn-test.el
@@ -473,7 +474,7 @@ test-weights-gpu:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/weights-gpu-test.el
 
 # --- Doc 08 Phase 3: adaptation ------------------------------------------
-.PHONY: test-weights-lora test-distill distill
+.PHONY: test-weights-lora test-weights-backward test-distill distill
 
 # A trainable LoRA over a frozen int8 base.  The transpose is pinned by the
 # inner-product identity and every gradient against finite differences, since a
@@ -494,3 +495,10 @@ OUT ?= build/distilled.eld
 distill:
 	NL_LLM_DISTILL_PROMPTS=$(PROMPTS) NL_LLM_DISTILL_OUT=$(OUT) \
 	  $(EMACS) -Q --batch -L lisp -L $(PHOTON) -l examples/distill-from-teacher.el
+
+# Every vjp between one linear and the next, each against finite differences on
+# its own before anything is composed: RMSNorm, the half-split rotation,
+# QK-norm, causal GQA, SwiGLU.  Two controls show what the dropped terms cost
+# (RMSNorm's mean term, the softmax subtraction).
+test-weights-backward:
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/weights-backward-test.el
