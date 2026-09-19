@@ -299,6 +299,69 @@
                                           "identical to the CPU backward")))
                             (nl-llm-wgpu-free-transposes tbl))))
 
+                      ;; --- quantizing on the device, and what it costs -----
+                      ;;
+                      ;; `pack-act-rows' is the input side of the int8 linear
+                      ;; done on the GPU, so a tensor already there can feed one
+                      ;; without coming back.  Checked as a fused batch --
+                      ;; pack into a tmp slot, apply from it -- because the
+                      ;; packed words must NOT come back: they are arbitrary
+                      ;; bit patterns and the return path decodes floats, so a
+                      ;; word landing in the NaN range does not survive it.
+                      ;; An earlier version of this check read them back and
+                      ;; reported a broken kernel; the kernel was right and the
+                      ;; harness was destroying its output.
+                      ;;
+                      ;; The result is *not* bit-identical to CPU packing and
+                      ;; cannot be: the GPU divides by gamma in f32 and Elisp in
+                      ;; f64, so a lane sitting on a rounding boundary can go
+                      ;; either way.  What that is worth is the number below.
+                      (let* ((ng (/ dim 4))
+                             (fseq 6)
+                             (fx (make-vector (* fseq dim) 0.0))
+                             (flin (nl-llm-weights-linear wts :wq 0))
+                             (frows (nl-llm-weights-lin-rows flin)))
+                        (dotimes (p fseq)
+                          (dotimes (i dim)
+                            (aset fx (+ (* p dim) i) (* (aref act i) (+ 1.0 (* 0.1 p))))))
+                        (let ((fh (nl-llm-wgpu-upload-lin flin)))
+                          (unwind-protect
+                              (let* ((t0 (float-time))
+                                     (cpu (nl-llm-wgpu-apply-seq flin fh fx 0 fseq))
+                                     (t1 (float-time))
+                                     (fused (car (nelisp-gpu-server-batch
+                                                  (list (cons 'in fx)
+                                                        (cons 'tmp (* fseq ng))
+                                                        (cons 'tmp fseq)
+                                                        (list 'res (plist-get fh :w) (* frows ng))
+                                                        (list 'res (plist-get fh :b) frows)
+                                                        (list 'res (plist-get fh :s) frows)
+                                                        (cons 'out (* fseq frows)))
+                                                  (list (list 'pack-act-rows '(0 1 2)
+                                                              (list fseq dim ng)
+                                                              (/ (+ fseq 63) 64))
+                                                        (list 'bitlinear-dp4a-rows '(1 3 4 5 2 6)
+                                                              (list fseq frows ng)
+                                                              (/ (+ (* fseq frows) 63) 64))))))
+                                     (t2 (float-time))
+                                     (sc (wg--amax cpu))
+                                     (rel (wg--rel fused cpu sc)))
+                                (wg--ck "packing on the device agrees with packing here"
+                                        (< rel 1.0e-5)
+                                        (format "rel %.3e (f32 vs f64 division by gamma)" rel))
+                                ;; And the part that decides the design: fusing
+                                ;; only pays when the input is already on the
+                                ;; device.  Here it is not, so the fused form
+                                ;; sends f32 where the other sends packed bytes
+                                ;; -- four times the data through the encoder --
+                                ;; and loses.  The check records that rather
+                                ;; than pretending otherwise.
+                                (wg--ck "and fusing from a host tensor is slower"
+                                        (> (- t2 t1) (* 0.9 (- t1 t0)))
+                                        (format "fused %.4fs vs packed-here %.4fs (f32 in vs int8 bytes in)" (- t2 t1) (- t1 t0))))
+                            (dolist (k '(:w :s :b))
+                              (nelisp-gpu-server-free (plist-get fh k))))))
+
                       ;; --- causal attention on the GPU, and why it is not
                       ;; --- wired in -------------------------------------
                       ;;
