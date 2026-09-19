@@ -299,6 +299,66 @@
                                           "identical to the CPU backward")))
                             (nl-llm-wgpu-free-transposes tbl))))
 
+                      ;; --- the two glue kernels a fused block still needed --
+                      ;;
+                      ;; QK-norm and the rotation were the pieces missing from
+                      ;; the kernel set: `rmsnorm-fwd' normalises rows, not
+                      ;; heads, and `rope-apply' pairs adjacent elements where
+                      ;; Qwen3 pairs i with i + hd/2.
+                      ;;
+                      ;; The rotation carries a control, because this is the
+                      ;; mistake the project has already paid for once: the two
+                      ;; conventions take the same shapes and produce different
+                      ;; numbers, so a kernel quietly using the wrong one is
+                      ;; invisible to anything but a comparison against the
+                      ;; right one.  The control asserts the other convention
+                      ;; really is different here, so "matches the CPU" is not
+                      ;; passing because both happen to agree.
+                      (let* ((gseq 6) (gnh (plist-get cfg :heads))
+                             (ghd (plist-get cfg :head-dim))
+                             (grb (plist-get cfg :rope-base))
+                             (gn (* gseq gnh ghd))
+                             (gx (make-vector gn 0.0))
+                             (ggain (make-vector ghd 0.0)))
+                        (dotimes (i gn)
+                          (aset gx i (* 0.05 (- (mod (* (1+ i) 7919) 101) 50))))
+                        (dotimes (i ghd) (aset ggain i (+ 0.8 (* 0.004 (mod i 51)))))
+                        (let ((cpu (copy-sequence gx)))
+                          (dotimes (p gseq)
+                            (nl-llm--rmsnorm-heads cpu (* p gnh ghd) gnh ghd
+                                                   (photon-tensor (list ghd) ggain)
+                                                   1.0e-6))
+                          (let* ((gpu (car (nelisp-gpu-server-run2
+                                            'rmsnorm-heads
+                                            (list (cons 'in gx) (cons 'in ggain)
+                                                  (cons 'out gn))
+                                            (list gseq gnh ghd)
+                                            (/ (+ (* gseq gnh) 63) 64))))
+                                 (sc (wg--amax cpu)))
+                            (wg--ck "per-head RMSNorm on the GPU (QK-norm)"
+                                    (< (wg--rel gpu cpu sc) 1.0e-5)
+                                    (format "rel %.3e" (wg--rel gpu cpu sc)))))
+                        (let ((cpu (copy-sequence gx))
+                              (other (copy-sequence gx)))
+                          (dotimes (p gseq)
+                            (nl-llm--rope-heads cpu (* p gnh ghd) gnh ghd p grb 'half)
+                            (nl-llm--rope-heads other (* p gnh ghd) gnh ghd p grb
+                                                'interleaved))
+                          (let* ((gpu (car (nelisp-gpu-server-run2
+                                            'rope-half
+                                            (list (cons 'in gx) (cons 'out gn))
+                                            (list gseq gnh ghd
+                                                  (nelisp-gpu--f32-bits (float grb)))
+                                            (/ (+ (* gseq gnh (/ ghd 2)) 63) 64))))
+                                 (sc (wg--amax cpu)))
+                            (wg--ck "half-split RoPE on the GPU"
+                                    (< (wg--rel gpu cpu sc) 1.0e-5)
+                                    (format "rel %.3e" (wg--rel gpu cpu sc)))
+                            (wg--ck "control: the interleaved convention differs"
+                                    (> (wg--rel gpu other (wg--amax other)) 0.1)
+                                    (format "rel %.3e against it"
+                                            (wg--rel gpu other (wg--amax other)))))))
+
                       ;; --- quantizing on the device, and what it costs -----
                       ;;
                       ;; `pack-act-rows' is the input side of the int8 linear
@@ -353,11 +413,18 @@
                                 ;; only pays when the input is already on the
                                 ;; device.  Here it is not, so the fused form
                                 ;; sends f32 where the other sends packed bytes
-                                ;; -- four times the data through the encoder --
-                                ;; and loses.  The check records that rather
-                                ;; than pretending otherwise.
-                                (wg--ck "and fusing from a host tensor is slower"
-                                        (> (- t2 t1) (* 0.9 (- t1 t0)))
+                                ;; -- four times the data through the encoder.
+                                ;;
+                                ;; The claim is that it does not *win*, not that
+                                ;; it loses.  An earlier version asserted
+                                ;; "slower" from a single sample of 0.042
+                                ;; against 0.030; the two have since measured
+                                ;; 0.0407 against 0.0411, the same within noise.
+                                ;; A check that keeps passing while the
+                                ;; observation it names changes sign is not
+                                ;; checking anything.
+                                (wg--ck "fusing from a host tensor buys nothing"
+                                        (> (- t2 t1) (* 0.7 (- t1 t0)))
                                         (format "fused %.4fs vs packed-here %.4fs (f32 in vs int8 bytes in)" (- t2 t1) (- t1 t0))))
                             (dolist (k '(:w :s :b))
                               (nelisp-gpu-server-free (plist-get fh k))))))
