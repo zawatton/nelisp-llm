@@ -374,7 +374,7 @@ clean:
 .PHONY: qwen-tokenizer-table test-qwen-tokenizer ollama-provider test-head-dim
 .PHONY: qwen-weights-table verify-qwen-weights test-weights-header
 .PHONY: qwen-weights-rows test-weights-load test-rope-style
-.PHONY: qwen-forward-ref test-weights-forward test-weights-gpu lora-demo
+.PHONY: qwen-forward-ref test-weights-forward test-weights-gpu lora-demo deltanet-fixture test-deltanet
 
 # DONOR is a HuggingFace model directory holding config.json + tokenizer.json.
 # Everything under build/donor/ is donor-derived and gitignored.
@@ -480,6 +480,14 @@ test-weights-gpu:
 # override the defaults (36 steps, lr 0.001).
 lora-demo:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l tools/lora-demo.el
+
+# The gated delta rule.  No GPU and no model: the fixture comes from
+# tools/deltanet-ref.py and the gradients from finite differences.
+deltanet-fixture:
+	python3 tools/deltanet-ref.py
+
+test-deltanet:
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/deltanet-test.el
 
 # --- Doc 08 Phase 3: adaptation ------------------------------------------
 .PHONY: test-weights-lora test-weights-backward test-block-backward test-train

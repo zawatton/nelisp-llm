@@ -14,3 +14,4 @@
 /test/fixtures/qwen-weights-rows.eld
 /test/fixtures/qwen-forward-ref.eld
 __pycache__/
+build/deltanet-fixture.json
