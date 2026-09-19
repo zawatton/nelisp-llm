@@ -1,0 +1,45 @@
+#+TITLE: Tokenizer corpus -- org markup
+#+OPTIONS: toc:nil num:t
+
+A frozen sample of the org markup this repo actually writes, kept as a fixture
+so the bulk parity check has stable input.  Do not edit: changing it makes the
+digest in =test/fixtures/qwen-tokenizer-bulk.eld= stale, which the suite
+reports as a failure until the fixture is regenerated.
+
+* Headings and inline markup
+Nested =code=, /emphasis/, *bold*, ~verbatim~, +strikethrough+ and a
+[[https://example.com][link with a label]].
+
+** A table, which is where column alignment produces long space runs
+| size     | op      | CPU ms | GPU ms | speedup |
+|----------+---------+--------+--------+---------|
+| dim 64   | infer   |    367 |     73 |   5.0x  |
+| dim 256  | infer   |   4821 |    412 |  11.7x  |
+| dim 1024 | train   | 121503 |   6244 |  19.5x  |
+
+** A source block
+#+begin_src elisp
+(defun example-forward (x w b)
+  "Return X . W^T + B, the shape every linear in this repo has."
+  (photon-tensor-add (photon-tensor-linear x w) b))
+#+end_src
+
+** A properties drawer and a timestamp
+:PROPERTIES:
+:ID:       7f3a9c21-4b6e-4d18-9a0f-2c5e8b1d7a44
+:CREATED:  [2026-09-19 Sat 11:40]
+:END:
+
+* Mixed-script prose
+The 受電設備 covers multiple 事業場, and the 月次点検 report is due on
+the 5th.  Numbers like 6.6kV, 0.4MΩ and 0.2A appear inline, as do units with
+full-width characters: ６．６ｋＶ.
+
+- a list item
+- another, with a nested one
+  - nested, indented by two spaces
+    - and deeper, by four
+
+#+begin_quote
+Whitespace runs, tabs	and trailing spaces   are all deliberate here.
+#+end_quote

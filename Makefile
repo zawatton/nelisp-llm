@@ -6,6 +6,7 @@ NELISP ?= ../nelisp/target/nelisp
 .PHONY: test compile clean train train-modern train-modern-full gpu-test gpu-train-test gpu-ag-test gpu-block-test gpu-moe-test gpu-stack-test gpu-window-test gpu-gather-test gpu-adam-test gpu-tie-test gpu-sched-test bench-gpu bench-gpu-train bench-ondevice train-stacked-gpu train-corpus-gpu generate-gpu train-full-gpu checkpoint-gpu train-big-gpu stream-decode spec-decode bitnet-model bench-dp4a spec-chain integrated-decode bench-longctx agent-demo agent-model-demo agent-improve-demo agent-code-demo agent-sandbox-demo agent-tasks-demo agent-gpu-finetune-demo agent-ondevice-demo
 
 test:
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/qwen-tokenizer-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/arch-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/attn-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/moe-test.el
@@ -196,3 +197,35 @@ test-nelisp-fast:
 
 clean:
 	rm -f lisp/*.elc
+# --- Doc 08: weight import (docs/design/08-weight-import.org) -------------
+.PHONY: qwen-tokenizer-table test-qwen-tokenizer ollama-provider
+
+# DONOR is a HuggingFace model directory holding config.json + tokenizer.json.
+# Everything under build/donor/ is donor-derived and gitignored.
+DONOR ?= build/donor/qwen3-0.6b
+DONOR_REPO ?= Qwen/Qwen3-0.6B
+PYLIBS ?= build/donor/pylibs
+DONOR_URL = https://huggingface.co/$(DONOR_REPO)/resolve/main
+
+# Fetch the donor's config and tokenizer, export the binary table, and
+# regenerate the parity fixtures from the reference tokenizer.  The reference
+# library goes into $(PYLIBS) via pip --target, so no virtualenv is needed and
+# no system Python packages are touched.
+qwen-tokenizer-table:
+	mkdir -p $(DONOR) $(PYLIBS)
+	cd $(DONOR) && curl -sfL -O $(DONOR_URL)/config.json
+	cd $(DONOR) && curl -sfL -O $(DONOR_URL)/tokenizer_config.json
+	cd $(DONOR) && curl -sfL -O $(DONOR_URL)/tokenizer.json
+	python3 -m pip install -q --disable-pip-version-check --target $(PYLIBS) tokenizers regex
+	PYTHONPATH=$(PYLIBS) python3 tools/qwen-tokenizer-export.py $(DONOR) $(DONOR)
+	PYTHONPATH=$(PYLIBS) python3 tools/qwen-tokenizer-fixtures.py $(DONOR)/tokenizer.json test/fixtures/qwen-tokenizer.eld
+
+# Donor token-id parity.  Skips cleanly when the table is absent, so a fresh
+# clone is not red; run `make qwen-tokenizer-table' once to enable it.
+test-qwen-tokenizer:
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/qwen-tokenizer-test.el
+
+# Phase 0: a locally served open-weight teacher, no conversion.
+# Needs `ollama serve' running and `ollama pull qwen3:4b' done once.
+ollama-provider:
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l examples/ollama-provider.el

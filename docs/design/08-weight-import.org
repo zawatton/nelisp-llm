@@ -1,0 +1,331 @@
+#+TITLE: Weight import -- run an open-weight Qwen model natively, without training it
+#+OPTIONS: toc:2 num:t
+#+STATUS: P0-P1 SHIPPED
+
+* Status
+Phase 0 and Phase 1 SHIPPED; Phases 2-3 are designed, not implemented.
+
+*Phase 0* (a locally served donor as teacher and as an immediately usable
+model): =examples/ollama-provider.el= + =make ollama-provider=.  No change was
+needed in =nl-llm-agent-openai.el= -- it reads only the =content= field, so a
+reasoning donor's chain of thought (returned separately as =reasoning=) is
+discarded and the final answer is what reaches the agent.  Measured against
+=qwen3:4b= served by Ollama on this host: 2/2 exact-answer cases, 1.2s and
+14.3s.  One trap found and guarded in the example: a completion truncated while
+the model is still reasoning arrives as an *empty string*, not an error, so an
+empty completion must be rejected rather than used as a training target.
+
+Ordering note: the Phase 0 example needs =lisp/nl-llm-agent-provider.el= and
+=lisp/nl-llm-agent-openai.el=, which belong to the agent-harness work of Doc 5
+and are not part of this change.  =make ollama-provider= therefore fails with a
+missing library until that layer lands; Phase 1 has no such dependency and runs
+on its own.
+
+*Phase 1* (donor token-id parity): =lisp/nl-llm-qwen-tokenizer.el= +
+=tools/qwen-tokenizer-export.py= + =tools/qwen-tokenizer-fixtures.py= +
+=test/qwen-tokenizer-test.el= (=make qwen-tokenizer-table=, then =make
+test-qwen-tokenizer=).  Against Qwen3-0.6B's own =tokenizer.json=:
+
+| check                                  | result                        |
+|----------------------------------------+-------------------------------|
+| 71 hand-picked cases, exact id equality | 71/71                         |
+| 4 whole corpora, exact id equality      | 3869 ids, 4/4 files           |
+| decode-then-encode stability            | all cases                     |
+| byte alphabet complete                  | 256/256                       |
+| pinned categories == reference          | 17569 code points             |
+| pre-tokenizer pieces rejoin to input    | all cases                     |
+| negative control (broken merge)         | detected                      |
+| negative control (stale fixture digest) | detected                      |
+| table load                              | 151387 merges, ~0.5s          |
+| encode throughput                       | ~30-40k chars/s (Emacs 30)    |
+
+The corpora are English open data, Elisp source, org markup with tables, and
+Japanese technical prose -- i.e. what this model is actually going to be fed.
+
+Four findings worth carrying forward, all of which were silent failures before
+they were caught:
+
+- =compare-strings= returns =t= on equality, not =0=.  The added-token matcher
+  tested for =0= and therefore never matched, so =<|im_start|>= tokenized as
+  seven ordinary tokens.  Nothing errored; the ids were simply wrong.
+- =encode-coding-string= / =decode-coding-string= with plain =utf-8= apply EOL
+  conversion, silently folding CRLF to LF.  Both directions must pin
+  =utf-8-unix=, or any Windows-authored input shifts ids.
+- Deriving the byte -> token map by scanning for single-byte tokens (a
+  bijection, asserted at load with a 256/256 check) removes an exported table
+  that could disagree with the blob.  Cheaper to verify than to trust.
+- *The Unicode tables are a hidden host dependency.*  The pre-tokenizer needs
+  \p{L} and \p{N}, and the first implementation read them from Emacs with
+  =get-char-code-property=.  That passes every parity test and is still wrong:
+  the reference library tracks its own Unicode version, so a code point one
+  side has not heard of yet tokenizes differently, with no error anywhere.
+  Measured on this host, three sources disagree about which code points are
+  letters -- Python's =unicodedata= 15.1 differs from the reference on 4382
+  code points, and this Emacs differs on 24 of the 17569 sampled.  The fix is
+  to *probe the reference pre-tokenizer itself*, one code point at a time
+  (=pre_tokenize_str("a" + X)= is one piece exactly when X is a letter) and
+  ship the resulting ranges inside the table.  A full 1.1M-code-point sweep
+  costs about 3 seconds, the ranges add 6 KB, and token ids stop depending on
+  the host -- which is also what lets the tokenizer run where
+  =get-char-code-property= does not exist.
+
+Portability, measured against the NeLisp standalone binary: =cl-lib=,
+=make-hash-table=, =encode-coding-string= / =decode-coding-string=,
+=insert-file-contents-literally=, =set-buffer-multibyte=, =compare-strings=,
+=string-to-vector=, =cl-subseq= and =sort= are all present, so the loader, the
+pre-tokenizer scanner and the BPE itself run there.  Two gaps remain, both at
+the encode entry point rather than in the algorithm: =ucs-normalize-NFC-string=
+(the NFC step, which =nl-llm-qwen-tok-encode= refuses to skip silently) and
+=secure-hash= (used only by the test's staleness guard).  Pinning the category
+ranges removed the third gap, =get-char-code-property=.
+
+
+Head-dimension finding that resizes Phase 2: Qwen3-0.6B's =config.json= has
+=hidden_size= 1024, =num_attention_heads= 16 and =head_dim= 128, so
+=q_proj= is 1024 -> 2048.  =nl-llm-attn.el= derives =hd= as =(/ dim heads)= at
+every call site, which would give 64.  The decoupled =:head-dim= refactor is
+therefore confirmed as the largest item in Phase 2, not a hypothetical.
+
+The goal is to skip pre-training entirely: take an Apache-2.0 open-weight
+checkpoint (Qwen3 dense), convert it into a nelisp-llm model, and run it on the
+existing =nelisp-gpu= substrate.  Personal-task adaptation then happens through
+LoRA (=lisp/nl-llm-lora*.el=) on data distilled from a larger teacher, not
+through pre-training.
+
+Cost argument for doing this at all: reaching usable quality from scratch at
+100M parameters needs roughly 2e9 tokens at the Chinchilla 20:1 ratio, i.e.
+=6*N*D= ~ 1.2e18 FLOP.  On a GTX 1060 6GB driven from Elisp that is not a
+weeks-long job, it is an out-of-reach job.  Importing costs 0 training FLOP and
+starts at the donor model's quality; a rank-8 LoRA over a 0.6B base trains ~2M
+parameters and is an hours-long job on the same hardware.  The ratio is three to
+five orders of magnitude.
+
+* Motivation
+Every technique doc so far (01-07) improves a model we train ourselves.  The
+substrate is now good enough that the binding constraint is no longer the
+architecture, it is the *data and compute budget of pre-training*.  Importing
+removes that constraint without giving up self-hosting: inference still runs in
+NeLisp/Elisp over =photon-tensor= and =nelisp-gpu=, and the model stays
+self-extensible (LoRA, Coconut, recurrent depth, the agent harness in Doc 05 all
+still apply on top of an imported base).
+
+Licensing makes Qwen specifically the right donor.  The core Qwen models are
+Apache-2.0, which places no restriction on the use of model outputs or on
+derivative weights -- so both distillation (Section "Data") and weight
+conversion are permitted.  This is *not* true of outputs taken from hosted APIs
+(OpenAI, Anthropic, Gemini), whose terms forbid using outputs to train competing
+models.  The rule for this repo: donors must be locally-run open weights under
+Apache-2.0 or MIT, never a hosted API.
+
+* Principle
+Qwen3's dense decoder block is the block this repo already implements:
+pre-norm RMSNorm, grouped-query attention with RoPE, a SwiGLU feed-forward, a
+final RMSNorm, and (at the small sizes) a head tied to the embedding.  Doc 01's
+Phase B established that weights do not have to be f32 to run here: the
+=nelisp-gpu= kernel set already carries packed integer weights and reads them
+back inside the kernel.
+
+So import is three separate problems, and only the first is new science-free
+plumbing:
+
+1. *Get the bytes in.*  =safetensors= is a trivial container (8-byte
+   little-endian header length, a JSON header of name -> dtype/shape/offsets,
+   then raw tensor bytes).  Qwen3 ships bf16; bf16 -> f32 is a 16-bit shift, or
+   sign/exponent/mantissa arithmetic plus =ldexp= in pure Elisp.
+2. *Make them fit.*  =photon-tensor= data is a =make-vector= of boxed floats,
+   about 24 bytes per parameter in Emacs.  Qwen3-0.6B would need ~14 GB and
+   Qwen3-4B ~96 GB in that representation, and =photon-weights-v1= /
+   =nl-llm-ckpt-v1= are =prin1= text sexps, so a 0.6B checkpoint would be a
+   multi-GB text file that =read= will not finish.  Both are blockers; the fix
+   is one packed binary representation used for storage *and* residency.
+3. *Make them correct.*  Token ids must match the ids the donor was trained on,
+   and three architecture details differ from what =nl-llm-attn.el= assumes.
+
+* Where it lands here
+Already present, no change needed:
+
+- =:kv-heads= and =:rope-base= are already model-plist options
+  (=nl-llm-model-forward=, =nl-llm-attn.el=), so GQA and Qwen3's
+  =rope_theta = 1e6= are configuration, not code.
+- =nl-llm-moe.el= covers a top-k sparse FFN, should a Qwen3-MoE donor be
+  attempted later.
+- Biases are supported throughout, so a Qwen2.5 donor's qkv bias is a superset
+  case, not a gap.
+- =nelisp-gpu-kernels.el= has =bitlinear-dp4a-1f=: four int8 lanes bitcast into
+  one f32, per-row =GAMMA= activation quantization and a =BETA= weight scale,
+  using hardware DP4A.  That is W8A8 per-channel quantization, and the GTX 1060
+  is Pascal SM6.1, so DP4A is real hardware there (~17.7 TOPS).
+- =nl-llm-bitnet-pack= is the template for a packer: same shape of code, base-4
+  digits replaced by four int8 lanes.
+- =lisp/nl-llm-lora*.el= plus the on-device training path is the adaptation
+  route once a base is imported.
+- =lisp/nl-llm-agent-openai.el= can point at a local Ollama instance today,
+  which is how the teacher is served for distillation with zero conversion work.
+
+Gaps, in descending order of size:
+
+1. *Decoupled head dimension.*  =nl-llm-attn.el= derives =hd= as =(/ dim heads)=
+   at every call site (=nl-llm-gqa=, =nl-llm-kv-new=, =nl-llm-decode-step=), and
+   the GPU decode path inherits that assumption.  Qwen3 decouples =head_dim=
+   from =hidden_size / num_heads= -- Qwen3-0.6B is hidden 1024, 16 Q heads,
+   =head_dim= 128, so =q_proj= is 1024 -> 2048 and =wo= is 2048 -> 1024.  An
+   explicit =:head-dim= has to be threaded through attention, the KV cache
+   layout, and =nl-llm-gpu-decode.el=.  This is the largest single change and it
+   touches the shapes the autograd path also relies on.
+2. *No binary weight IO.*  Both existing formats are text sexps.  A new
+   =nl-llm-weights-v2= binary format is required: a small sexp or JSON header
+   followed by packed int8 blocks, loadable without materializing an
+   intermediate float vector per tensor.
+3. *QK-norm.*  Qwen3 applies a per-head RMSNorm to q and k before RoPE.  Not
+   implemented (no match in =lisp/=).  About 20 lines, plus its autograd
+   backward if it is to be trainable.  Choosing a Qwen2.5 donor avoids it.
+4. *Tokenizer.*  =photon-bpe= is byte-level BPE with its own merges, so it is
+   structurally compatible with Qwen's vocabulary and can take its merge table
+   directly.  But =photon-bpe= has no pre-tokenizer: Qwen splits text with a
+   tiktoken-style regex *before* applying merges.  Importing merges alone
+   produces a different id sequence than the donor was trained on, which yields
+   fluent-looking garbage rather than an obvious error.  The splitter is
+   mandatory and is the highest-risk correctness item in this doc.
+   SHIPPED as =lisp/nl-llm-qwen-tokenizer.el=, a separate replay tokenizer
+   rather than an extension of =photon-bpe=: photon-bpe learns merges from a
+   corpus, this one reproduces a fixed donor table, and the two jobs want
+   opposite things from the data structures.  See Status for what the splitter
+   turned out to require.
+
+* Design
+
+** Phase 0 -- teacher available, zero conversion
+Serve a Qwen3 donor locally (Ollama) and drive it through the existing
+OpenAI-compatible provider adapter.  This delivers an immediately usable agent,
+and more importantly it is the data generator for every later phase and the
+oracle for Phase 1.  On this hardware: Qwen3-4B Q4 (~2.5 GB) fits in 6 GB VRAM;
+Qwen3-30B-A3B Q4 (~18 GB) runs on the 62 GB host at usable batch speed because
+only ~3B parameters are active, which makes it the better teacher for overnight
+data generation.
+
+** Phase 1 -- tokenizer parity
+Import Qwen's merge table into =photon-bpe= and implement the pre-tokenizer
+split.  Done before any weight work, because it fixes the vocabulary: models
+trained natively in the meantime become id-compatible with a future imported
+base, so the base can be dropped in underneath them.
+
+Vocabulary pruning belongs here.  Qwen's vocab is 151,936; at dim 1024 with a
+tied head, the embedding alone is ~155M parameters, about 26% of Qwen3-0.6B and
+the single largest tensor.  Restricting to the tokens that actually occur in
+Japanese prose plus Elisp source (~32k) reduces that to ~33M and the whole model
+to ~0.48B, cutting both VRAM and the decode bandwidth that dominates latency.
+Pruning is a row deletion on =wte= plus an id remap in the tokenizer, and it is
+only safe once parity is proven on the unpruned table.
+
+** Phase 2 -- import and run (the actual "no training" payoff)
+Offline converter first, self-hosted reader second:
+
+- *2a.* A one-shot offline converter (Python) reads the donor safetensors,
+  applies per-output-row int8 quantization, and writes =nl-llm-weights-v2=.
+  Python here is an offline tool, not runtime -- the NeLisp runtime stays pure
+  Elisp.  Building it first gets working numerics in days instead of weeks.
+- *2b.* A pure-Elisp loader for =nl-llm-weights-v2= that uploads straight to
+  resident GPU buffers via =OP_WRITE_RESIDENT=, never materializing a
+  full-precision float vector on the Elisp side.
+- *2c.* Route the imported linears through =bitlinear-dp4a-1f= and reuse the
+  resident decode from =nl-llm-gpu-decode.el=.
+- *2d.* Port the converter's reader to Elisp once 2a-2c agree numerically; the
+  Python version then survives as the parity oracle, not as a dependency.
+
+Weight-name mapping (=model.layers.N.self_attn.q_proj.weight= -> =:wq=, and so
+on) is a table in the converter, checked exhaustively: every donor tensor must
+be consumed or explicitly declared ignored, so a silently dropped tensor cannot
+pass as a successful conversion.
+
+Memory budget at int8, per-channel scales:
+
+| donor      | int8 weights | fits 6 GB VRAM        |
+|------------+--------------+-----------------------|
+| Qwen3-0.6B | ~0.6 GB      | yes, comfortably      |
+| Qwen3-1.7B | ~1.7 GB      | yes                   |
+| Qwen3-4B   | ~4.0 GB      | yes, with KV headroom |
+
+Do *not* route an imported model through the ternary path of Doc 01.  BitNet
+b1.58 assumes Phase-A QAT trained the latent weight whose ternary quantization
+is the deployed weight; rounding an already-trained f32/bf16 weight to ternary
+without that training collapses quality.  W8A8 per-channel is the near-lossless
+option and it is the one the existing kernel already implements.
+
+** Phase 3 -- adaptation
+Freeze the imported base, train a LoRA (rank 8, ~2M parameters) on data
+distilled from the Phase-0 teacher, using the existing completion-only
+supervision in =nl-llm-agent-supervised.el= (prompt stays attention context,
+loss only on completion targets) and the on-device training path.  The existing
+bounds (=max-examples 128=, =max-example-tokens 4096=) already shape the
+ingestion format, so this phase is mostly data plumbing plus provenance
+recording in =data/SOURCE.txt=.
+
+* Verification
+Ordered so that each check can only pass for the right reason:
+
+1. *Tokenizer parity, before anything else.*  Feed a corpus (Japanese prose,
+   Elisp source, mixed CJK/ASCII, emoji, lone surrogates and other malformed
+   UTF-8) to both the donor tokenizer and =photon-bpe=, and require *identical*
+   id sequences.  A negative control is mandatory here: perturb one merge rank
+   and confirm the check goes red.  Without that control the comparison can
+   pass by comparing two identically-broken paths.
+2. *Round-trip.*  =decode(encode(s)) == s= for every input above, which
+   =photon-bpe='s byte-level base alphabet guarantees by construction and the
+   pre-tokenizer must not break.
+3. *Dequantization.*  Packed int8 unpacked back to f32 must match the
+   quantizer's own output exactly (bit-level), separating packing bugs from
+   quantization error.
+4. *Layer-by-layer against a reference.*  Run the donor under a reference
+   implementation with a fixed prompt, dump per-layer hidden states, and compare
+   the Elisp forward layer by layer at f32 (relative L2, threshold per layer).
+   Compare the *first diverging layer*, not just the logits -- a single
+   transposed weight or a wrong =head_dim= shows up as a specific layer, whereas
+   the logits only say "wrong".
+5. *Quantization loss, stated not assumed.*  Perplexity of the imported model at
+   f32 vs W8A8 on a held-out slice, reported as a number in the doc's Status
+   section.  An import that silently costs 3 perplexity points is not a success.
+6. *Greedy determinism.*  Same prompt, same seed, same output across runs and
+   across the CPU reference and GPU decode paths -- the same equivalence gate
+   Doc 04 used.
+
+* Cost / risk
+- Effort: Phase 0 trivial.  Phase 1 medium (the pre-tokenizer regex is fiddly in
+  Emacs regexp syntax and may need a hand-rolled splitter).  Phase 2 medium-high,
+  dominated by the decoupled =head_dim= refactor rather than by the loader.
+  Phase 3 low, the machinery exists.
+- Risk: the tokenizer failure mode is silent.  Mitigation is check 1 with its
+  negative control, run before any weight is converted.
+- Risk: the =head_dim= refactor touches shapes that =nl-llm-autograd.el= and the
+  GPU autograd builder depend on, so it can regress training paths that have
+  nothing to do with import.  Mitigation: land it as a standalone change with
+  the existing gradcheck and decode suites green, *before* the loader, and keep
+  =(/ dim heads)= as the default when =:head-dim= is absent so every current
+  model and test is unaffected.
+- Risk: dispatch overhead, not arithmetic, sets decode latency.  28 layers at
+  ~7 kernels each is ~200 dispatches per token; at 0.5 ms of Elisp-side overhead
+  per dispatch that is ~100 ms/token against a ~3 ms/token weight-bandwidth floor
+  (0.6 GB at ~197 GB/s).  Mitigation: record the whole decode step as one
+  compiled batch (=OP_COMPILE= / =OP_RUN_COMPILED=, the "compiled batches" path
+  already used by the on-device training builder) instead of dispatching
+  per-layer.
+- Risk: license hygiene on redistribution.  Personal use is unencumbered, but
+  publishing converted weights requires carrying the donor's Apache-2.0 LICENSE
+  and NOTICE and stating what was changed.  Record the donor revision hash in
+  the =nl-llm-weights-v2= header so a published artifact is traceable.
+
+* Open questions
+- Donor choice: Qwen3 (needs QK-norm and decoupled =head_dim=) versus Qwen2.5
+  (needs neither, has qkv bias which is already supported, but is an older
+  model).  Starting at Qwen2.5 would shrink Phase 2 considerably and prove the
+  pipeline before taking on the refactor.
+- Which tensors to leave at f32: embedding/tied head, and the RMSNorm gains,
+  are small and sensitive; quantizing them may cost more accuracy than VRAM it
+  saves.  Doc 01 left the same question open.
+- Whether vocabulary pruning should be part of the shipped conversion or an
+  optional post-pass.  It changes the model's id space, so a pruned artifact is
+  not interchangeable with the donor's tokenizer.
+- Whether the KV cache should also be int8.  Doc 02's bounded window already
+  caps its size, so this may not be worth the accuracy risk at these scales.
+- Qwen3-MoE (30B-A3B) is out of reach for 6 GB VRAM even at int8, but only ~3B
+  parameters are active per token.  Expert streaming from the 62 GB host is
+  possible in principle and is deliberately out of scope here.

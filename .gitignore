@@ -1,2 +1,7 @@
 *.elc
 /target/
+/build/donor/
+# Donor-derived parity fixtures: regenerate with `make qwen-tokenizer-table'.
+/test/fixtures/qwen-tokenizer.eld
+/test/fixtures/qwen-tokenizer-bulk.eld
+/test/fixtures/qwen-tokenizer-cats.eld
