@@ -1,11 +1,12 @@
 #+TITLE: Weight import -- run an open-weight Qwen model natively, without training it
 #+OPTIONS: toc:2 num:t
-#+STATUS: P0-P2c SHIPPED (CPU); 2d GPU pending
+#+STATUS: P0-P2c SHIPPED (CPU); 2d started (one linear on the GPU)
 
 * Status
-Phases 0, 1, 2a, 2b and 2c SHIPPED on the CPU -- an imported Qwen3-0.6B runs
-and matches a reference to 2e-15.  Phase 2d (the GPU path) and Phase 3 are
-designed, not implemented.
+Phases 0, 1, 2a, 2b and 2c SHIPPED on the CPU -- an imported Qwen3-0.6B runs,
+matches a reference to 1e-14 through all 28 layers, and predicts the donor's
+next token exactly.  Phase 2d has started: one linear runs on the GPU, 67x
+faster than the Elisp loop.  Phase 3 is designed, not implemented.
 
 *Phase 0* (a locally served donor as teacher and as an immediately usable
 model): =examples/ollama-provider.el= + =make ollama-provider=.  No change was
@@ -168,11 +169,16 @@ Three things the donor turned out to disagree with the design about:
   155 MiB of int8 payload for a duplicate.  The converter drops it -- but only
   after proving equality; a donor whose head actually differs under that flag
   errors out and says the config is not the whole story.
-- *The DP4A kernel is closer to per-channel scaling than assumed.*
-  =bitlinear-dp4a-1f= reads =(aref BETA 0)=, a single scalar weight scale, so
-  per-row scales looked like a kernel redesign.  It is not: =o=, the output row,
-  is already in scope on that line, so Phase 2d changes =0= to =o= and uploads a
-  BETA vector of length =out= instead of length 1.
+- *The DP4A kernel is closer to per-channel scaling than assumed -- but the
+  one-token change was wrong.*  =bitlinear-dp4a-1f= reads =(aref BETA 0)=, a
+  single scalar weight scale, and =o= (the output row) is already in scope on
+  that line, so changing =0= to =o= looked free.  It is not: =nl-llm-bitnet.el=
+  calls that kernel in two places and passes BETA as =(vector beta)=, a
+  *one-element* buffer, so re-indexing it would have the ternary path read past
+  the end.  Corrected in Phase 2d by adding a sibling kernel with per-row BETA
+  and leaving =bitlinear-dp4a-1f= alone.  Recorded rather than quietly fixed:
+  "already in scope" said nothing about who else was calling it, and checking
+  the callers is what turned a one-token change into a new kernel.
 - *=head_dim= 128 with =dim= 1024 and 16 heads is exactly what Phase 2a made
   representable*, confirmed by the real tensors: =q_proj= is [2048, 1024],
   =o_proj= is [1024, 2048], =k_proj= / =v_proj= are [1024, 1024] = 8 x 128.  The
@@ -237,6 +243,49 @@ That addition lands in the *Notes* repository, not this one -- =dev/nelisp-gpu=
 is a directory of Notes rather than a repository of its own, and Notes currently
 carries unrelated uncommitted work.  So it is deliberately a separate change
 with its own commit scope, not smuggled in here.
+
+*Phase 2d* (GPU) STARTED -- one imported linear now runs on the GPU.
+=lisp/nl-llm-weights-gpu.el= + =test/weights-gpu-test.el= (7/7,
+=make test-weights-gpu=), plus two additions on the =nelisp-gpu= side
+(=nelisp-gpu-server-upload-bytes= and the =bitlinear-dp4a-rows= kernel).
+
+*Those two additions are not under version control.*  Earlier notes here said
+they belonged to the Notes repository and would be committed separately; that
+was wrong.  Notes ignores =dev/*= with the comment that each dev project is its
+own repository, and =nelisp-photon=, =nelisp-llm=, =nelisp= and =nelisp-agent=
+all are -- but =nelisp-gpu= has no =.git= at all.  So its whole source, the
+Elisp client and the C =vkserver=, exists on one machine with no history and no
+backup, and the changes above are only on disk.  That wants deciding before more
+of Phase 2d lands on top of it.
+
+| measurement                        | result                        |
+|------------------------------------+-------------------------------|
+| 2 MiB weight payload uploaded      | as bytes, no float built      |
+| GPU vs the same W8A8 on the CPU    | rel 8.2e-08 (f32 accumulate)  |
+| activation quantization cost       | rel 6.7e-03                   |
+| GPU vs the Elisp loop, one linear  | 0.016s vs 1.048s (67x)        |
+| control: one row scale doubled     | detected                      |
+
+The bytes go from =insert-file-contents-literally= to the GPU buffer untouched,
+because the table's payload is already the uint32 words of four int8 lanes the
+kernel reads back with =bitcast-u=.  That is what
+=nelisp-gpu-server-upload-bytes= is for; =upload-u32= would have built a 1.2 GB
+vector and a 2.4 GB list for a model's worth of words.
+
+Two checks, because one cannot answer both questions.
+=nl-llm-weights-apply-w8a8= reproduces the kernel's exact arithmetic on the CPU
+-- integer lane products, scaled once by the weight row's scale times the
+activation's -- so "did the transfer and kernel do the right thing" gets a tight
+threshold, while "what does quantizing the activation cost" is a number to
+report.  Comparing the GPU against the f32-activation path would have conflated
+them at 6.7e-03 and called it agreement.
+
+One trap worth recording: the first measurement said activation quantization
+costs *nothing*, rel 0.000e+00.  The input was a raw embedding row, which is
+=lane * scale= and therefore already exactly int8-representable, so
+re-quantizing it is lossless.  The suite now uses a post-RMSNorm activation --
+what a linear actually sees -- and *asserts that the activation is not
+int8-exact*, so the number cannot quietly go back to measuring nothing.
 
 *The imported model runs.*  =lisp/nl-llm-weights-forward.el= +
 =tools/qwen-forward-ref.py= + =tools/nlwts.py= + =test/weights-forward-test.el=
@@ -449,7 +498,8 @@ Shape first, then the offline converter, then the self-hosted reader:
   =nl-llm-wts-v1= that uploads straight to
   resident GPU buffers via =OP_WRITE_RESIDENT=, never materializing a
   full-precision float vector on the Elisp side.
-- *2d.* Route the imported linears through =bitlinear-dp4a-1f=, reuse the
+- *2d.* STARTED (one linear; the decode loop is next).  Route the imported
+  linears through a per-row-scale DP4A kernel, reuse the
   resident decode from =nl-llm-gpu-decode.el=, and migrate that path to
   =:head-dim= (it currently refuses the key rather than deriving a wrong width).
 - *2e.* Port the converter's reader to Elisp once 2b-2d agree numerically; the

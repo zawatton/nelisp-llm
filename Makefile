@@ -369,7 +369,7 @@ clean:
 .PHONY: qwen-tokenizer-table test-qwen-tokenizer ollama-provider test-head-dim
 .PHONY: qwen-weights-table verify-qwen-weights test-weights-header
 .PHONY: qwen-weights-rows test-weights-load test-rope-style
-.PHONY: qwen-forward-ref test-weights-forward
+.PHONY: qwen-forward-ref test-weights-forward test-weights-gpu
 
 # DONOR is a HuggingFace model directory holding config.json + tokenizer.json.
 # Everything under build/donor/ is donor-derived and gitignored.
@@ -459,3 +459,10 @@ qwen-forward-ref:
 # attention conventions change, which is when it has something to say.
 test-weights-forward:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/weights-forward-test.el
+
+# One imported linear through the per-row DP4A kernel: uploaded as bytes, run on
+# the GPU, and compared against the same W8A8 arithmetic on the CPU.  Needs a
+# Vulkan device and the donor table; skips cleanly without either.  Calibrated
+# by doubling one row's scale, which it detects.
+test-weights-gpu:
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/weights-gpu-test.el
