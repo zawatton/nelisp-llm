@@ -14,6 +14,7 @@ test:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/weights-lora-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/weights-backward-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/weights-block-backward-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/weights-train-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/distill-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/arch-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/attn-test.el
@@ -475,7 +476,7 @@ test-weights-gpu:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/weights-gpu-test.el
 
 # --- Doc 08 Phase 3: adaptation ------------------------------------------
-.PHONY: test-weights-lora test-weights-backward test-block-backward
+.PHONY: test-weights-lora test-weights-backward test-block-backward test-train
 .PHONY: test-distill distill
 
 # A trainable LoRA over a frozen int8 base.  The transpose is pinned by the
@@ -511,3 +512,10 @@ test-weights-backward:
 # cross-position terms are exercised.
 test-block-backward:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/weights-block-backward-test.el
+
+# The training loop: completion-only cross-entropy over an imported model, with
+# the stack gradient (head + blocks + loss) checked against finite differences
+# and the completion boundary pinned.  A synthetic model, because one real step
+# is 5.4 minutes at seq 1 -- see the design doc for the measurement.
+test-train:
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/weights-train-test.el

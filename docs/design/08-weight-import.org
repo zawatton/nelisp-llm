@@ -1,6 +1,6 @@
 #+TITLE: Weight import -- run an open-weight Qwen model natively, without training it
 #+OPTIONS: toc:2 num:t
-#+STATUS: P0-P2d SHIPPED; P3 -- data, adapter and a verified block gradient all exist
+#+STATUS: P0-P2d SHIPPED; P3 -- the loop runs and is verified; CPU cost is the limit
 
 * Status
 Phases 0, 1, 2a, 2b and 2c SHIPPED on the CPU -- an imported Qwen3-0.6B runs,
@@ -8,9 +8,11 @@ matches a reference to 1e-14 through all 28 layers, and predicts the donor's
 next token exactly.  Phase 2d SHIPPED: every linear runs on the GPU, a block 57x
 faster than the Elisp loop, and the whole 28-layer stack predicts the same
 token the CPU oracle does.  Phase 3: the distillation data path works against a live
-teacher, a LoRA trains over the frozen int8 base, and a gradient now runs
-through a whole block with every path checked against finite differences.  What
-remains is a loop over the dataset, not new machinery.
+teacher, a LoRA trains over the frozen int8 base, a gradient runs through a
+whole block, and the completion-only training loop is verified end to end.  What
+limits it now is measured rather than unknown: 327s per step at seq 1 on the
+CPU, which the GPU's 58x on the forward linears already halves the fix for -- a
+transposed DP4A kernel is what remains.
 
 *Phase 0* (a locally served donor as teacher and as an immediately usable
 model): =examples/ollama-provider.el= + =make ollama-provider=.  No change was
@@ -373,9 +375,43 @@ reaching for the same accumulator twice because two fields seemed to want it --
 is why the tape now keeps one list per thing and the saved triples are the only
 copy.
 
-*So end-to-end LoRA training over an imported model is now possible*: the data
-path, the adapter, every vjp, and the composition are each verified.  What is
-left is a loop over the distilled dataset, not new machinery.
+*The loop* -- =lisp/nl-llm-weights-train.el= + =test/weights-train-test.el=
+(11/11, =make test-train=).  Completion-only cross-entropy over an imported
+model: encode with the *donor's* tokenizer, run the stack with tapes, score the
+positions whose next token is a completion token, and push the gradient back
+through the head and every block into the LoRA.
+
+The donor's tokenizer, not the agent's.  =nl-llm-agent-supervised= uses the
+bounded ascii/utf8 tokenizers, which is right for a model trained from scratch
+beside them and wrong here: an imported model's embedding rows are indexed by
+Qwen's 151936-entry vocabulary, so training against any other id space is
+training against noise.  The suite pins that against the ids from the Phase 2c
+milestone -- "The capital of France is" + " Paris" encodes to
+(785 6722 315 9625 374 12095) with the boundary at 5.
+
+| check                                         | result                  |
+|-----------------------------------------------+-------------------------|
+| dL/dA through head + 2 blocks + loss          | agreement to 6e-10      |
+| dL/dB through head + 2 blocks + loss          | agreement to 5e-10      |
+| changing a completion target changes the loss | 2.7083 -> 2.6987        |
+| a boundary with no completion positions       | signals                 |
+| loss is a mean, not a sum                     | 2.71 vs ln 11 = 2.40    |
+| a step descends                               | 4.03 -> 1.82, 25 steps  |
+
+*And the honest cost.*  Measured on the real Qwen3-0.6B, one block at one
+position: forward 6.74s, backward 4.92s.  So a single training step over 28
+layers at *seq 1* is 327s -- five and a half minutes -- and a realistic example
+is tens to hundreds of tokens, which puts a CPU step in hours.  The loop is
+correct; it is not yet practical on this path, and that is a measurement rather
+than an impression.
+
+Two things that measurement says beyond the headline.  The backward is
+*cheaper* than the forward, ratio 0.73, because it is seven transposes against
+the forward's seven multiplies plus the adapter, and the transpose skips rows
+whose scale times gradient is zero.  And the fix is already half-built: the GPU
+gives 58x on the forward linears, so what is missing is a transposed DP4A
+kernel, not new numerics.  A rank-8 LoRA on one role is 16384 trainable
+parameters per layer, which was never the part that cost anything.
 
 Independent and still open: the f32 autograd path's own migration, since
 =nl-llm-ag-block= *refuses* =:head-dim=, =:rope-style= and QK-norm.  That
