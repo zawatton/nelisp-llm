@@ -53,6 +53,9 @@ regardless of how many tokens are decoded."
 BLK is the same weight plist as `nl-llm-decode-block'.  Appends this token's raw
 key/value to CACHE (mutated, sink+window bounded) and returns the block output
 \(1 x dim).  Keys are RoPE'd by cache-relative position at attention time."
+  (nl-llm-attn-reject-decoupled-head-dim
+   blk (nl-llm-scache-dim cache) (nl-llm-scache-heads cache)
+   "nl-llm-stream-block")
   (let* ((dim (nl-llm-scache-dim cache)) (heads (nl-llm-scache-heads cache))
          (kvh (nl-llm-scache-kvh cache)) (hd (/ dim heads)) (kvdim (nl-llm-scache-kvdim cache))
          (grp (/ heads kvh)) (nsink (nl-llm-scache-nsink cache)) (win (nl-llm-scache-win cache))

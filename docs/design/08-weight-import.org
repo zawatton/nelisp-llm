@@ -1,9 +1,9 @@
 #+TITLE: Weight import -- run an open-weight Qwen model natively, without training it
 #+OPTIONS: toc:2 num:t
-#+STATUS: P0-P1 SHIPPED
+#+STATUS: P0-P1-P2a SHIPPED
 
 * Status
-Phase 0 and Phase 1 SHIPPED; Phases 2-3 are designed, not implemented.
+Phases 0, 1 and 2a SHIPPED; Phases 2b-3 are designed, not implemented.
 
 *Phase 0* (a locally served donor as teacher and as an immediately usable
 model): =examples/ollama-provider.el= + =make ollama-provider=.  No change was
@@ -79,6 +79,55 @@ the encode entry point rather than in the algorithm: =ucs-normalize-NFC-string=
 =secure-hash= (used only by the test's staleness guard).  Pinning the category
 ranges removed the third gap, =get-char-code-property=.
 
+
+*Phase 2a* (decoupled head dimension) SHIPPED -- =lisp/nl-llm-attn.el=,
+=nl-llm-block.el= and =nl-llm-decode.el= now take the per-head width from
+=:head-dim= on the layer (or the model, for blocks that do not state their own),
+falling back to =(/ dim heads)= so every existing model and test is unaffected.
+=test/head-dim-test.el= + =make test-head-dim= (13/13).
+
+The suite was calibrated against the unmodified code first, and the calibration
+is the interesting part.  Before the change, with a Qwen-like shape:
+
+| check                                  | before  | after   |
+|----------------------------------------+---------+---------|
+| coupled head dim == reference          | PASS    | PASS    |
+| decoupled head dim == reference        | *FAIL*  | PASS    |
+| decoupled output shape is (seq x dim)  | PASS    | PASS    |
+| decoupled cached == full forward       | *FAIL*  | PASS    |
+
+The shape check passing while the numbers were wrong by 0.74 is the whole
+problem in one line: the projections are the right shape, so nothing objects --
+the loops simply stride =(/ dim heads)= through a =heads * head_dim= wide query
+row.  That is why the suite carries its *own* reference implementation of
+decoupled attention instead of comparing two nelisp-llm paths: both paths shared
+the assumption, so they would have agreed while both were wrong.  (They did not,
+as it turned out, which is why the cached-vs-full row is also red before -- but
+that was luck, not a designed detector.)
+
+Only those three modules implement a decoupled width.  The others still derive
+it, so rather than ignore the key they refuse it, via
+=nl-llm-attn-reject-decoupled-head-dim=: =nl-llm-stream-block=,
+=nl-llm-integrated--blk=, =nl-llm-ag-block= and =nl-llm-gpu--decode-block=
+signal instead of returning plausible numbers.  Each guard is exercised in the
+suite except the GPU one, which needs a Vulkan device and which Phase 2b
+migrates rather than guards.  The contract is: a path either implements
+=:head-dim= or errors on it.
+
+One regression was caught by the existing suites and is worth recording.
+=nl-llm--dcache-validate-layout= required =dim= to divide =heads=, and relaxing
+that for caches carrying an explicit head width looked obviously safe -- a
+decoupled model does not need the relationship.  But a head width is now
+*always* stored, so the condition switched the check off for every cache, and
+=test/decode-capacity-test.el= went red on a malformed-cache case that had been
+rejected before.  The check is unconditional again: every Qwen3 dense size
+satisfies it anyway (1024/16, 2048/16, 2560/32), so there was nothing to relax
+it for.
+
+Pre-existing and untouched: =nl-llm-stream.el=, =nl-llm-integrated.el= and
+=nl-llm-gpu-decode.el= already fail =byte-compile-error-on-warn= (two
+over-long docstrings and one unused argument).  Confirmed identical at the
+parent commit before blaming the refactor.
 
 Head-dimension finding that resizes Phase 2: Qwen3-0.6B's =config.json= has
 =hidden_size= 1024, =num_attention_heads= 16 and =head_dim= 128, so

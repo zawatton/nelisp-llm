@@ -16,13 +16,15 @@
 (require 'nl-llm-moe)
 
 ;;;###autoload
-(defun nl-llm-block (x block heads kv-heads &optional rope-base)
+(defun nl-llm-block (x block heads kv-heads &optional rope-base head-dim)
   "Run one pre-norm transformer BLOCK on X (seq x dim).
 BLOCK holds :ln1g :ln2g (RMSNorm gains), attention :wq :wk :wv :wo, and a
 feed-forward: either (:router :experts :top-k) for MoE, or (:wg :wu :wd) for
-a single SwiGLU."
+a single SwiGLU.  HEAD-DIM is the per-head width to use when BLOCK carries no
+:head-dim of its own; both absent means (/ dim heads)."
   (let* ((a (nl-llm-rmsnorm x (plist-get block :ln1g)))
-         (x1 (photon-tensor-add x (nl-llm-gqa a block heads kv-heads rope-base)))
+         (x1 (photon-tensor-add
+              x (nl-llm-gqa a block heads kv-heads rope-base head-dim)))
          (b (nl-llm-rmsnorm x1 (plist-get block :ln2g)))
          (ffn (if (plist-get block :router)
                   (nl-llm-moe b (plist-get block :router) (plist-get block :experts)
@@ -35,13 +37,17 @@ a single SwiGLU."
 (defun nl-llm-model-forward (model tokens)
   "Run MODEL over TOKENS (list of ids); return (seq x vocab) logits.
 MODEL holds :wte (vocab x dim), :blocks (list), :lnf (final RMSNorm gain),
-:head (vocab x dim), :dim, :heads and optional :kv-heads, :rope-base."
+:head (vocab x dim), :dim, :heads and optional :kv-heads, :rope-base,
+:head-dim.  :head-dim is the per-head width for blocks that do not state their
+own, and defaults to (/ dim heads) -- the Qwen3 family sets it independently
+of dim and heads."
   (let* ((dim (plist-get model :dim)) (heads (plist-get model :heads))
          (kvh (or (plist-get model :kv-heads) heads))
          (rb (plist-get model :rope-base))
+         (hd (plist-get model :head-dim))
          (x (photon-tensor-embedding (plist-get model :wte) tokens dim)))
     (dolist (blk (plist-get model :blocks))
-      (setq x (nl-llm-block x blk heads kvh rb)))
+      (setq x (nl-llm-block x blk heads kvh rb hd)))
     (photon-tensor-linear (nl-llm-rmsnorm x (plist-get model :lnf))
                           (plist-get model :head))))
 

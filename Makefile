@@ -7,6 +7,7 @@ NELISP ?= ../nelisp/target/nelisp
 
 test:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/qwen-tokenizer-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/head-dim-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/arch-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/attn-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/moe-test.el
@@ -362,7 +363,7 @@ clean:
 	rm -f lisp/*.elc
 
 # --- Doc 08: weight import (docs/design/08-weight-import.org) -------------
-.PHONY: qwen-tokenizer-table test-qwen-tokenizer ollama-provider
+.PHONY: qwen-tokenizer-table test-qwen-tokenizer ollama-provider test-head-dim
 
 # DONOR is a HuggingFace model directory holding config.json + tokenizer.json.
 # Everything under build/donor/ is donor-derived and gitignored.
@@ -393,3 +394,7 @@ test-qwen-tokenizer:
 # Needs `ollama serve' running and `ollama pull qwen3:4b' done once.
 ollama-provider:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l examples/ollama-provider.el
+
+# Attention with a head width decoupled from dim/heads, as Qwen3 has.
+test-head-dim:
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/head-dim-test.el

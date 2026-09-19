@@ -16,34 +16,46 @@
 (require 'nl-llm-attn)   ; nl-llm--rope-heads
 
 (cl-defstruct (nl-llm-dcache (:constructor nl-llm-dcache--make))
-  k v (len 0) kvdim dim heads kvh)
+  k v (len 0) kvdim dim heads kvh head-dim)
 
 (defun nl-llm--dcache-positive-integer-p (value)
   "Return non-nil when VALUE is a positive integer."
   (and (integerp value) (> value 0)))
 
-(defun nl-llm--dcache-validate-layout (dim heads kvh)
-  "Validate cache layout dimensions DIM, HEADS, and KVH."
+(defun nl-llm--dcache-validate-layout (dim heads kvh &optional head-dim)
+  "Validate cache layout dimensions DIM, HEADS, KVH and optional HEAD-DIM."
   (unless (nl-llm--dcache-positive-integer-p dim)
     (error "KV cache dim must be a positive integer, got %S" dim))
   (unless (nl-llm--dcache-positive-integer-p heads)
     (error "KV cache heads must be a positive integer, got %S" heads))
   (unless (nl-llm--dcache-positive-integer-p kvh)
     (error "KV cache kvh must be a positive integer, got %S" kvh))
+  (when head-dim
+    (unless (nl-llm--dcache-positive-integer-p head-dim)
+      (error "KV cache head-dim must be a positive integer, got %S" head-dim)))
+  ;; Kept unconditional.  Relaxing it for caches that state a head width looked
+  ;; harmless -- a decoupled model does not need dim to divide heads -- but it
+  ;; silently switched the check off for every cache, since one is now always
+  ;; stored, and test/decode-capacity-test.el caught the loss.  Every Qwen3
+  ;; dense size satisfies it anyway (1024/16, 2048/16, 2560/32), so there is no
+  ;; case to relax it for yet.
   (unless (= (% dim heads) 0)
     (error "KV cache dim %d must be divisible by heads %d" dim heads))
   (unless (= (% heads kvh) 0)
     (error "KV cache heads %d must be divisible by kvh %d" heads kvh)))
 
-(defun nl-llm-dcache-new (max-seq dim heads kvh)
-  "Empty KV cache for MAX-SEQ tokens, width DIM, HEADS query / KVH kv heads."
+(defun nl-llm-dcache-new (max-seq dim heads kvh &optional head-dim)
+  "Empty KV cache for MAX-SEQ tokens, width DIM, HEADS query / KVH kv heads.
+HEAD-DIM is the per-head width, defaulting to (/ DIM HEADS) and stored on the
+cache so the decode step cannot re-derive a width the weights disagree with."
   (unless (nl-llm--dcache-positive-integer-p max-seq)
     (error "KV cache capacity must be a positive integer, got %S" max-seq))
-  (nl-llm--dcache-validate-layout dim heads kvh)
-  (let* ((hd (/ dim heads)) (kvdim (* kvh hd)))
+  (nl-llm--dcache-validate-layout dim heads kvh head-dim)
+  (let* ((hd (or head-dim (/ dim heads))) (kvdim (* kvh hd)))
     (nl-llm-dcache--make :k (make-vector (* max-seq kvdim) 0.0)
                          :v (make-vector (* max-seq kvdim) 0.0)
-                         :len 0 :kvdim kvdim :dim dim :heads heads :kvh kvh)))
+                         :len 0 :kvdim kvdim :dim dim :heads heads :kvh kvh
+                         :head-dim hd)))
 
 (defun nl-llm--dcache-preflight (cache &optional expected-dim)
   "Validate CACHE metadata and storage, and require room for one token.
@@ -56,11 +68,12 @@ When EXPECTED-DIM is non-nil, require CACHE to have that model dimension."
         (kvdim (nl-llm-dcache-kvdim cache))
         (len (nl-llm-dcache-len cache))
         (kc (nl-llm-dcache-k cache))
-        (vc (nl-llm-dcache-v cache)))
-    (nl-llm--dcache-validate-layout dim heads kvh)
+        (vc (nl-llm-dcache-v cache))
+        (hd (nl-llm-dcache-head-dim cache)))
+    (nl-llm--dcache-validate-layout dim heads kvh hd)
     (when (and expected-dim (/= dim expected-dim))
       (error "KV cache dim %d does not match decoder dim %d" dim expected-dim))
-    (let ((expected-kvdim (* kvh (/ dim heads))))
+    (let ((expected-kvdim (* kvh (or hd (/ dim heads)))))
       (unless (and (integerp kvdim) (= kvdim expected-kvdim))
         (error "KV cache kvdim %S does not match expected width %d"
                kvdim expected-kvdim)))
@@ -114,7 +127,9 @@ BLK is a plist of tensor weights with biases: :ln1g :wq :bq :wk :bk :wv :bv
 CACHE (mutated) and returns the block output (1 x dim)."
   (nl-llm--dcache-preflight cache)
   (let* ((dim (nl-llm-dcache-dim cache)) (heads (nl-llm-dcache-heads cache))
-         (kvh (nl-llm-dcache-kvh cache)) (hd (/ dim heads)) (kvdim (nl-llm-dcache-kvdim cache))
+         (kvh (nl-llm-dcache-kvh cache))
+         (hd (or (nl-llm-dcache-head-dim cache) (/ dim heads)))
+         (qdim (* heads hd)) (kvdim (nl-llm-dcache-kvdim cache))
          (grp (/ heads kvh)) (pos (nl-llm-dcache-len cache)) (base (or rope-base 10000.0))
          (scale (/ 1.0 (sqrt (float hd))))
          (a (nl-llm-rmsnorm xrow (plist-get blk :ln1g)))
@@ -122,7 +137,7 @@ CACHE (mutated) and returns the block output (1 x dim)."
          (kr (photon-tensor-data (photon-tensor-linear a (plist-get blk :wk) (plist-get blk :bk))))
          (vr (photon-tensor-data (photon-tensor-linear a (plist-get blk :wv) (plist-get blk :bv))))
          (kc (nl-llm-dcache-k cache)) (vc (nl-llm-dcache-v cache))
-         (out (make-vector dim 0.0)))
+         (out (make-vector qdim 0.0)))
     (nl-llm--rope-heads qr 0 heads hd pos base)
     (nl-llm--rope-heads kr 0 kvh hd pos base)
     (dotimes (t0 kvdim)
@@ -145,7 +160,7 @@ CACHE (mutated) and returns the block output (1 x dim)."
                   (setq j (1+ j)))
                 (aset out (+ c0q t0) acc))
               (setq t0 (1+ t0)))))))
-    (let* ((attn (photon-tensor-linear (photon-tensor (list 1 dim) out) (plist-get blk :wo) (plist-get blk :bo)))
+    (let* ((attn (photon-tensor-linear (photon-tensor (list 1 qdim) out) (plist-get blk :wo) (plist-get blk :bo)))
            (x1 (photon-tensor-add xrow attn))
            (bnorm (nl-llm-rmsnorm x1 (plist-get blk :ln2g))))
       (photon-tensor-add x1 (nl-llm--swiglu-b bnorm blk)))))

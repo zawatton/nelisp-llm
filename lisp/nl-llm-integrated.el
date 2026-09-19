@@ -128,6 +128,9 @@ attention output (dim).  Shared by the LINFN and fused-resident blocks."
 through LINFN (XROW, weight-spec, bias-row) -> flat vector, so a ternary packed
 LINFN makes the block BitNet; the KV is stored in the paged streaming CACHE and
 attended sink+window with cache-relative RoPE (StreamingLLM + PagedAttention)."
+  (nl-llm-attn-reject-decoupled-head-dim
+   blk (nl-llm-spcache-dim cache) (nl-llm-spcache-heads cache)
+   "nl-llm-integrated--blk")
   (let* ((dim (nl-llm-spcache-dim cache)) (base (or rope-base 10000.0))
          (a (nl-llm-rmsnorm xrow (plist-get blk :ln1g)))
          (qr (funcall linfn a (plist-get blk :wq) (plist-get blk :bq)))

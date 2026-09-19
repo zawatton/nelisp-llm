@@ -20,7 +20,7 @@ work.
 |  6 | [[file:06-coconut.org][Coconut -- chain of continuous thought]]   | SHIPPED (CPU ref) | med    | latent reasoning (width) |
 |  7 | [[file:07-recurrent-depth.org][Recurrent depth -- iterate a shared block]] | SHIPPED (CPU ref) | med-lo | latent reasoning (depth), test-time compute |
 
-|  8 | [[file:08-weight-import.org][Weight import -- run a donor model natively]] | P0-P1✓ | med-hi | no pre-training   |
+|  8 | [[file:08-weight-import.org][Weight import -- run a donor model natively]] | P0-P2a✓ | med-hi | no pre-training   |
 
 Doc 8 is the one that changes the cost structure rather than the capability:
 reaching usable quality from scratch at 100M parameters is ~1.2e18 FLOP, which

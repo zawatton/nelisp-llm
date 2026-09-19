@@ -15,6 +15,7 @@
 (require 'photon-tensor)
 (require 'nl-llm-gpu)      ; server + bin path
 (require 'nl-llm-gpu-ag)   ; builder: nlga ops, slots, compile/step
+(require 'nl-llm-attn)     ; nl-llm-attn-reject-decoupled-head-dim
 (require 'nl-llm-decode)   ; CPU dcache / decode-step / decode-h (context prefill)
 (require 'nl-llm-spec)     ; argmax helpers for chain-draft speculative decode
 
@@ -52,6 +53,7 @@
     (nlga-rt--make :slot os :rows 1 :cols dim)))
 
 (defun nl-llm-gpu--decode-block (b x blk ck cv pos sign cosr sinr heads kvh dim kvdim)
+  (nl-llm-attn-reject-decoupled-head-dim blk dim heads "nl-llm-gpu--decode-block")
   (let* ((a (nlga-rmsnorm b x (plist-get blk :ln1g)))
          (q (nl-llm-gpu--rope1 b (nlga-linear b a (plist-get blk :wq) (plist-get blk :bq)) cosr sinr sign pos dim heads))
          (k (nl-llm-gpu--rope1 b (nlga-linear b a (plist-get blk :wk) (plist-get blk :bk)) cosr sinr sign pos kvdim kvh))

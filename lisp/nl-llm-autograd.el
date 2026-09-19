@@ -13,6 +13,7 @@
 (require 'photon-tensor)
 (require 'photon-autograd)
 (require 'nl-llm-moe)   ; for nl-llm--topk-indices
+(require 'nl-llm-attn)  ; nl-llm-attn-reject-decoupled-head-dim
 
 ;;;###autoload
 (defun nl-llm-ag-masked-softmax-ce (logits targets mask)
@@ -376,6 +377,8 @@ BLOCK is a plist of pav weights: :ln1g :wq :bq :wk :bk :wv :bv :wo :bo :ln2g
 and a feed-forward, either (:router :brouter :experts :top-k) for MoE or
 \(:wg :bg :wu :bu :wd :bd) for a single SwiGLU.  Computes
 x1 = x + GQA(RMSNorm(x)); returns x1 + FFN(RMSNorm(x1))."
+  (nl-llm-attn-reject-decoupled-head-dim
+   block (nth 1 (photon-tensor-shape (pav-value x))) heads "nl-llm-ag-block")
   (let* ((a (nl-llm-ag-rmsnorm x (plist-get block :ln1g)))
          (x1 (photon-autograd-add
               x (nl-llm-ag-gqa a (plist-get block :wq) (plist-get block :bq)

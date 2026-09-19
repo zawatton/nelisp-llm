@@ -7,6 +7,12 @@
 ;; by HEADS/KV-HEADS query heads, shrinking the KV cache.  MHA is the special
 ;; case KV-HEADS = HEADS.  The cached path is verified numerically identical
 ;; to full recomputation (see test/attn-test.el).  Built on photon-tensor.
+;;
+;; Head width is `:head-dim' on the layer when present, else (/ dim heads).
+;; Qwen3 decouples the two -- Qwen3-0.6B is dim 1024 with 16 heads of width 128,
+;; so the query side is 2048 wide and :wo folds it back to 1024.  Nothing in the
+;; shapes objects when the width is wrong, so the loops just stride the wrong
+;; distance; test/head-dim-test.el pins the numbers against its own reference.
 
 ;;; Code:
 
@@ -32,24 +38,26 @@
     (nl-llm--rope-block vec (+ rowbase (* h hd)) pos hd rbase) (setq h (1+ h)))))
 
 ;;;###autoload
-(defun nl-llm-gqa (x layer heads kv-heads &optional rope-base)
+(defun nl-llm-gqa (x layer heads kv-heads &optional rope-base head-dim)
   "Full causal grouped-query attention over X (seq x dim) with per-head RoPE.
-LAYER holds :wq (dim x dim) and :wk :wv (kvdim x dim) where kvdim =
-KV-HEADS*(dim/HEADS), and :wo (dim x dim).  Returns (seq x dim)."
+Head width is LAYER's :head-dim, else HEAD-DIM, else (/ dim heads).  With HD as
+that width, LAYER holds :wq (HEADS*HD x dim), :wk :wv (KV-HEADS*HD x dim) and
+:wo (dim x HEADS*HD).  Returns (seq x dim)."
   (let* ((sh (photon-tensor-shape x)) (seq (car sh)) (dim (nth 1 sh))
-         (hd (/ dim heads)) (kvdim (* kv-heads hd)) (grp (/ heads kv-heads))
+         (hd (or (plist-get layer :head-dim) head-dim (/ dim heads)))
+         (qdim (* heads hd)) (kvdim (* kv-heads hd)) (grp (/ heads kv-heads))
          (base (or rope-base 10000.0)) (scale (/ 1.0 (sqrt (float hd))))
          (q (photon-tensor-data (photon-tensor-linear x (plist-get layer :wq))))
          (k (photon-tensor-data (photon-tensor-linear x (plist-get layer :wk))))
          (v (photon-tensor-data (photon-tensor-linear x (plist-get layer :wv))))
-         (out (make-vector (* seq dim) 0.0)))
+         (out (make-vector (* seq qdim) 0.0)))
     (dotimes (i seq)
-      (nl-llm--rope-heads q (* i dim) heads hd i base)
+      (nl-llm--rope-heads q (* i qdim) heads hd i base)
       (nl-llm--rope-heads k (* i kvdim) kv-heads hd i base))
     (dotimes (h heads)
       (let ((c0q (* h hd)) (c0k (* (/ h grp) hd)))
         (dotimes (i seq)
-          (let ((scores (make-vector (1+ i) 0.0)) (mx -1.0e30) (qb (+ (* i dim) c0q)))
+          (let ((scores (make-vector (1+ i) 0.0)) (mx -1.0e30) (qb (+ (* i qdim) c0q)))
             (dotimes (j (1+ i))
               (let ((kb (+ (* j kvdim) c0k)) (acc 0.0) (t0 0))
                 (while (< t0 hd)
@@ -64,26 +72,44 @@ KV-HEADS*(dim/HEADS), and :wo (dim x dim).  Returns (seq x dim)."
                     (while (<= j i)
                       (setq acc (+ acc (* (/ (aref scores j) sm) (aref v (+ (* j kvdim) c0k t0)))))
                       (setq j (1+ j)))
-                    (aset out (+ (* i dim) c0q t0) acc))
+                    (aset out (+ (* i qdim) c0q t0) acc))
                   (setq t0 (1+ t0)))))))))
-    (photon-tensor-linear (photon-tensor (list seq dim) out) (plist-get layer :wo))))
+    (photon-tensor-linear (photon-tensor (list seq qdim) out) (plist-get layer :wo))))
 
 ;;;###autoload
-(defun nl-llm-mha (x layer heads &optional rope-base)
+(defun nl-llm-attn-reject-decoupled-head-dim (layer dim heads where)
+  "Signal when LAYER asks for a head width that WHERE does not implement.
+Only `nl-llm-gqa', `nl-llm-block' / `nl-llm-model-forward' and the CPU KV
+decode in `nl-llm-decode.el' honour a `:head-dim' other than (/ DIM HEADS).
+Every other attention path still derives the width from dim and heads, and a
+wrong width does not raise there -- the projections are the right shape, so the
+loops stride the wrong distance and return plausible numbers.  Those paths call
+this instead of ignoring the key, so forgetting to migrate one is an error
+rather than a quiet wrong answer."
+  (let ((hd (plist-get layer :head-dim)))
+    (when (and hd (/= hd (/ dim heads)))
+      (error "%s does not implement :head-dim %d yet (dim %d / heads %d = %d)"
+             where hd dim heads (/ dim heads)))))
+
+;;;###autoload
+(defun nl-llm-mha (x layer heads &optional rope-base head-dim)
   "Full causal multi-head self-attention: GQA with KV-HEADS = HEADS."
-  (nl-llm-gqa x layer heads heads rope-base))
+  (nl-llm-gqa x layer heads heads rope-base head-dim))
 
 (cl-defstruct (nl-llm-kv (:constructor nl-llm-kv--make))
-  k v len dim heads kv-heads)
+  k v len dim heads kv-heads head-dim)
 
 ;;;###autoload
-(defun nl-llm-kv-new (max-seq dim heads &optional kv-heads)
+(defun nl-llm-kv-new (max-seq dim heads &optional kv-heads head-dim)
   "Return an empty KV cache for MAX-SEQ tokens, width DIM, HEADS query heads
-and KV-HEADS key/value heads (default = HEADS, i.e. MHA)."
-  (let* ((kvh (or kv-heads heads)) (hd (/ dim heads)) (kvdim (* kvh hd)))
+and KV-HEADS key/value heads (default = HEADS, i.e. MHA).  HEAD-DIM is the
+per-head width, defaulting to (/ DIM HEADS); the cache remembers it so the
+decode step does not re-derive a width the weights disagree with."
+  (let* ((kvh (or kv-heads heads)) (hd (or head-dim (/ dim heads)))
+         (kvdim (* kvh hd)))
     (nl-llm-kv--make :k (make-vector (* max-seq kvdim) 0.0)
                      :v (make-vector (* max-seq kvdim) 0.0)
-                     :len 0 :dim dim :heads heads :kv-heads kvh)))
+                     :len 0 :dim dim :heads heads :kv-heads kvh :head-dim hd)))
 
 ;;;###autoload
 (defun nl-llm-attn-step (xi layer cache &optional rope-base)
@@ -91,14 +117,16 @@ and KV-HEADS key/value heads (default = HEADS, i.e. MHA)."
 Appends this token's RoPE'd key/value (KV-HEADS wide) to CACHE and returns
 its attention output (1 x dim).  Incremental KV-cache decode path."
   (let* ((dim (nl-llm-kv-dim cache)) (heads (nl-llm-kv-heads cache))
-         (kvh (nl-llm-kv-kv-heads cache)) (hd (/ dim heads))
+         (kvh (nl-llm-kv-kv-heads cache))
+         (hd (or (nl-llm-kv-head-dim cache) (/ dim heads)))
+         (qdim (* heads hd))
          (kvdim (* kvh hd)) (grp (/ heads kvh)) (pos (nl-llm-kv-len cache))
          (base (or rope-base 10000.0)) (scale (/ 1.0 (sqrt (float hd))))
          (qr (photon-tensor-data (photon-tensor-linear xi (plist-get layer :wq))))
          (kr (photon-tensor-data (photon-tensor-linear xi (plist-get layer :wk))))
          (vr (photon-tensor-data (photon-tensor-linear xi (plist-get layer :wv))))
          (kc (nl-llm-kv-k cache)) (vc (nl-llm-kv-v cache))
-         (out (make-vector dim 0.0)))
+         (out (make-vector qdim 0.0)))
     (nl-llm--rope-heads qr 0 heads hd pos base)
     (nl-llm--rope-heads kr 0 kvh hd pos base)
     (dotimes (t0 kvdim)
@@ -123,15 +151,17 @@ its attention output (1 x dim).  Incremental KV-cache decode path."
                   (setq j (1+ j)))
                 (aset out (+ c0q t0) acc))
               (setq t0 (1+ t0)))))))
-    (photon-tensor-linear (photon-tensor (list 1 dim) out) (plist-get layer :wo))))
+    (photon-tensor-linear (photon-tensor (list 1 qdim) out) (plist-get layer :wo))))
 
 ;;;###autoload
-(defun nl-llm-gqa-cached (x layer heads kv-heads &optional rope-base)
+(defun nl-llm-gqa-cached (x layer heads kv-heads &optional rope-base head-dim)
   "GQA over X (seq x dim) computed incrementally via a KV cache.
 Numerically identical to `nl-llm-gqa'; the decode-time path."
   (let* ((sh (photon-tensor-shape x)) (seq (car sh)) (dim (nth 1 sh))
          (xd (photon-tensor-data x))
-         (cache (nl-llm-kv-new seq dim heads kv-heads))
+         (cache (nl-llm-kv-new seq dim heads kv-heads
+                               (or (plist-get layer :head-dim) head-dim
+                                   (/ dim heads))))
          (out (make-vector (* seq dim) 0.0)))
     (dotimes (i seq)
       (let ((rowvec (make-vector dim 0.0)))
@@ -143,9 +173,9 @@ Numerically identical to `nl-llm-gqa'; the decode-time path."
     (photon-tensor (list seq dim) out)))
 
 ;;;###autoload
-(defun nl-llm-mha-cached (x layer heads &optional rope-base)
+(defun nl-llm-mha-cached (x layer heads &optional rope-base head-dim)
   "Incremental MHA: `nl-llm-gqa-cached' with KV-HEADS = HEADS."
-  (nl-llm-gqa-cached x layer heads heads rope-base))
+  (nl-llm-gqa-cached x layer heads heads rope-base head-dim))
 
 (provide 'nl-llm-attn)
 ;;; nl-llm-attn.el ends here
