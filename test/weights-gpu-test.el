@@ -1095,6 +1095,70 @@ CPU %.0fs" (car (nl-llm-wf-argmax gl)) (wg--rel gl f32 sc) csec))
                                     (< worst 1.0e-4)
                                     (format "dq/dk/dv worst rel %.3e" worst)))))
 
+                      ;; --- a whole block's backward as one batch -----------
+                      ;;
+                      ;; The forward writes its tape into resident buffers and
+                      ;; the backward reads them, so nothing between the two
+                      ;; crosses the Elisp boundary.  The training forward also
+                      ;; decomposes the attention, because every attention vjp
+                      ;; takes the probabilities and the fused kernel discards
+                      ;; them; that it still computes the same block is the
+                      ;; first check here.
+                      (let* ((klay (nl-llm-wf-load-layer wts 0))
+                             ;; one layer object: the transpose table is keyed
+                             ;; by `eq', so a second load misses every lookup
+                             ;; and the comparison silently becomes against the
+                             ;; f32 path -- which reads as a 1e-02 disagreement
+                             ;; that is the activation quantization, not a bug
+                             (ktbl (nl-llm-wgpu-upload-transposes (list klay)))
+                             (kflay (nl-llm-wfuse-open-layer wts 0))
+                             (kff (plist-get (plist-get kflay :wg) :rows))
+                             (kseq 6)
+                             (ktape (nl-llm-wfuse-alloc-tape cfg kseq kff))
+                             (kx (make-vector (* kseq dim) 0.0))
+                             (kdout (make-vector (* kseq dim) 0.0)))
+                        (dotimes (p kseq)
+                          (let ((r (nl-llm-weights-embed wts (+ 785 p))))
+                            (dotimes (i dim) (aset kx (+ (* p dim) i) (aref r i)))))
+                        (dotimes (i (* kseq dim))
+                          (aset kdout i (* 0.01 (- (mod (* (1+ i) 7919) 211) 105.0))))
+                        (unwind-protect
+                            (let* ((plain (nl-llm-wfuse-block kflay kx kseq))
+                                   (trained (nl-llm-wfuse-block kflay kx kseq ktape)))
+                              (wg--ck "the training forward == the inference one"
+                                      (< (wg--rel trained plain (wg--amax plain)) 1.0e-5)
+                                      (format "rel %.3e (decomposed vs fused attention)"
+                                              (wg--rel trained plain (wg--amax plain))))
+                              (let* ((t0 (float-time))
+                                     (fw (nl-llm-wgpu-with-linears ktbl
+                                           (nl-llm-wb-block-forward klay kx kseq cfg)))
+                                     (ref (car (nl-llm-wgpu-with-transposes ktbl
+                                                 (nl-llm-wb-block-backward
+                                                  klay (nth 1 fw) kdout kseq cfg))))
+                                     (t1 (float-time))
+                                     (fus (nl-llm-wfuse-block-backward
+                                           kflay ktape kx kdout kseq))
+                                     (t2 (float-time)))
+                                (wg--ck "a block's backward as one batch == unfused"
+                                        (< (wg--rel fus ref (wg--amax ref)) 1.0e-4)
+                                        (format "rel %.3e, %.4fs vs %.4fs"
+                                                (wg--rel fus ref (wg--amax ref))
+                                                (- t2 t1) (- t1 t0)))
+                                ;; The first version of this wrote the per-head
+                                ;; inverse stds into the tape's per-row ones --
+                                ;; sixteen times too many entries into a buffer
+                                ;; a sixteenth the size.  It returned numbers of
+                                ;; the right magnitude and a rel of 0.78: not
+                                ;; close, not obviously broken either.  Hence a
+                                ;; control that says the slot was written at
+                                ;; all, separately from whether it is right.
+                                (wg--ck "control: the backward wrote its output"
+                                        (> (wg--amax fus) 1.0e-6)
+                                        (format "amax %.4f" (wg--amax fus)))))
+                          (nl-llm-wfuse-free-tape ktape)
+                          (nl-llm-wfuse-close-layer kflay)
+                          (nl-llm-wgpu-free-transposes ktbl)))
+
                       ;; --- the fused block end to end, behind an env var ---
                       ;;
                       ;; One block matching is not the claim that matters; 28
