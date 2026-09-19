@@ -26,8 +26,12 @@
 
 (add-to-list 'load-path (expand-file-name "lisp"))
 (add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+(require 'photon-tensor)
 (require 'nl-llm-weights)
+(require 'nl-llm-lora)
 (require 'nl-llm-weights-forward)
+(require 'nl-llm-weights-lora)
+(require 'nl-llm-weights-backward)
 
 (defvar wg--fail 0)
 (defvar wg--table (expand-file-name "build/donor/qwen3-0.6b/weights.bin"))
@@ -174,6 +178,84 @@
                             (wg--ck "GPU transpose satisfies <W.x, g> = <x, W^T.g>"
                                     (< rel 1.0e-4)
                                     (format "%.6f vs %.6f (rel %.2e)" lhs rhs rel)))))
+
+                      ;; --- the block backward, routed to the GPU ----------
+                      ;;
+                      ;; Only the transposes move, so every gradient that
+                      ;; depends on one may differ by f32 accumulation.  That is
+                      ;; all of them: an adapter's dA and dB do not touch its
+                      ;; own W^T, but they are built from the gradient arriving
+                      ;; at that linear, and for a LoRA on :wv that has already
+                      ;; come back through :wo's transpose and the attention.
+                      ;;
+                      ;; Worth writing down because the first version of this
+                      ;; check asserted dA and dB were bit-identical, on exactly
+                      ;; that "they never touch W^T" reasoning, and a probe
+                      ;; seemed to agree -- but only because the probe left B at
+                      ;; zero, which makes dA identically zero on both sides.
+                      ;; The suite failed the moment B was perturbed.
+                      (let* ((lay (nl-llm-wf-load-layer wts 0))
+                             (blin (nl-llm-wf-layer-lin lay :wv))
+                             (lora (nl-llm-lora-make
+                                    (nl-llm-weights-lin-rows blin)
+                                    (nl-llm-weights-lin-cols blin) 8 16 0))
+                             (loras (list :wv lora))
+                             (bx (nl-llm-weights-embed wts 785))
+                             (dout (make-vector dim 0.0)))
+                        (dotimes (i (length (photon-tensor-data
+                                             (plist-get lora :b))))
+                          (aset (photon-tensor-data (plist-get lora :b)) i
+                                (* 0.001 (- (mod (* (1+ i) 31) 17) 8))))
+                        (dotimes (i dim)
+                          (aset dout i (* 0.01 (- (mod (* (1+ i) 7919) 211) 105))))
+                        (let* ((fw (nl-llm-wb-block-forward lay bx 1 cfg loras))
+                               (tape (nth 1 fw))
+                               (t6 (float-time))
+                               (cpu (nl-llm-wb-block-backward
+                                     lay tape dout 1 cfg loras))
+                               (csec (- (float-time) t6))
+                               (tbl (nl-llm-wgpu-upload-transposes (list lay)))
+                               (t7 (float-time))
+                               (gpu (nl-llm-wgpu-with-transposes tbl
+                                      (nl-llm-wb-block-backward
+                                       lay tape dout 1 cfg loras)))
+                               (gsec (- (float-time) t7)))
+                          (unwind-protect
+                              (progn
+                                (wg--ck "block backward on the GPU == the CPU (dx)"
+                                        (< (wg--rel (car gpu) (car cpu)
+                                                    (wg--amax (car cpu)))
+                                           1.0e-4)
+                                        (format "rel %.3e"
+                                                (wg--rel (car gpu) (car cpu)
+                                                         (wg--amax (car cpu)))))
+                                (let* ((ca (plist-get (plist-get (cdr cpu) :wv) :da))
+                                       (ga (plist-get (plist-get (cdr gpu) :wv) :da))
+                                       (cb (plist-get (plist-get (cdr cpu) :wv) :db))
+                                       (gb (plist-get (plist-get (cdr gpu) :wv) :db))
+                                       (ra (wg--rel ga ca (wg--amax ca)))
+                                       (rb (wg--rel gb cb (wg--amax cb))))
+                                  (wg--ck "the adapter's gradients agree to f32"
+                                          (and (< ra 1.0e-4) (< rb 1.0e-4)
+                                               (> (wg--amax ca) 0.0))
+                                          (format "dA rel %.2e, dB rel %.2e (nonzero: %s)"
+                                                  ra rb (> (wg--amax ca) 0.0))))
+                                (wg--ck "the GPU block backward is faster"
+                                        (< gsec csec)
+                                        (format "%.3fs vs %.2fs (%.0fx)"
+                                                gsec csec (/ csec (max gsec 1.0e-6))))
+                                ;; A linear absent from the table must fall back
+                                ;; rather than fail, which is what makes a
+                                ;; partially uploaded model merely slower.
+                                (let* ((empty (make-hash-table :test 'eq))
+                                       (fb (nl-llm-wgpu-with-transposes empty
+                                             (nl-llm-wb-block-backward
+                                              lay tape dout 1 cfg loras))))
+                                  (wg--ck "an empty table falls back to the CPU"
+                                          (equal (append (car fb) nil)
+                                                 (append (car cpu) nil))
+                                          "identical to the CPU backward")))
+                            (nl-llm-wgpu-free-transposes tbl))))
 
                       ;; The acceptance criterion for this phase, behind an env
                       ;; var because it is a four-minute run: does the whole

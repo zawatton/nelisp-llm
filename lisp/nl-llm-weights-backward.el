@@ -195,6 +195,19 @@ Returns (Y U XS), U and XS nil when there is no adapter."
         (nl-llm-wlora-forward lin lora x base)
       (list (nl-llm-weights-apply lin x base) nil nil))))
 
+(defvar nl-llm-wb-transpose-fn nil
+  "When non-nil, a function (LIN G) computing W^T.G in place of the CPU loop.
+Bound around a backward to route every frozen base's transpose somewhere else
+-- the GPU, in practice.  A dynamic variable rather than an argument threaded
+through six call sites, and nil restores the CPU path exactly, which is what
+keeps the verified reference available for comparison.")
+
+(defun nl-llm-wb--transpose (lin g)
+  "Return W^T.G for LIN, through `nl-llm-wb-transpose-fn' if one is bound."
+  (if nl-llm-wb-transpose-fn
+      (funcall nl-llm-wb-transpose-fn lin g)
+    (nl-llm-weights-apply-t lin g)))
+
 (defun nl-llm-wb--lin-backward (lay role loras saved g acc)
   "Accumulate ROLE's input gradient for output gradient G into ACC.
 Returns the plist of LoRA gradients for ROLE, or nil.  SAVED is the (Y U XS)
@@ -202,10 +215,11 @@ from `nl-llm-wb--lin-forward'."
   (let* ((lin (nl-llm-wf-layer-lin lay role))
          (lora (plist-get loras role)))
     (if (null lora)
-        (let ((dx (nl-llm-weights-apply-t lin g)))
+        (let ((dx (nl-llm-wb--transpose lin g)))
           (dotimes (i (length dx)) (aset acc i (+ (aref acc i) (aref dx i))))
           nil)
-      (let ((grads (nl-llm-wlora-backward lin lora (nth 2 saved) (nth 1 saved) g)))
+      (let ((grads (nl-llm-wlora-backward lin lora (nth 2 saved) (nth 1 saved) g
+                                          #'nl-llm-wb--transpose)))
         (let ((dx (plist-get grads :dx)))
           (dotimes (i (length dx)) (aset acc i (+ (aref acc i) (aref dx i)))))
         grads))))

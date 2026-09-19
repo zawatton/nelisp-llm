@@ -433,9 +433,39 @@ The inner-product identity carries the structural weight there: it needs no
 reference implementation at all, and no index error survives it -- which matters
 for the one access pattern that is easy to get backwards.
 
-So both directions of a linear now run on the GPU at 67x, and what stands
-between the loop and practicality is wiring the block backward through them --
-assembly again, not numerics.
+*And the block backward is wired through it* -- =nl-llm-wgpu-with-transposes=
+binds =nl-llm-wb-transpose-fn=, so every frozen base's W^T.g inside
+=nl-llm-wb-block-backward= goes to the GPU without that file knowing there is
+one.  A dynamic binding rather than an argument threaded through six call
+sites, and unbound it restores the CPU path exactly, which is what keeps the
+verified reference available to compare against.
+
+| measurement                              | result              |
+|------------------------------------------+---------------------|
+| block backward, GPU vs CPU               | 0.129s vs 4.85s, 37x |
+| dx, GPU vs CPU                           | rel 1.1e-06         |
+| the adapter's dA / dB, GPU vs CPU        | rel 8.5e-07 / 1.4e-06 |
+| a linear absent from the table           | falls back, identical |
+
+The handles are keyed by the linear *object*, and the upload takes the CPU
+layer's own linears rather than a fresh load, because two loads of one tensor
+are equal in content and not =eq= -- a lookup that missed would fall back to
+the CPU silently and look merely slow.
+
+One claim corrected here.  The suite first asserted that the adapter's dA and
+dB would be *bit-identical* under the routing, on the reasoning that they are
+built from the adapter's own arithmetic and never touch W^T.  A probe appeared
+to confirm it at rel 0.000e+00 -- but only because that probe left B at zero,
+which makes dA identically zero on both sides.  The moment B was perturbed the
+check failed, correctly: dA and dB do not touch their *own* transpose, but for a
+LoRA on =:wv= the gradient arriving there has already come back through =:wo='s
+transpose and the attention.  Everything downstream of a transpose inherits its
+f32 accumulation.
+
+So a training step's arithmetic is now GPU-side in both directions: the forward
+linears at 57x per block, the backward at 37x.  What remains between that and a
+practical loop is the upload, which this version pays per block per step, and
+the head.
 
 Independent and still open: the f32 autograd path's own migration, since
 =nl-llm-ag-block= *refuses* =:head-dim=, =:rope-style= and QK-norm.  That

@@ -90,11 +90,15 @@ base's output exactly -- an invariant rather than an approximation."
       (list y u xs))))
 
 ;;;###autoload
-(defun nl-llm-wlora-backward (lin lora xs u g)
+(defun nl-llm-wlora-backward (lin lora xs u g &optional wt-fn)
   "Gradients of LIN+LORA at XS (from `nl-llm-wlora-forward') for output grad G.
 Returns a plist (:da :db :dx), each a flat float vector: :da is RANK x COLS,
 :db is ROWS x RANK, :dx is COLS long and includes the frozen base's
-contribution W^T.G, which is what makes anything upstream trainable."
+contribution W^T.G, which is what makes anything upstream trainable.
+
+WT-FN, when given, computes that W^T.G instead of `nl-llm-weights-apply-t' --
+which is how the same backward runs on the GPU without this file knowing there
+is one.  It is called with (LIN G) and must return a COLS-long vector."
   (let* ((rows (nl-llm-weights-lin-rows lin))
          (cols (nl-llm-weights-lin-cols lin))
          (rank (plist-get lora :rank))
@@ -121,7 +125,7 @@ contribution W^T.G, which is what makes anything upstream trainable."
             (dotimes (i cols)
               (aset da (+ (* r cols) i) (* dr (aref xs i)))))))
       ;; dL/dx = W^T.g + A^T.(dL/du)
-      (let ((dx (nl-llm-weights-apply-t lin g))
+      (let ((dx (if wt-fn (funcall wt-fn lin g) (nl-llm-weights-apply-t lin g)))
             (dxa (nl-llm-wlora--matvec-t a rank cols du)))
         (dotimes (i cols) (aset dx i (+ (aref dx i) (aref dxa i))))
         (list :da da :db db :dx dx)))))

@@ -153,6 +153,9 @@ comparison to go with it."
 ;; oracle already agrees with.
 
 (require 'nl-llm-weights-forward)
+;; nl-llm-wf-layer-lin and nl-llm-wb-transpose-fn live here; the backward is
+;; what this file routes, so requiring it is honest about the dependency.
+(require 'nl-llm-weights-backward)
 
 (cl-defstruct (nl-llm-wgpu-layer (:constructor nl-llm-wgpu-layer--make))
   lins       ; plist ROLE -> nl-llm-weights-lin
@@ -311,6 +314,56 @@ costs."
               (aset out (+ (* i dim) t0)
                     (+ (aref x1 (+ (* i dim) t0)) (aref d t0))))))
         out))))
+
+;;; --- routing the backward's transposes to the GPU ------------------------
+
+(defvar nl-llm-wgpu--transposes nil
+  "An eq hash of `nl-llm-weights-lin' -> resident handle, or nil.
+Consulted by `nl-llm-wgpu-transpose', which stands in for the CPU loop while
+`nl-llm-wgpu-with-transposes' is in scope.")
+
+;;;###autoload
+(defun nl-llm-wgpu-upload-transposes (layers)
+  "Upload LAYERS' seven matrices each and return an eq hash LIN -> handle.
+LAYERS are `nl-llm-wf-layer' structs -- the CPU ones the backward actually
+holds.  Uploading *those* objects rather than a separately loaded copy is what
+makes the hash lookup work: two loads of the same tensor are equal in content
+and not `eq', and a lookup that missed would silently fall back to the CPU and
+look merely slow."
+  (let ((tbl (make-hash-table :test 'eq)))
+    (dolist (lay layers)
+      (dolist (role nl-llm-wgpu-roles)
+        (let ((lin (nl-llm-wf-layer-lin lay role)))
+          (puthash lin (nl-llm-wgpu-upload lin) tbl))))
+    tbl))
+
+;;;###autoload
+(defun nl-llm-wgpu-free-transposes (tbl)
+  "Free every resident handle in TBL."
+  (maphash (lambda (_lin h) (nelisp-gpu-server-free h)) tbl))
+
+;;;###autoload
+(defun nl-llm-wgpu-transpose (lin g)
+  "Return W^T.G for LIN on the GPU when it is resident, else on the CPU."
+  (let ((h (and nl-llm-wgpu--transposes (gethash lin nl-llm-wgpu--transposes))))
+    (if h (nl-llm-wgpu-apply-t lin h g) (nl-llm-weights-apply-t lin g))))
+
+;;;###autoload
+(defmacro nl-llm-wgpu-with-transposes (table &rest body)
+  "Run BODY with every frozen base's W^T.g routed through TABLE to the GPU.
+TABLE is from `nl-llm-wgpu-upload-transposes'; a linear absent from it falls
+back to the CPU loop, so a partially uploaded model still works and is merely
+slower.
+
+This wires only the *backward*.  The forward stays on the f32 path on purpose:
+`nl-llm-wgpu-block' quantizes activations to int8, which is a different
+computation from the CPU reference, and folding that in here would mean a
+gradient difference could be either the wiring or the quantization.  Separating
+them keeps the comparison against the verified CPU backward direct."
+  (declare (indent 1))
+  `(let ((nl-llm-wgpu--transposes ,table)
+         (nl-llm-wb-transpose-fn #'nl-llm-wgpu-transpose))
+     ,@body))
 
 ;;;###autoload
 (defun nl-llm-wgpu-next-token (wts tokens &optional nlayers progress)
