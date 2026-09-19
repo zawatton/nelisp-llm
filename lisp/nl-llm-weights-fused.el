@@ -163,10 +163,12 @@ quantization those two differ by is measured separately."
            (list 'rmsnorm-heads '(6 19 9) (list (* seq kv-heads) 1 hd)
                  (funcall g64 (* seq kv-heads)))
            (list 'rope-half '(8 10) (list seq heads hd
-                                          (nelisp-gpu--f32-bits (float rbase)))
+                                          (nelisp-gpu--f32-bits (float rbase))
+                                          (nelisp-gpu--f32-bits 1.0))
                  (funcall g64 (* seq heads (/ hd 2))))
            (list 'rope-half '(9 11) (list seq kv-heads hd
-                                          (nelisp-gpu--f32-bits (float rbase)))
+                                          (nelisp-gpu--f32-bits (float rbase))
+                                          (nelisp-gpu--f32-bits 1.0))
                  (funcall g64 (* seq kv-heads (/ hd 2))))
            ;; causal GQA, then the output projection and the residual
            (list 'attn-causal-gqa '(10 11 7 12) (list seq heads kv-heads hd)

@@ -396,7 +396,8 @@
                                                           (cons 'out tn))
                                                     (list tseq tnh thd
                                                           (nelisp-gpu--f32-bits
-                                                           (float trb)))
+                                                           (float trb))
+                                                          (nelisp-gpu--f32-bits 1.0))
                                                     (/ (+ (* tseq tnh (/ thd 2)) 63)
                                                        64))))
                                          (sc (wg--amax cpu)))
@@ -458,7 +459,8 @@
                                             'rope-half
                                             (list (cons 'in gx) (cons 'out gn))
                                             (list gseq gnh ghd
-                                                  (nelisp-gpu--f32-bits (float grb)))
+                                                  (nelisp-gpu--f32-bits (float grb))
+                                                  (nelisp-gpu--f32-bits 1.0))
                                             (/ (+ (* gseq gnh (/ ghd 2)) 63) 64))))
                                  (sc (wg--amax cpu)))
                             (wg--ck "half-split RoPE on the GPU"
@@ -933,6 +935,83 @@ CPU %.0fs" (car (nl-llm-wf-argmax gl)) (wg--rel gl f32 sc) csec))
                                                     (format "%.1f vs %.1f (rel %.2e)"
                                                             lhs rhs rel))))))))))
                           (nelisp-gpu-server-free hh)))
+
+                      ;; --- the last two vjps -----------------------------
+                      ;;
+                      ;; QK-norm's gradient is `rmsnorm-dx' with each head
+                      ;; taken as a row, which is what the CPU version does by
+                      ;; calling the row vjp per head.  The rotation's is the
+                      ;; same kernel with the sine negated.
+                      ;;
+                      ;; The rotation gets two extra assertions because a sign
+                      ;; error there still returns numbers of the right size:
+                      ;; rotating and rotating back must be the identity, and
+                      ;; the rotation must actually move something -- without
+                      ;; the second, a kernel that did nothing would satisfy
+                      ;; the first.
+                      (let* ((vseq 6) (vnh (plist-get cfg :heads))
+                             (vhd (plist-get cfg :head-dim))
+                             (vrb (plist-get cfg :rope-base))
+                             (vn (* vseq vnh vhd))
+                             (vx (make-vector vn 0.0)) (vdy (make-vector vn 0.0))
+                             (vg (make-vector vhd 0.0)))
+                        (dotimes (i vn)
+                          (aset vx i (* 0.05 (- (mod (* (1+ i) 7919) 101) 50)))
+                          (aset vdy i (* 0.02 (- (mod (* (1+ i) 6151) 101) 50))))
+                        (dotimes (i vhd) (aset vg i (+ 0.8 (* 0.004 (mod i 51)))))
+                        (let ((cpu (copy-sequence vdy)))
+                          (dotimes (p vseq)
+                            (nl-llm-wb-rmsnorm-heads-vjp vx (* p vnh vhd) vnh vhd
+                                                         vg cpu 1.0e-6))
+                          (let ((gpu (car (nelisp-gpu-server-batch
+                                           (list (cons 'in vdy) (cons 'in vx)
+                                                 (cons 'tmp (* vseq vnh))
+                                                 (cons 'in vg) (cons 'out vn))
+                                           (list (list 'rmsnorm-istd '(1 2)
+                                                       (list (* vseq vnh) vhd)
+                                                       (/ (+ (* vseq vnh) 63) 64))
+                                                 (list 'rmsnorm-dx '(0 1 2 3 4)
+                                                       (list (* vseq vnh) vhd)
+                                                       (/ (+ (* vseq vnh) 63) 64)))))))
+                            (wg--ck "QK-norm vjp on the GPU"
+                                    (< (wg--rel gpu cpu (wg--amax cpu)) 1.0e-4)
+                                    (format "rel %.3e"
+                                            (wg--rel gpu cpu (wg--amax cpu))))))
+                        (let ((cpu (copy-sequence vdy))
+                              (rb (nelisp-gpu--f32-bits (float vrb)))
+                              (grp (/ (+ (* vseq vnh (/ vhd 2)) 63) 64)))
+                          (dotimes (p vseq)
+                            (nl-llm-wb-rope-vjp cpu (* p vnh vhd) vnh vhd p vrb 'half))
+                          (let ((gpu (car (nelisp-gpu-server-run2
+                                           'rope-half
+                                           (list (cons 'in vdy) (cons 'out vn))
+                                           (list vseq vnh vhd rb
+                                                 (nelisp-gpu--f32-bits -1.0))
+                                           grp))))
+                            (wg--ck "half-split RoPE vjp on the GPU"
+                                    (< (wg--rel gpu cpu (wg--amax cpu)) 1.0e-4)
+                                    (format "rel %.3e"
+                                            (wg--rel gpu cpu (wg--amax cpu)))))
+                          (let* ((fwd (car (nelisp-gpu-server-run2
+                                            'rope-half
+                                            (list (cons 'in vx) (cons 'out vn))
+                                            (list vseq vnh vhd rb
+                                                  (nelisp-gpu--f32-bits 1.0))
+                                            grp)))
+                                 (back (car (nelisp-gpu-server-run2
+                                             'rope-half
+                                             (list (cons 'in fwd) (cons 'out vn))
+                                             (list vseq vnh vhd rb
+                                                   (nelisp-gpu--f32-bits -1.0))
+                                             grp))))
+                            (wg--ck "rotating and rotating back is the identity"
+                                    (< (wg--rel back vx (wg--amax vx)) 1.0e-5)
+                                    (format "rel %.3e"
+                                            (wg--rel back vx (wg--amax vx))))
+                            (wg--ck "control: the rotation moved something"
+                                    (> (wg--rel fwd vx (wg--amax vx)) 0.1)
+                                    (format "rel %.3e forward against its input"
+                                            (wg--rel fwd vx (wg--amax vx)))))))
 
                       ;; --- the decomposed attention, and its vjps ----------
                       ;;
