@@ -5,3 +5,6 @@
 /test/fixtures/qwen-tokenizer.eld
 /test/fixtures/qwen-tokenizer-bulk.eld
 /test/fixtures/qwen-tokenizer-cats.eld
+# Tool and benchmark scratch directories.
+/.serena/
+/.recurrent-inference-bench-*/
