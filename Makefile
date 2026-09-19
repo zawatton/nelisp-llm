@@ -8,6 +8,7 @@ NELISP ?= ../nelisp/target/nelisp
 test:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/qwen-tokenizer-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/head-dim-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/weights-header-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/arch-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/attn-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/moe-test.el
@@ -364,6 +365,7 @@ clean:
 
 # --- Doc 08: weight import (docs/design/08-weight-import.org) -------------
 .PHONY: qwen-tokenizer-table test-qwen-tokenizer ollama-provider test-head-dim
+.PHONY: qwen-weights-table verify-qwen-weights test-weights-header
 
 # DONOR is a HuggingFace model directory holding config.json + tokenizer.json.
 # Everything under build/donor/ is donor-derived and gitignored.
@@ -398,3 +400,23 @@ ollama-provider:
 # Attention with a head width decoupled from dim/heads, as Qwen3 has.
 test-head-dim:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/head-dim-test.el
+
+# Fetch the donor weights and convert them to the int8 table.  ~1.5 GiB of
+# safetensors in, ~571 MiB of table out; both live under the gitignored
+# build/donor/.  Needs `make qwen-tokenizer-table' first for config.json and
+# the numpy/tokenizers install.
+qwen-weights-table:
+	mkdir -p $(DONOR) $(PYLIBS)
+	cd $(DONOR) && curl -sfL -O $(DONOR_URL)/model.safetensors
+	python3 -m pip install -q --disable-pip-version-check --target $(PYLIBS) numpy
+	PYTHONPATH=$(PYLIBS) python3 tools/qwen-weights-export.py $(DONOR) $(DONOR)/weights.bin
+
+# Check the table against the donor: bit-exact packing, per-tensor
+# dequantization error, and header/payload agreement.  Calibrated by corrupting
+# a payload byte and a scale; both trip it.
+verify-qwen-weights:
+	PYTHONPATH=$(PYLIBS) python3 tools/qwen-weights-verify.py $(DONOR) $(DONOR)/weights.bin
+
+# The Elisp side: the header is one sexp and must `read' without a parser.
+test-weights-header:
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/weights-header-test.el

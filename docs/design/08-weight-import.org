@@ -1,9 +1,9 @@
 #+TITLE: Weight import -- run an open-weight Qwen model natively, without training it
 #+OPTIONS: toc:2 num:t
-#+STATUS: P0-P1-P2a SHIPPED
+#+STATUS: P0-P1-P2a-P2b SHIPPED
 
 * Status
-Phases 0, 1 and 2a SHIPPED; Phases 2b-3 are designed, not implemented.
+Phases 0, 1, 2a and 2b SHIPPED; Phases 2c-3 are designed, not implemented.
 
 *Phase 0* (a locally served donor as teacher and as an immediately usable
 model): =examples/ollama-provider.el= + =make ollama-provider=.  No change was
@@ -128,6 +128,62 @@ Pre-existing and untouched: =nl-llm-stream.el=, =nl-llm-integrated.el= and
 =nl-llm-gpu-decode.el= already fail =byte-compile-error-on-warn= (two
 over-long docstrings and one unused argument).  Confirmed identical at the
 parent commit before blaming the refactor.
+
+*Phase 2b* (offline converter) SHIPPED -- =tools/qwen-weights-export.py= +
+=tools/qwen-weights-verify.py= + =test/weights-header-test.el=
+(=make qwen-weights-table=, =make verify-qwen-weights=, =make
+test-weights-header=).  Qwen3-0.6B's 1434 MiB of bf16 becomes a 571 MiB
+=nl-llm-wts-v1= table: 310 tensors, 596.0M parameters, 568 MiB of int8 payload
+and 0.25 MiB of f32, with a 64 KiB header.
+
+| measurement                                   | result                |
+|-----------------------------------------------+-----------------------|
+| packing round trip, every int8 tensor         | bit-exact             |
+| padding lanes nonzero                         | 0 of 197 tensors      |
+| worst per-tensor relative dequantization error | 0.0039 (0.39%)        |
+| donor tensors mapped                          | 311 of 311            |
+| header readable by Emacs =read=               | yes, 15/15 checks     |
+| conversion wall time                          | ~6s                   |
+
+Quantization is per-output-row int8, not per-tensor: one scale is set by the
+largest row and wastes most of the range on every other one.  RMSNorm gains and
+the Qwen3 =q_norm= / =k_norm= vectors stay f32 -- a few thousand floats in total,
+and the tensors quantization error hurts most.  The 568 MiB of weights leaves
+the 6 GB card most of its memory for the KV cache, so the Doc-01 ternary path is
+not needed for this size and should not be used (it assumes QAT).
+
+The header is *one Lisp sexp*, not JSON, so the Phase 2c loader needs no parser
+and does not depend on the JSON differences between Emacs and NeLisp.
+=test/weights-header-test.el= pins that: =read= accepts it, the config values
+round-trip as integers and floats matching =config.json=, every declared tensor
+extent lies inside the file, int8 byte counts match rows x words x 4, and every
+role the model plist needs is present.
+
+Three things the donor turned out to disagree with the design about:
+
+- *=lm_head.weight= is present despite =tie_word_embeddings: true=*, and is
+  bitwise identical to =model.embed_tokens.weight=.  Storing both would cost
+  155 MiB of int8 payload for a duplicate.  The converter drops it -- but only
+  after proving equality; a donor whose head actually differs under that flag
+  errors out and says the config is not the whole story.
+- *The DP4A kernel is closer to per-channel scaling than assumed.*
+  =bitlinear-dp4a-1f= reads =(aref BETA 0)=, a single scalar weight scale, so
+  per-row scales looked like a kernel redesign.  It is not: =o=, the output row,
+  is already in scope on that line, so Phase 2d changes =0= to =o= and uploads a
+  BETA vector of length =out= instead of length 1.
+- *=head_dim= 128 with =dim= 1024 and 16 heads is exactly what Phase 2a made
+  representable*, confirmed by the real tensors: =q_proj= is [2048, 1024],
+  =o_proj= is [1024, 2048], =k_proj= / =v_proj= are [1024, 1024] = 8 x 128.  The
+  header carries =:head-dim= and the suite asserts it differs from
+  =(/ dim heads)=, so a loader cannot quietly fall back.
+
+Both verifiers are calibrated.  =qwen-weights-verify.py= was run against a table
+with one payload byte flipped (relative error 0.35, red) and one scale
+overwritten (398520, red), returning to OK after restore; it also parses the
+header through cruder string handling than the writer used, so a malformed sexp
+fails there as well as in Emacs.  =test/weights-header-test.el= was run against
+a header whose =:nbytes= had been inflated past the end of the file (red).  Both
+skip cleanly when the donor table is absent, so a fresh clone is not red.
 
 Head-dimension finding that resizes Phase 2: Qwen3-0.6B's =config.json= has
 =hidden_size= 1024, =num_attention_heads= 16 and =head_dim= 128, so
@@ -267,18 +323,21 @@ Pruning is a row deletion on =wte= plus an id remap in the tokenizer, and it is
 only safe once parity is proven on the unpruned table.
 
 ** Phase 2 -- import and run (the actual "no training" payoff)
-Offline converter first, self-hosted reader second:
+Shape first, then the offline converter, then the self-hosted reader:
 
-- *2a.* A one-shot offline converter (Python) reads the donor safetensors,
+- *2a.* SHIPPED.  Make the decoupled head width representable, so a Qwen-shaped
+  model can exist at all before any weight is read.  See Status.
+- *2b.* SHIPPED.  A one-shot offline converter (Python) reads the donor safetensors,
   applies per-output-row int8 quantization, and writes =nl-llm-weights-v2=.
   Python here is an offline tool, not runtime -- the NeLisp runtime stays pure
   Elisp.  Building it first gets working numerics in days instead of weeks.
-- *2b.* A pure-Elisp loader for =nl-llm-weights-v2= that uploads straight to
+- *2c.* A pure-Elisp loader for =nl-llm-weights-v2= that uploads straight to
   resident GPU buffers via =OP_WRITE_RESIDENT=, never materializing a
   full-precision float vector on the Elisp side.
-- *2c.* Route the imported linears through =bitlinear-dp4a-1f= and reuse the
-  resident decode from =nl-llm-gpu-decode.el=.
-- *2d.* Port the converter's reader to Elisp once 2a-2c agree numerically; the
+- *2d.* Route the imported linears through =bitlinear-dp4a-1f=, reuse the
+  resident decode from =nl-llm-gpu-decode.el=, and migrate that path to
+  =:head-dim= (it currently refuses the key rather than deriving a wrong width).
+- *2e.* Port the converter's reader to Elisp once 2b-2d agree numerically; the
   Python version then survives as the parity oracle, not as a dependency.
 
 Weight-name mapping (=model.layers.N.self_attn.q_proj.weight= -> =:wq=, and so
@@ -339,8 +398,9 @@ Ordered so that each check can only pass for the right reason:
 
 * Cost / risk
 - Effort: Phase 0 trivial.  Phase 1 medium (the pre-tokenizer regex is fiddly in
-  Emacs regexp syntax and may need a hand-rolled splitter).  Phase 2 medium-high,
-  dominated by the decoupled =head_dim= refactor rather than by the loader.
+  Emacs regexp syntax and needed a hand-rolled splitter).  Phase 2a came in
+  smaller than estimated; the remaining weight of Phase 2 is the loader and the
+  DP4A routing, not the shapes.
   Phase 3 low, the machinery exists.
 - Risk: the tokenizer failure mode is silent.  Mitigation is check 1 with its
   negative control, run before any weight is converted.
