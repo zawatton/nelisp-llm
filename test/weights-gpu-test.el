@@ -299,6 +299,66 @@
                                           "identical to the CPU backward")))
                             (nl-llm-wgpu-free-transposes tbl))))
 
+                      ;; --- a tape that lives on the device -----------------
+                      ;;
+                      ;; A `tmp' slot lives for one batch.  A tape does not:
+                      ;; the forward writes it and the backward reads it in a
+                      ;; later call.  So the fused design rests on a kernel
+                      ;; being able to write into a *resident* buffer and have
+                      ;; it survive, which is cheap to establish and expensive
+                      ;; to assume.
+                      ;;
+                      ;; The control is the load-bearing half.  If the write
+                      ;; had not survived, the second dispatch would have
+                      ;; rotated a buffer of zeros and returned zeros -- which
+                      ;; disagrees with the CPU, so the first check would fail,
+                      ;; but for a reason it does not name.  Asserting the
+                      ;; output is not zero says which of the two happened.
+                      (let* ((tseq 6) (tnh (plist-get cfg :heads))
+                             (thd (plist-get cfg :head-dim))
+                             (trb (plist-get cfg :rope-base))
+                             (tn (* tseq tnh thd))
+                             (tx (make-vector tn 0.0))
+                             (tg (make-vector thd 0.0)))
+                        (dotimes (i tn)
+                          (aset tx i (* 0.05 (- (mod (* (1+ i) 7919) 101) 50))))
+                        (dotimes (i thd) (aset tg i (+ 0.8 (* 0.004 (mod i 51)))))
+                        (let ((cpu (copy-sequence tx)))
+                          (dotimes (p tseq)
+                            (nl-llm--rmsnorm-heads cpu (* p tnh thd) tnh thd
+                                                   (photon-tensor (list thd) tg)
+                                                   1.0e-6))
+                          (dotimes (p tseq)
+                            (nl-llm--rope-heads cpu (* p tnh thd) tnh thd p trb 'half))
+                          (let ((tape (nelisp-gpu-server-upload-bytes
+                                       (make-string (* 4 tn) 0))))
+                            (unwind-protect
+                                (progn
+                                  (nelisp-gpu-server-run2
+                                   'rmsnorm-heads
+                                   (list (cons 'in tx) (cons 'in tg)
+                                         (list 'res tape tn))
+                                   (list tseq tnh thd)
+                                   (/ (+ (* tseq tnh) 63) 64))
+                                  (let* ((out (car (nelisp-gpu-server-run2
+                                                    'rope-half
+                                                    (list (list 'res tape tn)
+                                                          (cons 'out tn))
+                                                    (list tseq tnh thd
+                                                          (nelisp-gpu--f32-bits
+                                                           (float trb)))
+                                                    (/ (+ (* tseq tnh (/ thd 2)) 63)
+                                                       64))))
+                                         (sc (wg--amax cpu)))
+                                    (wg--ck "a kernel's write to a resident buffer survives"
+                                            (< (wg--rel out cpu sc) 1.0e-5)
+                                            (format "rel %.3e across two dispatches"
+                                                    (wg--rel out cpu sc)))
+                                    (wg--ck "control: the second pass is not reading zeros"
+                                            (> (wg--amax out) 1.0e-3)
+                                            (format "amax %.4f" (wg--amax out)))))
+                              (nelisp-gpu-server-free tape)))))
+
                       ;; --- the two glue kernels a fused block still needed --
                       ;;
                       ;; QK-norm and the rotation were the pieces missing from
