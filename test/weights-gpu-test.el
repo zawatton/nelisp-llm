@@ -299,6 +299,63 @@
                                           "identical to the CPU backward")))
                             (nl-llm-wgpu-free-transposes tbl))))
 
+                      ;; --- causal attention on the GPU, and why it is not
+                      ;; --- wired in -------------------------------------
+                      ;;
+                      ;; Attention is the one part of a block that is
+                      ;; quadratic in the sequence, and in Elisp that is the
+                      ;; wall: measured on these shapes it is 6.6s a step at
+                      ;; seq 6 across 28 layers and 311s at seq 48.  So
+                      ;; `attn-causal-gqa' exists and agrees with the CPU.
+                      ;;
+                      ;; It is still not used, and the reason is worth a check
+                      ;; rather than a comment.  Calling it means marshalling
+                      ;; q, k and v across the Elisp boundary, and that costs
+                      ;; about 3 microseconds a float out and 1.2 back --
+                      ;; 0.71s of the 1.06s a seq-48 call takes, whatever the
+                      ;; kernel does.  The fix is not a faster kernel but
+                      ;; keeping q, k and v on the device between the
+                      ;; projections and the attention, which is a different
+                      ;; shape of change.
+                      (let* ((heads (plist-get cfg :heads))
+                             (kv-heads (plist-get cfg :kv-heads))
+                             (hd (plist-get cfg :head-dim))
+                             (aseq 24)
+                             (qd (* heads hd)) (kvd (* kv-heads hd))
+                             (qq (make-vector (* aseq qd) 0.0))
+                             (kk (make-vector (* aseq kvd) 0.0))
+                             (vv (make-vector (* aseq kvd) 0.0)))
+                        (dotimes (i (* aseq qd))
+                          (aset qq i (* 0.05 (- (mod (* (1+ i) 7919) 101) 50))))
+                        (dotimes (i (* aseq kvd))
+                          (aset kk i (* 0.05 (- (mod (* (1+ i) 5387) 101) 50)))
+                          (aset vv i (* 0.05 (- (mod (* (1+ i) 3319) 101) 50))))
+                        (let* ((t0 (float-time))
+                               (ccpu (nl-llm-wf--attend qq kk vv aseq heads kv-heads hd))
+                               (t1 (float-time))
+                               (cgpu (car (nelisp-gpu-server-run2
+                                           'attn-causal-gqa
+                                           (list (cons 'in qq) (cons 'in kk)
+                                                 (cons 'in vv)
+                                                 (cons 'out (* aseq qd)))
+                                           (list aseq heads kv-heads hd)
+                                           (/ (+ (* heads aseq) 63) 64))))
+                               (t2 (float-time))
+                               (t3 (float-time))
+                               (_ (nelisp-gpu--floats-bytes (list qq kk vv)))
+                               (enc (- (float-time) t3))
+                               (sc (wg--amax ccpu))
+                               (rel (wg--rel cgpu ccpu sc)))
+                          (wg--ck "causal GQA attention matches the CPU"
+                                  (< rel 1.0e-5)
+                                  (format "rel %.3e, seq %d" rel aseq))
+                          ;; The claim that the boundary dominates, as a
+                          ;; number: if this ever stops holding, the kernel
+                          ;; becomes worth wiring in.
+                          (wg--ck "and its cost is the boundary, not the kernel"
+                                  (> enc (* 0.3 (- t2 t1)))
+                                  (format "encoding q,k,v %.3fs of a %.3fs call (CPU %.3fs)" enc (- t2 t1) (- t1 t0)))))
+
                       ;; --- the block backward, batched and not -------------
                       ;;
                       ;; The same check as for the forward, and it matters more
