@@ -1,9 +1,11 @@
 #+TITLE: Weight import -- run an open-weight Qwen model natively, without training it
 #+OPTIONS: toc:2 num:t
-#+STATUS: P0-P2b SHIPPED, P2c reader done
+#+STATUS: P0-P2c SHIPPED (CPU); 2d GPU pending
 
 * Status
-Phases 0, 1, 2a and 2b SHIPPED, 2c partly; 2d-3 are designed, not implemented.
+Phases 0, 1, 2a, 2b and 2c SHIPPED on the CPU -- an imported Qwen3-0.6B runs
+and matches a reference to 2e-15.  Phase 2d (the GPU path) and Phase 3 are
+designed, not implemented.
 
 *Phase 0* (a locally served donor as teacher and as an immediately usable
 model): =examples/ollama-provider.el= + =make ollama-provider=.  No change was
@@ -236,6 +238,40 @@ is a directory of Notes rather than a repository of its own, and Notes currently
 carries unrelated uncommitted work.  So it is deliberately a separate change
 with its own commit scope, not smuggled in here.
 
+*The imported model runs.*  =lisp/nl-llm-weights-forward.el= +
+=tools/qwen-forward-ref.py= + =tools/nlwts.py= + =test/weights-forward-test.el=
+(7/7, =make test-weights-forward=).  Pure Elisp, straight off the int8 table,
+compared against a numpy reference *layer by layer*:
+
+| state           | relative error vs reference |
+|-----------------+-----------------------------|
+| embedding       | 0.00e+00                    |
+| after layer 0   | 1.99e-15                    |
+| after layer 1   | 2.03e-15                    |
+
+That is float64 round-off -- summation order, nothing else.  The reference reads
+the *same* int8 table and dequantizes it the same way, so a difference cannot be
+blamed on quantization; it isolates the arithmetic.  Logits at the last position
+come out sensible too (token 14990 "hello" scores 6.43, token 100 scores -3.88),
+with only the requested head rows read, since scoring all 151936 would cost more
+than the rest of the forward.
+
+Layer by layer rather than on the logits, because the logits only say "wrong".
+The calibration shows why that matters: running the same forward with the
+*interleaved* rotation instead of half-split leaves the embedding exact and
+turns layer 0 red at relative 2.5e-1, naming the layer where the convention is
+wrong.  Perturbing one reference value instead reddens the embedding.  Both
+controls were run and both trip; the suite skips when the donor table is absent.
+
+Cost: about 6.5 s per layer per token, so roughly three minutes per token for
+all 28 layers.  That is deliberate.  Weights stay int8 and are accumulated lane
+by lane in the same order the DP4A kernel uses, one tensor is read per linear
+per layer (7 reads instead of 12288 row fetches, ~12 MB resident per layer), and
+the attention loop is written out rather than routed through =nl-llm-gqa=, which
+wants photon-tensors this model cannot afford.  That duplication is the risk, so
+the suite also pins the loop against the definition on a synthetic case small
+enough for both -- a check that needs no donor and runs in milliseconds.
+
 *Two more silent convention mismatches*, found while building toward a
 reference forward and fixed in =lisp/nl-llm-attn.el= with
 =test/rope-style-test.el= (10/10, =make test-rope-style=):
@@ -408,7 +444,8 @@ Shape first, then the offline converter, then the self-hosted reader:
   applies per-output-row int8 quantization, and writes =nl-llm-weights-v2=.
   Python here is an offline tool, not runtime -- the NeLisp runtime stays pure
   Elisp.  Building it first gets working numerics in days instead of weeks.
-- *2c.* PARTLY SHIPPED (reader done, upload pending).  A pure-Elisp loader for
+- *2c.* SHIPPED for the CPU (reader + reference forward); the resident-GPU
+  upload is pending on a bytes-in primitive.  A pure-Elisp loader for
   =nl-llm-wts-v1= that uploads straight to
   resident GPU buffers via =OP_WRITE_RESIDENT=, never materializing a
   full-precision float vector on the Elisp side.

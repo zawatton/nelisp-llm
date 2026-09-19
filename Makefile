@@ -369,6 +369,7 @@ clean:
 .PHONY: qwen-tokenizer-table test-qwen-tokenizer ollama-provider test-head-dim
 .PHONY: qwen-weights-table verify-qwen-weights test-weights-header
 .PHONY: qwen-weights-rows test-weights-load test-rope-style
+.PHONY: qwen-forward-ref test-weights-forward
 
 # DONOR is a HuggingFace model directory holding config.json + tokenizer.json.
 # Everything under build/donor/ is donor-derived and gitignored.
@@ -440,3 +441,21 @@ test-weights-load:
 # suite's own reference.
 test-rope-style:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/rope-style-test.el
+
+# The numpy reference forward over the SAME int8 table, as a per-layer fixture.
+# TOKENS and LAYERS override the defaults ("hello world", 2 layers).
+TOKENS ?=
+FWD_LAYERS ?= 2
+qwen-forward-ref:
+	PYTHONPATH=$(PYLIBS) python3 tools/qwen-forward-ref.py $(DONOR)/weights.bin test/fixtures/qwen-forward-ref.eld --layers $(FWD_LAYERS) $(TOKENS)
+
+# Run the imported model forward in pure Elisp and compare layer by layer.
+# ~6.5s per layer per token, the slowest suite here; it is the oracle the GPU
+# path gets checked against.  Calibrated by using the wrong rotation convention
+# (layer 0 red at rel 2.5e-1) and by perturbing one reference value.
+#
+# Deliberately NOT in the `test' aggregate: at two layers it is 26s, and a
+# fixture covering all 28 would be minutes.  Run it when the import or the
+# attention conventions change, which is when it has something to say.
+test-weights-forward:
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/weights-forward-test.el

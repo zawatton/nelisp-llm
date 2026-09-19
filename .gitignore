@@ -9,3 +9,5 @@
 /.serena/
 /.recurrent-inference-bench-*/
 /test/fixtures/qwen-weights-rows.eld
+/test/fixtures/qwen-forward-ref.eld
+__pycache__/

@@ -230,5 +230,65 @@ or `nl-llm-weights-bytes'" (plist-get tn :name)))
     (dotimes (i n) (aset v i (nl-llm-weights--f32 raw (* 4 i))))
     (photon-tensor (copy-sequence shape) v)))
 
+;;; --- linears, applied without dequantizing the weight --------------------
+
+(cl-defstruct (nl-llm-weights-lin (:constructor nl-llm-weights-lin--make))
+  bytes    ; the tensor's packed int8 payload, verbatim
+  scales   ; per-output-row f32 scales
+  rows cols words
+  name)
+
+;;;###autoload
+(defun nl-llm-weights-linear (wts role &optional layer)
+  "Load ROLE at LAYER from WTS as an applicable linear.
+The weight stays int8: one read of the tensor's payload (a few MB for any
+single Qwen3-0.6B matrix) plus its scale row, and no float per weight.  Reading
+the whole tensor once beats fetching rows individually -- 7 reads per layer
+instead of 12288 -- while staying bounded, which is the point of holding bytes
+rather than tensors."
+  (let* ((tn (nl-llm-weights-tensor wts role layer))
+         (shape (plist-get tn :shape)))
+    (unless (equal (plist-get tn :kind) "int8x4")
+      (error "nl-llm-weights-linear: %s is %s, not a quantized matrix"
+             (plist-get tn :name) (plist-get tn :kind)))
+    (nl-llm-weights-lin--make
+     :bytes (nl-llm-weights-bytes wts tn)
+     :scales (nl-llm-weights-scales wts tn)
+     :rows (car shape) :cols (nth 1 shape)
+     :words (plist-get tn :words)
+     :name (plist-get tn :name))))
+
+;;;###autoload
+(defun nl-llm-weights-apply (lin x &optional xbase out)
+  "Return LIN applied to the COLS-long slice of X at XBASE, as a ROWS vector.
+Computes y[o] = scale[o] * sum_i lane[o,i] * x[i], accumulating over the raw
+int8 lanes and scaling once per row -- the same order the DP4A kernel uses, and
+the reason the weight never becomes a float.  OUT, when given, is filled and
+returned."
+  (let* ((b (nl-llm-weights-lin-bytes lin))
+         (scales (nl-llm-weights-lin-scales lin))
+         (rows (nl-llm-weights-lin-rows lin))
+         (cols (nl-llm-weights-lin-cols lin))
+         (stride (* 4 (nl-llm-weights-lin-words lin)))
+         (base (or xbase 0))
+         (y (or out (make-vector rows 0.0)))
+         (o 0))
+    (while (< o rows)
+      (let ((p (* o stride)) (acc 0.0) (i 0))
+        (while (< i cols)
+          (let ((byte (aref b (+ p i))))
+            (setq acc (+ acc (* (if (> byte 127) (- byte 256) byte)
+                                (aref x (+ base i))))))
+          (setq i (1+ i)))
+        (aset y o (* acc (aref scales o))))
+      (setq o (1+ o)))
+    y))
+
+;;;###autoload
+(defun nl-llm-weights-embed (wts token)
+  "Return TOKEN's embedding row from WTS as a float vector of :dim."
+  (let ((tn (nl-llm-weights-tensor wts :wte)))
+    (nl-llm-weights-row wts tn token)))
+
 (provide 'nl-llm-weights)
 ;;; nl-llm-weights.el ends here
