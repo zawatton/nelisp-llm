@@ -11,6 +11,8 @@ test:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/rope-style-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/weights-header-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/weights-load-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/weights-lora-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/distill-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/arch-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/attn-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/moe-test.el
@@ -469,3 +471,26 @@ test-weights-forward:
 # greedy token must equal the CPU oracle's 12095.  That one takes ~4 minutes.
 test-weights-gpu:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/weights-gpu-test.el
+
+# --- Doc 08 Phase 3: adaptation ------------------------------------------
+.PHONY: test-weights-lora test-distill distill
+
+# A trainable LoRA over a frozen int8 base.  The transpose is pinned by the
+# inner-product identity and every gradient against finite differences, since a
+# transposed loop reads like the forward one and a wrong scale still descends.
+# No donor table needed; the weight is quantized in the test.
+test-weights-lora:
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/weights-lora-test.el
+
+# The gates on teacher-generated data.  Teacher is injected, so no model runs.
+test-distill:
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/distill-test.el
+
+# Build a dataset from the local open-weight teacher.  PROMPTS and OUT override
+# the defaults; personal prompts belong in a file outside this repository.
+# Needs `ollama serve' and a pulled model.
+PROMPTS ?= examples/distill-prompts.txt
+OUT ?= build/distilled.eld
+distill:
+	NL_LLM_DISTILL_PROMPTS=$(PROMPTS) NL_LLM_DISTILL_OUT=$(OUT) \
+	  $(EMACS) -Q --batch -L lisp -L $(PHOTON) -l examples/distill-from-teacher.el

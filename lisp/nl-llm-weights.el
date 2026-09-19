@@ -285,6 +285,66 @@ returned."
     y))
 
 ;;;###autoload
+(defun nl-llm-weights-apply-t (lin g &optional out)
+  "Return W^T applied to G, a COLS-long vector, for LIN's (ROWS x COLS) weight.
+Computes x[i] = sum_o lane[o,i] * scale[o] * g[o], which is the gradient with
+respect to a linear's input and therefore the one operation a frozen quantized
+base still has to provide for anything downstream of it to be trainable.  The
+weight stays int8: the row scale folds into the per-row multiplier once, and the
+lanes are accumulated as they are.
+
+Correctness here is not obvious by reading -- a transposed loop looks like the
+forward one -- so `test/weights-lora-test.el' pins it with the inner-product
+identity <W.x, g> = <x, W^T.g>, which no index swap survives."
+  (let* ((b (nl-llm-weights-lin-bytes lin))
+         (scales (nl-llm-weights-lin-scales lin))
+         (rows (nl-llm-weights-lin-rows lin))
+         (cols (nl-llm-weights-lin-cols lin))
+         (stride (* 4 (nl-llm-weights-lin-words lin)))
+         (x (or out (make-vector cols 0.0)))
+         (o 0))
+    (unless (= (length g) rows)
+      (error "nl-llm-weights-apply-t: G is %d long, weight has %d rows"
+             (length g) rows))
+    (dotimes (i cols) (aset x i 0.0))
+    (while (< o rows)
+      (let ((s (* (aref scales o) (aref g o))))
+        (unless (= s 0.0)
+          (let ((p (* o stride)) (i 0))
+            (while (< i cols)
+              (let ((byte (aref b (+ p i))))
+                (aset x i (+ (aref x i)
+                             (* (if (> byte 127) (- byte 256) byte) s))))
+              (setq i (1+ i))))))
+      (setq o (1+ o)))
+    x))
+
+;;;###autoload
+(defun nl-llm-weights-lin-quantize (data rows cols &optional name)
+  "Build an applicable linear from f32 DATA (ROWS x COLS, row-major).
+Quantizes per output row exactly as tools/qwen-weights-export.py does --
+scale = max|row| / 127 -- so a test can construct a small weight whose
+behaviour matches an imported one, and so the exporter's scheme has a second
+implementation to disagree with if either drifts."
+  (let* ((words (/ (+ cols 3) 4))
+         (bytes (make-string (* rows words 4) 0))
+         (scales (make-vector rows 1.0)))
+    (dotimes (o rows)
+      (let ((amax 0.0))
+        (dotimes (i cols)
+          (let ((a (abs (aref data (+ (* o cols) i)))))
+            (when (> a amax) (setq amax a))))
+        (let ((scale (if (> amax 0.0) (/ amax 127.0) 1.0)))
+          (aset scales o scale)
+          (dotimes (i cols)
+            (let ((q (round (/ (aref data (+ (* o cols) i)) scale))))
+              (aset bytes (+ (* o words 4) i)
+                    (logand (max -127 (min 127 q)) 255)))))))
+    (nl-llm-weights-lin--make
+     :bytes bytes :scales scales :rows rows :cols cols :words words
+     :name (or name "synthetic"))))
+
+;;;###autoload
 (defun nl-llm-weights-embed (wts token)
   "Return TOKEN's embedding row from WTS as a float vector of :dim."
   (let ((tn (nl-llm-weights-tensor wts :wte)))

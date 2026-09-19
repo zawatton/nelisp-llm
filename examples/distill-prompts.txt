@@ -1,0 +1,18 @@
+# Prompts for examples/distill-from-teacher.el, one per line; blank lines and
+# lines starting with # are ignored.
+#
+# Deliberately generic.  A personal model is trained on personal prompts, and
+# those belong in a file outside this repository -- pass it as the first
+# argument.  What is shipped here is a shape to copy, not a dataset: short
+# tasks with short, checkable answers, which is what fits the supervised path's
+# budget of 128 examples and 65536 characters in total.
+Give the SI unit of electrical resistance and its symbol.
+State Ohm's law as an equation and name each term.
+In one sentence, what does an RMSNorm layer do?
+Write an Emacs Lisp expression that returns the length of the list (1 2 3).
+Name the file extension Emacs uses for byte-compiled Lisp.
+What does the acronym SPIR-V stand for?
+In one sentence, what is a KV cache used for during decoding?
+Give the result of 17 times 23.
+Name the two matrices a LoRA adapter adds to a linear layer.
+What does int8 quantization trade away in exchange for memory?

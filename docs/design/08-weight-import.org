@@ -1,13 +1,15 @@
 #+TITLE: Weight import -- run an open-weight Qwen model natively, without training it
 #+OPTIONS: toc:2 num:t
-#+STATUS: P0-P2d SHIPPED -- imported Qwen3-0.6B runs on the GPU and predicts the donor's token
+#+STATUS: P0-P2d SHIPPED; P3 started -- data path and trainable adapter both exist
 
 * Status
 Phases 0, 1, 2a, 2b and 2c SHIPPED on the CPU -- an imported Qwen3-0.6B runs,
 matches a reference to 1e-14 through all 28 layers, and predicts the donor's
 next token exactly.  Phase 2d SHIPPED: every linear runs on the GPU, a block 57x
 faster than the Elisp loop, and the whole 28-layer stack predicts the same
-token the CPU oracle does.  Phase 3 is designed, not implemented.
+token the CPU oracle does.  Phase 3 has started: the distillation data path
+works against a live teacher, and a LoRA trains over the frozen int8 base with
+every gradient checked -- what remains is a backward for a whole block.
 
 *Phase 0* (a locally served donor as teacher and as an immediately usable
 model): =examples/ollama-provider.el= + =make ollama-provider=.  No change was
@@ -244,6 +246,68 @@ That addition lands in the *Notes* repository, not this one -- =dev/nelisp-gpu=
 is a directory of Notes rather than a repository of its own, and Notes currently
 carries unrelated uncommitted work.  So it is deliberately a separate change
 with its own commit scope, not smuggled in here.
+
+*Phase 3* (adaptation) STARTED -- the data path and the trainable adapter both
+exist; wiring the adapter into a whole block is what remains.
+
+*Distillation data* -- =lisp/nl-llm-distill.el= + =test/distill-test.el= (14/14,
+=make test-distill=) + =examples/distill-from-teacher.el= (=make distill=).
+Turns a locally served teacher's answers into the vector of (:prompt
+:completion) that =nl-llm-agent-supervised= takes.  The teacher is passed as a
+*function*, not a URL: a donor must be locally-run open weights, outputs from a
+hosted API may not be used to train a model, and the difference is which
+endpoint was called -- something the caller knows and no gate can detect.
+
+The gates are the substance.  Each is a failure seen rather than a precaution:
+=empty= (a reasoning model truncated mid-thought returns "", which Phase 0
+found), =echo= (small instruct models hand the prompt back), =duplicate=,
+=too-long=, =budget=, =over-count=, and =error= for a teacher that signals.
+Every rejection is counted by reason, because a run that accepted 3 of 200
+prompts is a broken teacher and that must be visible without opening the output.
+
+A real run bears this out.  Ten prompts against =qwen3:4b= gave *9 accepted, 1
+rejected (empty 1)* -- the reasoning-truncation gate, built from a Phase 0
+observation, firing on live data.  The dataset then passed its actual consumer:
+=nl-llm-agent-supervised--prepare= accepted 9 examples, 11547 completion tokens,
+loss starting at (57 50 47 58 39 61 31 60 62), i.e. exactly where each prompt
+ends.
+
+*The barrier to training, removed* -- =lisp/nl-llm-weights-lora.el= +
+=test/weights-lora-test.el= (11/11, =make test-weights-lora=).  A frozen
+quantized weight still has to appear in the backward pass, because
+=dL/dx = W^T.g= even when W collects no gradient of its own -- "frozen" means
+untrained, not unused.  =nl-llm-weights-apply-t= supplies that term straight off
+the int8 table, so a dequantized base's 14 GB of boxed floats are avoided in
+both directions.
+
+| check                                     | result                    |
+|-------------------------------------------+---------------------------|
+| <W.x, g> = <x, W^T.g>                     | rel 1.5e-16               |
+| dL/dA vs finite differences               | worst rel 6.5e-08         |
+| dL/dB vs finite differences               | worst rel 4.2e-08         |
+| dL/dx vs finite differences (needs W^T)   | worst rel 5.2e-07         |
+| *control: dL/dx with W^T dropped*         | *wrong by rel 1.59*       |
+| fresh adapter (B = 0) vs base             | bit-identical             |
+| trains                                    | loss 0.0127 -> 0.0000     |
+| base after training                       | bit-identical             |
+
+The transpose gets the inner-product identity rather than a spot check because a
+transposed loop reads almost exactly like the forward one, so reading it proves
+nothing and no index swap survives the identity.  The control is the number that
+makes the case: drop =W^T.g= and =dL/dx= is wrong by 159%, which is what "the
+frozen base participates in the backward" means quantitatively.
+
+One thing the suite got wrong first, worth keeping: the training check initially
+fed inputs around +-39, the loss started at 1.1e7 and plain SGD diverged to NaN
+in sixty steps -- with gradients already verified correct.  That was the test's
+data, not the code, and it is also the honest shape of =nl-llm-wlora-fit=, which
+is unclipped SGD and says so now.  Real adaptation wants the Adam and clipping
+=nl-llm-gpu-ag.el= already has for the f32 path.
+
+Still missing for end-to-end LoRA training: a backward for the whole block (this
+is one linear's worth), and the autograd path's own migration -- =nl-llm-ag-block=
+currently *refuses* =:head-dim=, =:rope-style= and QK-norm, which is the guard
+working correctly and also a prerequisite.
 
 *Phase 2d* (GPU) STARTED -- one imported linear now runs on the GPU.
 =lisp/nl-llm-weights-gpu.el= + =test/weights-gpu-test.el= (7/7,
@@ -556,7 +620,7 @@ is the deployed weight; rounding an already-trained f32/bf16 weight to ternary
 without that training collapses quality.  W8A8 per-channel is the near-lossless
 option and it is the one the existing kernel already implements.
 
-** Phase 3 -- adaptation
+** Phase 3 -- adaptation (STARTED; see Status)
 Freeze the imported base, train a LoRA (rank 8, ~2M parameters) on data
 distilled from the Phase-0 teacher, using the existing completion-only
 supervision in =nl-llm-agent-supervised.el= (prompt stays attention context,
