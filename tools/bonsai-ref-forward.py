@@ -85,11 +85,18 @@ class Rot:
     """
 
     def __init__(self, widths, values, block, invert, blocks=None,
-                 sequency=False):
+                 sequency=False, order=None):
         self.block, self.invert, self.sequency = block, invert, sequency
         self.blocks = blocks or {}
+        # `sign_widths` lists the widths; whether the runs are concatenated in
+        # that order is a separate claim.  The three lengths are distinct, so a
+        # different file order means a different slice for every width -- and
+        # every slice is random +/-1 either way, so nothing about the numbers
+        # says which is which.
+        order = order or list(range(len(widths)))
         self.runs, off = {}, 0
-        for w in widths:
+        for idx in order:
+            w = widths[idx]
             self.runs[w] = np.asarray(values[off:off + w], dtype=np.float32)
             off += w
 
@@ -105,6 +112,12 @@ class Rot:
 def rms(x, gain, eps):
     v = np.mean(x * x, axis=-1, keepdims=True)
     return x * (1.0 / np.sqrt(v + eps)) * gain
+
+
+def rmsn(x, eps):
+    """RMSNorm without the gain, for composing the gain on the other side."""
+    v = np.mean(x * x, axis=-1, keepdims=True)
+    return x * (1.0 / np.sqrt(v + eps))
 
 
 def silu(x):
@@ -137,14 +150,19 @@ class Model:
 
 
 def run(m, ids, invert, gate_first, qkv_order, verbose=False,
-        layers=None, dump=None, mode="act", lens=None, skip=(), score=False, curve=0, blocks=None, no_head_rot=False,
+        layers=None, dump=None, mode="act", lens=None, skip=(), score=False,
+        curve=0, blocks=None, no_head_rot=False,
         gate_first_half=False, kv_tile=False, swap_ab=False,
-        sequency=False):
+        sequency=False, sign_order=None, decay_after_read=False,
+        qscale="pre", gnorm_eps=None, gain_after_rot=False,
+        no_hh_rot=False, no_out_rot=False, conv_reverse=False,
+        head_minor=False, conv_act="all"):
     kv = m.kv
     dim = kv["qwen35.embedding_length"]
     nblk = kv["qwen35.block_count"]
     iv = kv["qwen35.full_attention_interval"]
     eps = float(kv["qwen35.attention.layer_norm_rms_epsilon"])
+    gneps = gnorm_eps if gnorm_eps is not None else eps
     heads = kv["qwen35.attention.head_count"]
     kvh = kv["qwen35.attention.head_count_kv"]
     hdim = kv["qwen35.attention.key_length"]
@@ -158,7 +176,7 @@ def run(m, ids, invert, gate_first, qkv_order, verbose=False,
     grp = nv // nk
     _rot = Rot(kv["prism.hadamard.sign_widths"], kv["prism.hadamard.sign_values"],
                kv["prism.hadamard.block_size"], invert, blocks=blocks,
-               sequency=sequency)
+               sequency=sequency, order=sign_order)
     # Where the transform belongs at run time is not written down anywhere.
     #   act        the residual stream is unrotated and every rotated
     #              projection gets a rotated activation
@@ -259,7 +277,10 @@ def run(m, ids, invert, gate_first, qkv_order, verbose=False,
             att = att / att.sum(axis=-1, keepdims=True)
             ctx = np.einsum("hqk,khd->qhd", att, vv).reshape(seq, heads * hdim)
             g = ctx * silu(gate)
-            x = x + rot(g) @ m.t(p + "attn_output.weight").T
+            # The 6144-wide rotation before the output projection is the one
+            # thing both mixing halves do and the feed-forward never does --
+            # and the feed-forward is the only half that improves with depth.
+            x = x + (g if no_out_rot else rot(g)) @ m.t(p + "attn_output.weight").T
         else:
             plain = rms(x, ln1, eps)
             a = rot(plain)
@@ -277,20 +298,49 @@ def run(m, ids, invert, gate_first, qkv_order, verbose=False,
             pad = np.concatenate([np.zeros((kern - 1, cd), np.float32), mixed], 0)
             conv = np.zeros_like(mixed)
             for r in range(kern):
-                conv += pad[r:r + seq] * cw[:, r]
-            conv = silu(conv)
+                # tap r covers position t + r - kern + 1, so r = kern-1 is the
+                # current position.  A reversed file order puts it at r = 0.
+                w_ = cw[:, kern - 1 - r] if conv_reverse else cw[:, r]
+                conv += pad[r:r + seq] * w_
+            # The activation after the causal conv: on everything, on the
+            # value channels only, or not at all.
+            if conv_act == "all":
+                conv = silu(conv)
+            elif conv_act == "v":
+                conv = np.concatenate([conv[:, :2 * kd], silu(conv[:, 2 * kd:])], 1)
             parts = {"qkv": (conv[:, :kd], conv[:, kd:2 * kd], conv[:, 2 * kd:]),
                      "kqv": (conv[:, kd:2 * kd], conv[:, :kd], conv[:, 2 * kd:]),
                      "vqk": (conv[:, vd:vd + kd], conv[:, vd + kd:], conv[:, :vd])}
             qc, kc, vc = parts[qkv_order]
-            # The 1/sqrt(dk) goes BEFORE the L2 norm, as transformers does it,
-            # where its only effect is through the norm's epsilon.  After the
-            # norm it divides a unit vector by 11.3, which collapses the
-            # recurrence's output to 1e-5 and leaves the gated RMSNorm swamped
-            # by its own eps -- stable, well-formed, and carrying nothing.
-            qh = l2n(qc.reshape(seq, nk, sd) / math.sqrt(sd))
-            kh = l2n(kc.reshape(seq, nk, sd) / math.sqrt(sd))
-            vh = vc.reshape(seq, nv, sd)
+            # Where the 1/sqrt(dk) goes is not a rounding question here.  The
+            # recurrence's output lands near 1e-3, which is the regime where
+            # the gated RMSNorm's own 1e-6 dominates its denominator -- so the
+            # norm stops normalising and the block's contribution becomes
+            # proportional to this scale.  A factor applied in the wrong place
+            # is then a systematic per-block error, which is exactly the shape
+            # of the depth curve.
+            sc = 1.0 / math.sqrt(sd)
+            def split0(a, nh):
+                return (a.reshape(seq, sd, nh).transpose(0, 2, 1) if head_minor
+                        else a.reshape(seq, nh, sd))
+            if qscale == "pre":
+                qh = l2n(split0(qc, nk) * sc)
+                kh = l2n(split0(kc, nk) * sc)
+            elif qscale == "post-q":
+                qh = l2n(split0(qc, nk)) * sc
+                kh = l2n(split0(kc, nk))
+            elif qscale == "post-both":
+                qh = l2n(split0(qc, nk)) * sc
+                kh = l2n(split0(kc, nk)) * sc
+            else:
+                qh = l2n(split0(qc, nk))
+                kh = l2n(split0(kc, nk))
+            # Whether a projection's output runs [head][dim] or [dim][head]
+            # is a reshape either way and a different model.
+            def split(a, nh):
+                return (a.reshape(seq, sd, nh).transpose(0, 2, 1) if head_minor
+                        else a.reshape(seq, nh, sd))
+            vh = split(vc, nv)
             alog = m.t(p + "ssm_a")
             dtb = m.t(p + "ssm_dt.bias")
             gt = np.exp(-np.exp(alog) * np.log1p(np.exp(al + dtb)))
@@ -305,23 +355,38 @@ def run(m, ids, invert, gate_first, qkv_order, verbose=False,
             for t_ in range(seq):
                 qt = qh[t_][qg]
                 kt = kh[t_][qg]
-                S = S * gt[t_][:, None, None]
-                kv_ = np.einsum("hij,hi->hj", S, kt)
-                d = (vh[t_] - kv_) * bt[t_][:, None]
-                S = S + kt[:, :, None] * d[:, None, :]
+                # S_t = a_t S_{t-1} (I - b_t k k') + b_t v k' expands to a read
+                # of the DECAYED state: a_t S_{t-1}' k.  Some implementations
+                # read the undecayed one instead, which is a different
+                # recurrence and differs at every position.
+                if decay_after_read:
+                    kv_ = np.einsum("hij,hi->hj", S, kt)
+                    d = (vh[t_] - kv_) * bt[t_][:, None]
+                    S = S * gt[t_][:, None, None] + kt[:, :, None] * d[:, None, :]
+                else:
+                    S = S * gt[t_][:, None, None]
+                    kv_ = np.einsum("hij,hi->hj", S, kt)
+                    d = (vh[t_] - kv_) * bt[t_][:, None]
+                    S = S + kt[:, :, None] * d[:, None, :]
                 out[t_] = np.einsum("hij,hi->hj", S, qt)
             sn = m.t(p + "ssm_norm.weight")
-            zz = z.reshape(seq, nv, sd)
+            zz = split(z, nv)
             if gate_first:
-                g = rms(out * silu(zz), sn, eps)
+                g = rms(out * silu(zz), sn, gneps)
             else:
-                g = rms(out, sn, eps) * silu(zz)
-            x = x + rot(g.reshape(seq, vd)) @ m.t(p + "ssm_out.weight").T
+                g = rms(out, sn, gneps) * silu(zz)
+            gv = g.reshape(seq, vd)
+            x = x + (gv if no_out_rot else rot(gv)) @ m.t(p + "ssm_out.weight").T
         if "ffn" not in skip:
-            b = rot(rms(x, ln2, eps))
+            # A rotation and a per-element gain do not commute, so whether the
+            # gain belongs inside the rotation or outside it is a real choice
+            # and it is made in every norm of every block.
+            b = (rot(rmsn(x, eps)) * ln2 if gain_after_rot
+                 else rot(rms(x, ln2, eps)))
             gg = b @ m.t(p + "ffn_gate.weight").T
             uu = b @ m.t(p + "ffn_up.weight").T
-            x = x + rot(silu(gg) * uu) @ m.t(p + "ffn_down.weight").T
+            hh_ = silu(gg) * uu
+            x = x + (hh_ if no_hh_rot else rot(hh_)) @ m.t(p + "ffn_down.weight").T
         if lens is not None:
             look("block %d" % ly)
         if curve and ((ly + 1) % curve == 0 or ly == nblk - 1):
@@ -369,6 +434,23 @@ def main():
     ap.add_argument("--no-head-rot", action="store_true")
     ap.add_argument("--gate-first-half", action="store_true",
                     help="attn_q is [gate | query] rather than [query | gate]")
+    ap.add_argument("--gain-after-rot", action="store_true",
+                    help="rotate the normalised value, then apply the gain")
+    ap.add_argument("--conv-reverse", action="store_true")
+    ap.add_argument("--conv-act", default="all", choices=("all", "v", "none"))
+    ap.add_argument("--head-minor", action="store_true",
+                    help="q/k/v/z run [dim][head] rather than [head][dim]")
+    ap.add_argument("--no-out-rot", action="store_true",
+                    help="feed ssm_out / attn_output the unrotated 6144 value")
+    ap.add_argument("--no-hh-rot", action="store_true",
+                    help="feed ffn_down the unrotated SwiGLU output")
+    ap.add_argument("--decay-after-read", action="store_true",
+                    help="read the undecayed state, decay when writing")
+    ap.add_argument("--sign-order", default="",
+                    help="file order of the sign runs, e.g. 2,1,0")
+    ap.add_argument("--qscale", default="pre",
+                    choices=("pre", "post-q", "post-both", "none"))
+    ap.add_argument("--gnorm-eps", type=float, default=None)
     ap.add_argument("--sequency", action="store_true",
                     help="Walsh (sequency) row order instead of Sylvester")
     ap.add_argument("--swap-ab", action="store_true",
@@ -414,7 +496,14 @@ def main():
                  blocks=({6144: args.block6144} if args.block6144 else None),
                  no_head_rot=args.no_head_rot,
                  gate_first_half=args.gate_first_half, kv_tile=args.kv_tile,
-                 swap_ab=args.swap_ab, sequency=args.sequency)
+                 swap_ab=args.swap_ab, sequency=args.sequency,
+                 qscale=args.qscale, gnorm_eps=args.gnorm_eps,
+                 sign_order=([int(x) for x in args.sign_order.split(",")]
+                             if args.sign_order else None),
+                 decay_after_read=args.decay_after_read,
+                 gain_after_rot=args.gain_after_rot, no_hh_rot=args.no_hh_rot,
+                 no_out_rot=args.no_out_rot, conv_reverse=args.conv_reverse,
+                 head_minor=args.head_minor, conv_act=args.conv_act)
         if args.score:
             print("  %s  ->  cross entropy %.4f nats  (chance %.2f)"
                   % (label, lg, math.log(len(vocab) if vocab else 248320)),
