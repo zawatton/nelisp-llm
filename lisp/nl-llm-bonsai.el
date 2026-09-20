@@ -47,11 +47,23 @@ does not gate the context, it distorts it.  Measured on 86 tokens of prose:
 9.42 nats with the sigmoid against 12.68 with the SiLU, where chance is 12.42."
   (/ 1.0 (+ 1.0 (exp (- z)))))
 
-(defun nl-llm-bonsai--gain (wts role layer n)
-  "The gain vector for ROLE at LAYER, or ones when it is folded into the weights."
-  (if nl-llm-bonsai-folded-gains
+(defun nl-llm-bonsai--gain (sess role layer n)
+  "The gain for ROLE at LAYER, or ones when the weights already carry it."
+  (if (and nl-llm-bonsai-folded-gains (plist-get sess :folded))
       (make-vector n 1.0)
-    (nl-llm-weights-row wts (nl-llm-weights-tensor wts role layer) 0)))
+    (let ((wts (plist-get sess :wts)))
+      (nl-llm-weights-row wts (nl-llm-weights-tensor wts role layer) 0))))
+
+(defun nl-llm-bonsai--interval (cfg)
+  "Blocks per group; 1 -- every block is full attention -- when unstated."
+  (or (plist-get cfg :full-attention-interval) 1))
+
+(defun nl-llm-bonsai--gated-q-p (lins cfg)
+  "Non-nil when `:wq' carries an output gate beside the query.
+Self-describing: the gated form is twice as wide as HEADS * HEAD-DIM, so the
+tensor says which it is and no header key has to."
+  (> (nl-llm-weights-lin-rows (plist-get lins :wq))
+     (* (plist-get cfg :heads) (plist-get cfg :head-dim))))
 
 (defvar nl-llm-bonsai-apply-fn nil
   "When non-nil, a function (LIN X BASE) applying a linear in place of the CPU.
@@ -73,7 +85,7 @@ structural answer to it."
     (or hit
         (let* ((wts (plist-get sess :wts))
                (cfg (plist-get sess :cfg))
-               (iv (plist-get cfg :full-attention-interval))
+               (iv (nl-llm-bonsai--interval cfg))
                (roles (if (= (mod layer iv) (1- iv))
                           '(:wq :wk :wv :wo :wg :wu :wd)
                         '(:wqkv :wz :walpha :wbeta :wout :wg :wu :wd)))
@@ -110,6 +122,10 @@ difference because both are orthogonal."
       (setq signs (plist-put signs w (nl-llm-had-signs vals widths w))))
     (list :wts wts :cfg cfg :signs signs :invert invert
           :block (or (plist-get cfg :hadamard-block) nl-llm-had-block)
+          :rotate (and widths t)
+          :folded (if (plist-member cfg :folded-gains)
+                      (plist-get cfg :folded-gains)
+                    (and widths t))
           :lins (make-hash-table :test 'eql))))
 
 ;;;###autoload
@@ -117,12 +133,18 @@ difference because both are orthogonal."
   "Apply the model's folded rotation to the N-long X in place.
 BACK pulls a gradient through it instead, which is the inverse transform --
 the rotation is orthogonal, so that is all a pullback is.  The session's
-`:invert' says which of the two orthogonal candidates is the forward one."
-  (let ((s (plist-get (plist-get sess :signs) n))
-        (nl-llm-had-block (or (plist-get sess :block) nl-llm-had-block))
-        (inv (plist-get sess :invert)))
-    (unless s (error "nl-llm-bonsai-rotate: no signs for width %d" n))
-    (nl-llm-had-rotate x n s (if back (not inv) inv))))
+`:invert' says which of the two orthogonal candidates is the forward one.
+
+A model that declares no `:hadamard-widths' has no folded rotation and this
+is the identity, which is what lets the same driver run an ordinary
+transformer."
+  (if (not (plist-get sess :rotate))
+      x
+    (let ((s (plist-get (plist-get sess :signs) n))
+          (nl-llm-had-block (or (plist-get sess :block) nl-llm-had-block))
+          (inv (plist-get sess :invert)))
+      (unless s (error "nl-llm-bonsai-rotate: no signs for width %d" n))
+      (nl-llm-had-rotate x n s (if back (not inv) inv)))))
 
 ;;;###autoload
 (defun nl-llm-bonsai-deltanet-block (sess layer x seq)
@@ -136,9 +158,9 @@ matrix; everything between them is `nl-llm-deltanet.el'."
          (ff (plist-get cfg :ff))
          (eps (or (plist-get cfg :rms-eps) 1.0e-6))
          (kd (* nk hd)) (vd (* nv hd)) (cd (+ kd kd vd))
-         (ln1 (nl-llm-bonsai--gain wts :ln1g layer dim))
-         (ln2 (nl-llm-bonsai--gain wts :ln2g layer dim))
-         (snorm (nl-llm-bonsai--gain wts :ssm-norm layer hd))
+         (ln1 (nl-llm-bonsai--gain sess :ln1g layer dim))
+         (ln2 (nl-llm-bonsai--gain sess :ln2g layer dim))
+         (snorm (nl-llm-bonsai--gain sess :ssm-norm layer hd))
          (alog (nl-llm-weights-row wts (nl-llm-weights-tensor wts :a-log layer) 0))
          (dtb (nl-llm-weights-row wts (nl-llm-weights-tensor wts :dt-bias layer) 0))
 
@@ -270,12 +292,13 @@ rotary does and what rotating the whole head would silently not do."
          (dim (plist-get cfg :dim))
          (heads (plist-get cfg :heads)) (kvh (plist-get cfg :kv-heads))
          (hd (plist-get cfg :head-dim)) (ff (plist-get cfg :ff))
-         (rdims (plist-get cfg :rope-dims))
+         ;; no partial rotary declared means the whole head
+         (rdims (or (plist-get cfg :rope-dims) hd))
          (rbase (plist-get cfg :rope-base))
          (eps (or (plist-get cfg :rms-eps) 1.0e-6))
          (qdim (* heads hd)) (kvdim (* kvh hd))
-         (ln1 (nl-llm-bonsai--gain wts :ln1g layer dim))
-         (ln2 (nl-llm-bonsai--gain wts :ln2g layer dim))
+         (ln1 (nl-llm-bonsai--gain sess :ln1g layer dim))
+         (ln2 (nl-llm-bonsai--gain sess :ln2g layer dim))
          (qn (nl-llm-weights-row wts (nl-llm-weights-tensor wts :q-norm layer) 0))
          (kn (nl-llm-weights-row wts (nl-llm-weights-tensor wts :k-norm layer) 0))
          (lins (nl-llm-bonsai-linears sess layer))
@@ -283,6 +306,7 @@ rotary does and what rotating the whole head would silently not do."
          (wv (plist-get lins :wv)) (wo (plist-get lins :wo))
          (wg (plist-get lins :wg)) (wu (plist-get lins :wu))
          (wd (plist-get lins :wd))
+         (gated (nl-llm-bonsai--gated-q-p lins cfg))
          (q (make-vector (* seq qdim) 0.0)) (k (make-vector (* seq kvdim) 0.0))
          (v (make-vector (* seq kvdim) 0.0)) (gate (make-vector (* seq qdim) 0.0))
          (out (make-vector (* seq dim) 0.0)))
@@ -292,10 +316,12 @@ rotary does and what rotating the whole head would silently not do."
         (let ((yq (nl-llm-bonsai--apply wq a 0))
               (yk (nl-llm-bonsai--apply wk a 0))
               (yv (nl-llm-bonsai--apply wv a 0)))
-          ;; the query projection is [query | gate], each HEADS * HD wide
+          ;; the query projection is [query | gate], each HEADS * HD wide,
+          ;; when the model has an output gate at all
           (dotimes (i qdim)
             (aset q (+ (* tt qdim) i) (aref yq i))
-            (aset gate (+ (* tt qdim) i) (aref yq (+ qdim i))))
+            (when gated
+              (aset gate (+ (* tt qdim) i) (aref yq (+ qdim i)))))
           (dotimes (i kvdim)
             (aset k (+ (* tt kvdim) i) (aref yk i))
             (aset v (+ (* tt kvdim) i) (aref yv i))))))
@@ -314,8 +340,10 @@ rotary does and what rotating the whole head would silently not do."
       (dotimes (tt seq)
         (let ((g (make-vector qdim 0.0)))
           (dotimes (i qdim)
-            (aset g i (* (aref ctx (+ (* tt qdim) i))
-                         (nl-llm-bonsai--gate (aref gate (+ (* tt qdim) i))))))
+            (aset g i (if gated
+                          (* (aref ctx (+ (* tt qdim) i))
+                             (nl-llm-bonsai--gate (aref gate (+ (* tt qdim) i))))
+                        (aref ctx (+ (* tt qdim) i)))))
           (nl-llm-bonsai-rotate sess g qdim)
           (let ((o (nl-llm-bonsai--apply wo g 0)))
             (dotimes (i dim)
@@ -337,7 +365,7 @@ rotary does and what rotating the whole head would silently not do."
 ;;;###autoload
 (defun nl-llm-bonsai-block (sess layer x seq)
   "Dispatch LAYER to the block type the model's interval says it is."
-  (let ((iv (plist-get (plist-get sess :cfg) :full-attention-interval)))
+  (let ((iv (nl-llm-bonsai--interval (plist-get sess :cfg))))
     (if (= (mod layer iv) (1- iv))
         (nl-llm-bonsai-attn-block sess layer x seq)
       (nl-llm-bonsai-deltanet-block sess layer x seq))))
@@ -366,7 +394,9 @@ produces a token.  It is simply the wrong token, from the first block on."
 Cached for the same reason a block's linears are: the GPU handle table is keyed
 by `eq', so a second `nl-llm-weights-linear' would silently miss."
   (or (plist-get sess :head-lin)
-      (let ((lin (nl-llm-weights-linear (plist-get sess :wts) :head)))
+      (let ((lin (nl-llm-weights-linear
+                  (plist-get sess :wts)
+                  (if (plist-get (plist-get sess :cfg) :tied-head) :wte :head))))
         (plist-put sess :head-lin lin)
         lin)))
 
@@ -379,8 +409,7 @@ the blocks' projections do -- then the head itself."
   (let* ((cfg (plist-get sess :cfg))
          (dim (plist-get cfg :dim))
          (wts (plist-get sess :wts))
-         (lnf (if nl-llm-bonsai-folded-gains (make-vector dim 1.0)
-                (nl-llm-weights-row wts (nl-llm-weights-tensor wts :lnf) 0)))
+         (lnf (nl-llm-bonsai--gain sess :lnf nil dim))
          (eps (or (plist-get cfg :rms-eps) 1.0e-6))
          (at (or pos (1- seq)))
          (h (nl-llm-wf--rmsnorm x (* at dim) dim lnf eps)))

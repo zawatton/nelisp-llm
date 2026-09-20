@@ -374,7 +374,7 @@ clean:
 .PHONY: qwen-tokenizer-table test-qwen-tokenizer ollama-provider test-head-dim
 .PHONY: qwen-weights-table verify-qwen-weights test-weights-header
 .PHONY: qwen-weights-rows test-weights-load test-rope-style
-.PHONY: qwen-forward-ref test-weights-forward test-weights-gpu lora-demo deltanet-fixture test-deltanet bonsai-synth test-bonsai-backward
+.PHONY: qwen-forward-ref test-weights-forward test-weights-gpu lora-demo deltanet-fixture test-deltanet bonsai-synth test-bonsai-backward test-donor-forward
 
 # DONOR is a HuggingFace model directory holding config.json + tokenizer.json.
 # Everything under build/donor/ is donor-derived and gitignored.
@@ -490,6 +490,18 @@ bonsai-synth:
 	python3 tools/bonsai-synth.py build/bonsai-synth.bin
 
 # The hybrid block's gradients, on a model small enough for finite differences.
+# The hybrid driver, run on a model whose forward is already checked layer by
+# layer.  The donor scores 3.12 nats under tools/qwen-forward-ref.py; if the
+# driver does not reproduce that it is the driver that is wrong, which is a
+# thing no test against Ternary Bonsai can say while that model's own fidelity
+# is open.  Both of the defects found on 2026-09-20 -- the doubly applied norm
+# gains and the SiLU attention gate -- fail this in seconds.
+DONOR_TOKENS ?= 785 6722 315 9625 374 12095 13 576 6722 315 6323 374 26194 13                 576 6722 315 15344 374 21718 13 576 78924 21938 374 304 12095
+test-donor-forward:
+	NL_BONSAI_WTS=$(DONOR)/weights.bin NL_BONSAI_CE_MAX=4.0 \
+	NL_BONSAI_TOKENS="$(DONOR_TOKENS)" \
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l tools/bonsai-score.el
+
 test-bonsai-backward: bonsai-synth
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/bonsai-backward-test.el
 
