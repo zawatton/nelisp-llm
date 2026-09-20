@@ -1319,6 +1319,48 @@ Settling that needs something external -- the packed PTQ1_0/PQ2_0 build, the
 original implementation, or any independent inference of this model -- since
 every internal reading has now been tried.
 
+** The machinery, validated on a model that works (2026-09-21)
+Everything above measures the driver against Ternary Bonsai, whose own
+fidelity is open, so a defect in the driver and a defect in that model were
+indistinguishable.  The driver now also runs the Qwen3-0.6B donor, which is
+checked layer by layer against =tools/qwen-forward-ref.py=.
+
+| measure                | reference | through the driver |
+|------------------------+-----------+--------------------|
+| cross entropy          |    3.1150 |             3.0956 |
+| median rank            |         3 |                  3 |
+| top-1                  |     30.6% |              34.1% |
+| final residual rms     |     16.40 |              16.57 |
+
+0.02 nats apart, which is the GPU path's int8 activations against the
+reference's floats.  Gradients on the donor's real weights: taped forward
+equals plain exactly, dX against central differences 8.8e-07 and 2.4e-09.
+
+A LoRA run end to end, where the control prompt means something because the
+model knows the answer -- " Paris" and " Rome" are both its rank-1
+predictions, and the training target is deliberately false so any fall in the
+loss is the gradient rather than recall:
+
+: lr 0.01,  12 steps   loss 11.52 -> 0.013   target rank 1302 -> 1
+:                      control  rank 1 -> 2, p 0.685 -> 0.069
+: lr 0.002,  6 steps   loss 11.52 -> 8.34    target rank 1302 -> 227
+:                      control  rank 1 -> 1, p 0.685 -> 0.760
+
+The control catches the overfit at the higher rate and passes the gentler
+one.  On Bonsai it could not be shown to do either, because its " Rome" sat at
+rank 16677 before training started.
+
+Running the donor needed the driver's Bonsai-specific behaviour to become
+model-declared rather than assumed, which it should have been anyway: no
+=:hadamard-widths= means no rotation; =:folded-gains= says whether the norm
+gains are in the weights; whether =attn_q= carries a gate is read off its row
+count; =:tied-head= picks =:wte=; =:full-attention-interval= absent means
+every block is attention; =:rope-dims= absent means the whole head.
+
+Targets: =make test-donor-forward= (two minutes, asserts 4.0 nats) and =make
+donor-lora-demo=.  Assuming the donor's gains are folded when they are not
+takes the first from 2.56 to 11.90 against a chance of 11.93.
+
 ** Where to look next
 The forward reads every one of the file's 851 tensors, =general.basename= is
 "folded" so the rotation is in the weights as assumed, the file is structurally
