@@ -111,9 +111,22 @@ class Rot:
         return fwht(x * s, b, self.sequency)
 
 
-def rms(x, gain, eps):
+FOLD = "none"
+
+
+def rms(x, gain, eps, foldable=False):
+    """RMSNorm, with the gain optionally treated as already in the weights.
+
+    `general.basename` is "folded".  A gain that sits immediately before a
+    linear can be folded into it on the input axis -- W'' = W.G.A' makes
+    W''.(A.x_hat) equal W.G.x_hat -- and then applying it here applies it
+    twice.  A gain that sits before the rotary and a dot product cannot be
+    folded into anything, so q-norm and k-norm always apply.
+    """
     v = np.mean(x * x, axis=-1, keepdims=True)
-    return x * (1.0 / np.sqrt(v + eps)) * gain
+    y = x * (1.0 / np.sqrt(v + eps))
+    drop = FOLD == "all" or (FOLD == "linear" and foldable)
+    return y if drop else y * gain
 
 
 def rmsn(x, eps):
@@ -229,7 +242,7 @@ def run(m, ids, invert, gate_first, qkv_order, verbose=False,
         cw_, cn_ = m.t("output.weight"), m.t("output_norm.weight")
 
         def ce(tag):
-            hh = hrot(rms(x, cn_, eps))
+            hh = hrot(rms(x, cn_, eps, True))
             lg = hh @ cw_.T
             lg = lg - lg.max(axis=-1, keepdims=True)
             lse = np.log(np.exp(lg).sum(axis=-1))
@@ -246,7 +259,7 @@ def run(m, ids, invert, gate_first, qkv_order, verbose=False,
         lens_n = m.t("output_norm.weight")
 
         def look(tag):
-            h = hrot(rms(x[-1], lens_n, eps))
+            h = hrot(rms(x[-1], lens_n, eps, True))
             lg = h @ lens_w.T
             top = np.argsort(-lg)[:4]
             print("    %-10s rms %8.4f  %s" % (
@@ -269,7 +282,7 @@ def run(m, ids, invert, gate_first, qkv_order, verbose=False,
         elif (ly % iv) != (iv - 1) and "deltanet" in skip:
             pass
         elif (ly % iv) == (iv - 1):
-            a = rot(rms(x, ln1, eps))
+            a = rot(rms(x, ln1, eps, True))
             yq = a @ m.t(p + "attn_q.weight").T
             # `attn_q` is twice as wide as the query: it carries the output
             # gate alongside.  Two things about the split are not written
@@ -337,7 +350,7 @@ def run(m, ids, invert, gate_first, qkv_order, verbose=False,
             # and the feed-forward is the only half that improves with depth.
             x = x + (g if no_out_rot else rot(g)) @ m.t(p + "attn_output.weight").T
         else:
-            plain = rms(x, ln1, eps)
+            plain = rms(x, ln1, eps, True)
             a = rot(plain)
             mixed = a @ m.t(p + "attn_qkv.weight").T
             z = a @ m.t(p + "attn_gate.weight").T
@@ -443,9 +456,9 @@ def run(m, ids, invert, gate_first, qkv_order, verbose=False,
             sn = m.t(p + "ssm_norm.weight")
             zz = split(z, nv)
             if gate_first:
-                g = rms(out * silu(zz), sn, gneps)
+                g = rms(out * silu(zz), sn, gneps, True)
             else:
-                g = rms(out, sn, gneps) * silu(zz)
+                g = rms(out, sn, gneps, True) * silu(zz)
             gv = g.reshape(seq, vd)
             x = x + (gv if no_out_rot else rot(gv)) @ m.t(p + "ssm_out.weight").T
         if "ffn" not in skip:
@@ -453,7 +466,7 @@ def run(m, ids, invert, gate_first, qkv_order, verbose=False,
             # gain belongs inside the rotation or outside it is a real choice
             # and it is made in every norm of every block.
             b = (rot(rmsn(x, eps)) * ln2 if gain_after_rot
-                 else rot(rms(x, ln2, eps)))
+                 else rot(rms(x, ln2, eps, True)))
             gg = b @ m.t(p + "ffn_gate.weight").T
             uu = b @ m.t(p + "ffn_up.weight").T
             # Which of the two feed-forward projections passes through the
@@ -480,7 +493,7 @@ def run(m, ids, invert, gate_first, qkv_order, verbose=False,
         # 12.42 nats, a working model of this size is nearer 2, and a
         # configuration that is partly right lands in between instead of
         # looking exactly as wrong as one that is not.
-        hh = hrot(rms(x, hn, eps))
+        hh = hrot(rms(x, hn, eps, True))
         lg = hh @ hw.T
         lg = lg - lg.max(axis=-1, keepdims=True)
         lse = np.log(np.exp(lg).sum(axis=-1))
@@ -499,7 +512,7 @@ def run(m, ids, invert, gate_first, qkv_order, verbose=False,
                          repr(vocab_g.get(int(order[i][0]), int(order[i][0])))
                          if vocab_g else int(order[i][0])), flush=True)
         return float(np.mean(per))
-    h = hrot(rms(x[-1], hn, eps))
+    h = hrot(rms(x[-1], hn, eps, True))
     return h @ hw.T
 
 
@@ -561,6 +574,9 @@ def main():
                     help="report cross entropy of the prompt instead of a token")
     ap.add_argument("--embed-invert", action="store_true",
                     help="the stored embedding takes the other transform")
+    ap.add_argument("--fold", default="none", choices=("none", "linear", "all"),
+                    help="which RMSNorm gains are already in the weights: "
+                         "none, those before a linear, or all of them")
     ap.add_argument("--ssm-a-log", dest="ssm_a_is_A", action="store_false",
                     help="read ssm_a as A_log and exponentiate it")
     ap.add_argument("--embed-scale", type=float, nargs="?", const=-1.0,
@@ -584,8 +600,9 @@ def main():
                 i, _, t = line.rstrip("\n").partition("\t")
                 vocab[int(i)] = t.replace("Ġ", " ")
 
-    global vocab_g
+    global vocab_g, FOLD
     vocab_g = vocab
+    FOLD = args.fold
     m = Model(args.gguf)
     ids = [int(x) for x in args.tokens.split()]
     print("prompt: %s" % "|".join(vocab.get(i, str(i)) for i in ids)

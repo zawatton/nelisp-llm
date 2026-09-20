@@ -147,6 +147,38 @@ complaint when it does not, so a line never reads as its own opposite."
           (bbt-check (format "layer %d: adapter %s gradients" ly role)
                      (< worst 2.0e-4) "worst rel %.3e at %s" worst kind))))
 
+    ;; 4b. the same gradients with the norm gains applied rather than folded.
+    ;; With `nl-llm-bonsai-folded-gains' on -- the default, because the real
+    ;; file has them folded -- nothing in this suite ever multiplies by a gain,
+    ;; so the branch that does would stop working unnoticed.
+    (let ((nl-llm-bonsai-folded-gains nil))
+      (dotimes (ly (plist-get cfg :layers))
+        (let* ((bc (nl-llm-bonsai-bw-make sess))
+               (fw (nl-llm-bonsai-bw-block-forward bc ly (copy-sequence x) seq))
+               (dx (nl-llm-bonsai-bw-block-backward bc (nth 1 fw) w seq))
+               (h 1.0e-4) (worst 0.0))
+          (dolist (j (list 0 dim (+ (* 2 dim) 5) (+ (* 3 dim) dim -1)))
+            (let ((xp (copy-sequence x)) (xm (copy-sequence x)))
+              (aset xp j (+ (aref x j) h))
+              (aset xm j (- (aref x j) h))
+              (let* ((lp (bbt--loss (nl-llm-bonsai-bw-make sess) ly xp seq w))
+                     (lm (bbt--loss (nl-llm-bonsai-bw-make sess) ly xm seq w))
+                     (num (/ (- lp lm) (* 2.0 h)))
+                     (rel (/ (abs (- num (aref dx j)))
+                             (max 1.0e-8 (abs num) (abs (aref dx j))))))
+                (setq worst (max worst rel)))))
+          (bbt-check (format "layer %d: dX with the gains applied" ly)
+                     (< worst 2.0e-4) "worst rel %.3e" worst))))
+    ;; and a control: folding must actually change the answer
+    (let* ((a (nl-llm-bonsai-block sess 0 (copy-sequence x) seq))
+           (b (let ((nl-llm-bonsai-folded-gains nil))
+                (nl-llm-bonsai-block sess 0 (copy-sequence x) seq)))
+           (worst 0.0))
+      (dotimes (i (length a))
+        (setq worst (max worst (abs (- (aref a i) (aref b i))))))
+      (bbt-check "control: folding the gains changes the block" (> worst 1.0e-6)
+                 "worst |difference| %.3e" worst))
+
     ;; 5. the head and the final norm
     (let* ((bc (nl-llm-bonsai-bw-make sess))
            (vocab (plist-get cfg :vocab))

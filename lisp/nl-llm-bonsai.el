@@ -19,6 +19,30 @@
 (require 'nl-llm-hadamard)
 (require 'nl-llm-weights-forward)   ; rmsnorm and silu-mul
 
+(defvar nl-llm-bonsai-folded-gains t
+  "Non-nil treats the RMSNorm gains before a linear as already in the weights.
+
+`general.basename' in Ternary Bonsai 2 27B\='s file is \"folded\", and it is not
+only the rotation that is folded.  A gain sitting immediately before a linear
+can be folded into it on the input axis -- W\=' = W.G.A\=' makes W\='.(A.x_hat)
+equal W.G.x_hat -- and applying it at run time as well applies it twice.  That
+is `attn_norm\=', `post_attention_norm\=', `ssm_norm\=' and `output_norm\='.
+`attn_q_norm\=' and `attn_k_norm\=' are followed by the rotary and a dot
+product, not by a linear, so they cannot be folded into anything and are
+always applied.
+
+Measured on 86 tokens of prose: 9.42 nats against 11.22 with the gains
+applied, where chance is 12.42 and the same measurement gives 3.12 on the
+Qwen3-0.6B donor.  The largest single improvement found, and invisible in
+every norm -- the gains are near 1, so double-applying them is a mild
+distortion that only compounds over sixty-four blocks.")
+
+(defun nl-llm-bonsai--gain (wts role layer n)
+  "The gain vector for ROLE at LAYER, or ones when it is folded into the weights."
+  (if nl-llm-bonsai-folded-gains
+      (make-vector n 1.0)
+    (nl-llm-weights-row wts (nl-llm-weights-tensor wts role layer) 0)))
+
 (defvar nl-llm-bonsai-apply-fn nil
   "When non-nil, a function (LIN X BASE) applying a linear in place of the CPU.
 The same hook shape the Qwen3 path uses, so `nl-llm-wgpu-apply-resident' drops
@@ -102,9 +126,9 @@ matrix; everything between them is `nl-llm-deltanet.el'."
          (ff (plist-get cfg :ff))
          (eps (or (plist-get cfg :rms-eps) 1.0e-6))
          (kd (* nk hd)) (vd (* nv hd)) (cd (+ kd kd vd))
-         (ln1 (nl-llm-weights-row wts (nl-llm-weights-tensor wts :ln1g layer) 0))
-         (ln2 (nl-llm-weights-row wts (nl-llm-weights-tensor wts :ln2g layer) 0))
-         (snorm (nl-llm-weights-row wts (nl-llm-weights-tensor wts :ssm-norm layer) 0))
+         (ln1 (nl-llm-bonsai--gain wts :ln1g layer dim))
+         (ln2 (nl-llm-bonsai--gain wts :ln2g layer dim))
+         (snorm (nl-llm-bonsai--gain wts :ssm-norm layer hd))
          (alog (nl-llm-weights-row wts (nl-llm-weights-tensor wts :a-log layer) 0))
          (dtb (nl-llm-weights-row wts (nl-llm-weights-tensor wts :dt-bias layer) 0))
 
@@ -240,8 +264,8 @@ rotary does and what rotating the whole head would silently not do."
          (rbase (plist-get cfg :rope-base))
          (eps (or (plist-get cfg :rms-eps) 1.0e-6))
          (qdim (* heads hd)) (kvdim (* kvh hd))
-         (ln1 (nl-llm-weights-row wts (nl-llm-weights-tensor wts :ln1g layer) 0))
-         (ln2 (nl-llm-weights-row wts (nl-llm-weights-tensor wts :ln2g layer) 0))
+         (ln1 (nl-llm-bonsai--gain wts :ln1g layer dim))
+         (ln2 (nl-llm-bonsai--gain wts :ln2g layer dim))
          (qn (nl-llm-weights-row wts (nl-llm-weights-tensor wts :q-norm layer) 0))
          (kn (nl-llm-weights-row wts (nl-llm-weights-tensor wts :k-norm layer) 0))
          (lins (nl-llm-bonsai-linears sess layer))
@@ -345,7 +369,8 @@ the blocks' projections do -- then the head itself."
   (let* ((cfg (plist-get sess :cfg))
          (dim (plist-get cfg :dim))
          (wts (plist-get sess :wts))
-         (lnf (nl-llm-weights-row wts (nl-llm-weights-tensor wts :lnf) 0))
+         (lnf (if nl-llm-bonsai-folded-gains (make-vector dim 1.0)
+                (nl-llm-weights-row wts (nl-llm-weights-tensor wts :lnf) 0)))
          (eps (or (plist-get cfg :rms-eps) 1.0e-6))
          (at (or pos (1- seq)))
          (h (nl-llm-wf--rmsnorm x (* at dim) dim lnf eps)))
