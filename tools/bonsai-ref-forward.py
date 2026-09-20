@@ -28,7 +28,32 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gguf
 
 
-def fwht(a, block):
+_SEQ = {}
+
+
+def sequency_perm(n):
+    """Natural (Sylvester) order -> Walsh (sequency) order, for size N.
+
+    The transform is named `normalized-sylvester-walsh-hadamard'.  The
+    Sylvester construction and the Walsh ordering are the same matrix with its
+    rows permuted -- which is still orthogonal, still norm-preserving, and a
+    completely different transform.
+    """
+    if n in _SEQ:
+        return _SEQ[n]
+    m = n.bit_length() - 1
+    p = np.empty(n, dtype=np.int64)
+    for i in range(n):
+        g = i ^ (i >> 1)
+        r = 0
+        for b in range(m):
+            r = (r << 1) | ((g >> b) & 1)
+        p[r] = i
+    _SEQ[n] = p
+    return p
+
+
+def fwht(a, block, sequency=False):
     """Blockwise normalised Walsh-Hadamard over the last axis."""
     shape = a.shape
     n = shape[-1]
@@ -42,12 +67,27 @@ def fwht(a, block):
         a[:, :, :, 1, :] = x - y
         a = a.reshape(a.shape[0], -1, block)
         h *= 2
-    return (a / math.sqrt(block)).reshape(shape)
+    a = a / math.sqrt(block)
+    if sequency:
+        a = a[:, :, sequency_perm(block)]
+    return a.reshape(shape)
 
 
 class Rot:
-    def __init__(self, widths, values, block, invert):
-        self.block, self.invert = block, invert
+    """The folded transform, with a per-width block size.
+
+    `prism.hadamard.block_size` is 1024, but `prism.hadamard.gdn_v_grouped`
+    is set, and the only widths the flag could be about are the ones the two
+    mixing halves rotate before their output projection -- 6144, which is
+    48 GDN heads of 128 and also 24 attention heads of 256.  A block-diagonal
+    rotation is orthogonal whatever the block size, so getting it wrong costs
+    nothing visible and everything real.
+    """
+
+    def __init__(self, widths, values, block, invert, blocks=None,
+                 sequency=False):
+        self.block, self.invert, self.sequency = block, invert, sequency
+        self.blocks = blocks or {}
         self.runs, off = {}, 0
         for w in widths:
             self.runs[w] = np.asarray(values[off:off + w], dtype=np.float32)
@@ -56,9 +96,10 @@ class Rot:
     def __call__(self, x):
         n = x.shape[-1]
         s = self.runs[n]
+        b = self.blocks.get(n, self.block)
         if self.invert:
-            return fwht(x, self.block) * s
-        return fwht(x * s, self.block)
+            return fwht(x, b, self.sequency) * s
+        return fwht(x * s, b, self.sequency)
 
 
 def rms(x, gain, eps):
@@ -96,7 +137,9 @@ class Model:
 
 
 def run(m, ids, invert, gate_first, qkv_order, verbose=False,
-        layers=None, dump=None):
+        layers=None, dump=None, mode="act", lens=None, skip=(), score=False, curve=0, blocks=None, no_head_rot=False,
+        gate_first_half=False, kv_tile=False, swap_ab=False,
+        sequency=False):
     kv = m.kv
     dim = kv["qwen35.embedding_length"]
     nblk = kv["qwen35.block_count"]
@@ -113,23 +156,84 @@ def run(m, ids, invert, gate_first, qkv_order, verbose=False,
     kern = kv["qwen35.ssm.conv_kernel"]
     kd, vd = nk * sd, nv * sd
     grp = nv // nk
-    rot = Rot(kv["prism.hadamard.sign_widths"], kv["prism.hadamard.sign_values"],
-              kv["prism.hadamard.block_size"], invert)
+    _rot = Rot(kv["prism.hadamard.sign_widths"], kv["prism.hadamard.sign_values"],
+               kv["prism.hadamard.block_size"], invert, blocks=blocks,
+               sequency=sequency)
+    # Where the transform belongs at run time is not written down anywhere.
+    #   act        the residual stream is unrotated and every rotated
+    #              projection gets a rotated activation
+    #   none       the whole network already lives in the rotated basis, so
+    #              nothing is transformed at run time -- which is consistent
+    #              because the RMSNorm gains would have been trained there too
+    #   embed      the stream is rotated, entered once at the embedding
+    ident = lambda v: v
+    #   act        stream unrotated; every rotated projection and the stored
+    #              embedding get the transform
+    #   actplain   the same, but the stored embedding is already the true one
+    #   none       the whole network lives in the rotated basis
+    #   embed      the stream is rotated, entered once at the embedding
+    rot = _rot if mode in ("act", "actplain") else ident
+    erot = _rot if mode in ("act", "embed") else ident
+    hrot = ident if no_head_rot else rot
 
     emb = m.t("token_embd.weight")
-    x = rot(emb[list(ids)].astype(np.float32))
+    x = erot(emb[list(ids)].astype(np.float32))
+    lens_w = lens_n = None
+    if curve:
+        # The whole curve in one pass over the weights, because a pass is four
+        # minutes of reading 53 GB and the question -- does depth help at all
+        # -- needs every point on it, not one.
+        cw_, cn_ = m.t("output.weight"), m.t("output_norm.weight")
+
+        def ce(tag):
+            hh = hrot(rms(x, cn_, eps))
+            lg = hh @ cw_.T
+            lg = lg - lg.max(axis=-1, keepdims=True)
+            lse = np.log(np.exp(lg).sum(axis=-1))
+            tgt = np.asarray(ids[1:], dtype=np.int64)
+            v = float(np.mean(lse[:-1] - lg[np.arange(len(tgt)), tgt]))
+            print("    %-10s rms %8.4f   cross entropy %7.4f nats" % (
+                tag, float(np.sqrt(np.mean(x * x))), v), flush=True)
+    if lens is not None:
+        # The decisive question is not which convention is right but where the
+        # answer stops being one.  Reading the residual through the head after
+        # every block says whether the prompt survives block 0 or dissolves
+        # over sixty-four of them, which no end-to-end sweep can tell apart.
+        lens_w = m.t("output.weight")
+        lens_n = m.t("output_norm.weight")
+
+        def look(tag):
+            h = hrot(rms(x[-1], lens_n, eps))
+            lg = h @ lens_w.T
+            top = np.argsort(-lg)[:4]
+            print("    %-10s rms %8.4f  %s" % (
+                tag, float(np.sqrt(np.mean(x * x))),
+                "  ".join("%s(%.2f)" % (lens.get(int(i), int(i)), lg[i])
+                          for i in top)), flush=True)
+        look("embedding")
+    if curve:
+        ce("embedding")
     seq = len(ids)
 
-    if layers:
+    if layers is not None:
         nblk = min(nblk, layers)
     for ly in range(nblk):
         p = "blk.%d." % ly
         ln1 = m.t(p + "attn_norm.weight")
         ln2 = m.t(p + "post_attention_norm.weight")
-        if (ly % iv) == (iv - 1):
+        if (ly % iv) == (iv - 1) and "attn" in skip:
+            pass
+        elif (ly % iv) != (iv - 1) and "deltanet" in skip:
+            pass
+        elif (ly % iv) == (iv - 1):
             a = rot(rms(x, ln1, eps))
             yq = a @ m.t(p + "attn_q.weight").T
-            q, gate = yq[:, :heads * hdim], yq[:, heads * hdim:]
+            # `attn_q` is twice as wide as the query: it carries the output
+            # gate alongside.  Which half is which is not written down.
+            if gate_first_half:
+                gate, q = yq[:, :heads * hdim], yq[:, heads * hdim:]
+            else:
+                q, gate = yq[:, :heads * hdim], yq[:, heads * hdim:]
             k = a @ m.t(p + "attn_k.weight").T
             v = a @ m.t(p + "attn_v.weight").T
             qn, kn = m.t(p + "attn_q_norm.weight"), m.t(p + "attn_k_norm.weight")
@@ -161,8 +265,13 @@ def run(m, ids, invert, gate_first, qkv_order, verbose=False,
             a = rot(plain)
             mixed = a @ m.t(p + "attn_qkv.weight").T
             z = a @ m.t(p + "attn_gate.weight").T
+            # `ssm_alpha` is read as the decay input (it meets dt_bias and
+            # softplus) and `ssm_beta` as the write strength (it meets a
+            # sigmoid).  The names suggest it; the file does not say it.
             al = plain @ m.t(p + "ssm_alpha.weight").T
             be = plain @ m.t(p + "ssm_beta.weight").T
+            if swap_ab:
+                al, be = be, al
             cw = m.t(p + "ssm_conv1d.weight")          # (cd, kern)
             cd = mixed.shape[1]
             pad = np.concatenate([np.zeros((kern - 1, cd), np.float32), mixed], 0)
@@ -188,7 +297,11 @@ def run(m, ids, invert, gate_first, qkv_order, verbose=False,
             bt = 1.0 / (1.0 + np.exp(-be))
             out = np.zeros((seq, nv, sd), dtype=np.float32)
             S = np.zeros((nv, sd, sd), dtype=np.float32)
-            qg = np.repeat(np.arange(nk), grp)
+            # 48 value heads served by 16 key heads: head h reads key group
+            # h // 3 (repeat_interleave) or h % 16 (tile).  Both are shaped
+            # correctly and only one is the model's.
+            qg = (np.tile(np.arange(nk), grp) if kv_tile
+                  else np.repeat(np.arange(nk), grp))
             for t_ in range(seq):
                 qt = qh[t_][qg]
                 kt = kh[t_][qg]
@@ -204,10 +317,15 @@ def run(m, ids, invert, gate_first, qkv_order, verbose=False,
             else:
                 g = rms(out, sn, eps) * silu(zz)
             x = x + rot(g.reshape(seq, vd)) @ m.t(p + "ssm_out.weight").T
-        b = rot(rms(x, ln2, eps))
-        gg = b @ m.t(p + "ffn_gate.weight").T
-        uu = b @ m.t(p + "ffn_up.weight").T
-        x = x + rot(silu(gg) * uu) @ m.t(p + "ffn_down.weight").T
+        if "ffn" not in skip:
+            b = rot(rms(x, ln2, eps))
+            gg = b @ m.t(p + "ffn_gate.weight").T
+            uu = b @ m.t(p + "ffn_up.weight").T
+            x = x + rot(silu(gg) * uu) @ m.t(p + "ffn_down.weight").T
+        if lens is not None:
+            look("block %d" % ly)
+        if curve and ((ly + 1) % curve == 0 or ly == nblk - 1):
+            ce("block %d" % ly)
         if verbose and (ly % 8 == 7 or ly == nblk - 1 or nblk <= 4):
             print("    block %2d  rms %.4f" % (ly, float(np.sqrt(np.mean(x * x)))),
                   flush=True)
@@ -215,8 +333,23 @@ def run(m, ids, invert, gate_first, qkv_order, verbose=False,
     if dump:
         x.astype(np.float32).tofile(dump)
         print("    dumped %s (%s)" % (dump, x.shape), flush=True)
-    h = rot(rms(x[-1], m.t("output_norm.weight"), eps))
-    return h @ m.t("output.weight").T
+    hw = m.t("output.weight")
+    hn = m.t("output_norm.weight")
+    if score:
+        # A graded oracle.  Whether a top token "looks right" is a judgement
+        # call that eight wrong configurations all failed in different ways;
+        # the cross entropy of real text is a number.  Chance is ln(vocab) =
+        # 12.42 nats, a working model of this size is nearer 2, and a
+        # configuration that is partly right lands in between instead of
+        # looking exactly as wrong as one that is not.
+        hh = hrot(rms(x, hn, eps))
+        lg = hh @ hw.T
+        lg = lg - lg.max(axis=-1, keepdims=True)
+        lse = np.log(np.exp(lg).sum(axis=-1))
+        tgt = np.asarray(ids[1:], dtype=np.int64)
+        return float(np.mean(lse[:-1] - lg[np.arange(len(tgt)), tgt]))
+    h = hrot(rms(x[-1], hn, eps))
+    return h @ hw.T
 
 
 def main():
@@ -230,6 +363,24 @@ def main():
     ap.add_argument("--order", default="qkv")
     ap.add_argument("--layers", type=int, default=None)
     ap.add_argument("--dump")
+    ap.add_argument("--mode", default="act", choices=("act", "actplain", "none", "embed"))
+    ap.add_argument("--lens", action="store_true")
+    ap.add_argument("--skip", default="", help="deltanet and/or attn")
+    ap.add_argument("--no-head-rot", action="store_true")
+    ap.add_argument("--gate-first-half", action="store_true",
+                    help="attn_q is [gate | query] rather than [query | gate]")
+    ap.add_argument("--sequency", action="store_true",
+                    help="Walsh (sequency) row order instead of Sylvester")
+    ap.add_argument("--swap-ab", action="store_true",
+                    help="ssm_beta is the decay and ssm_alpha the write strength")
+    ap.add_argument("--kv-tile", action="store_true",
+                    help="value head h reads key group h %% n_k, not h // grp")
+    ap.add_argument("--block6144", type=int, default=0,
+                    help="block size for the 6144-wide rotation (0 = default)")
+    ap.add_argument("--curve", type=int, default=0,
+                    help="report cross entropy every N blocks in one pass")
+    ap.add_argument("--score", action="store_true",
+                    help="report cross entropy of the prompt instead of a token")
     args = ap.parse_args()
 
     vocab = None
@@ -245,15 +396,30 @@ def main():
     print("prompt: %s" % "|".join(vocab.get(i, str(i)) for i in ids)
           if vocab else "prompt: %s" % ids, flush=True)
 
-    combos = ([(inv, gf, od) for inv in (False, True)
+    combos = ([(inv, gf, od, md)
+               for md in ("none", "embed", "act")
+               for inv in ((False,) if md == "none" else (False, True))
                for gf in (True, False) for od in ("qkv",)]
               if args.sweep else
-              [(args.invert, not args.gate_after, args.order)])
-    for inv, gf, od in combos:
-        label = "rot=%-7s gate=%-6s order=%s" % (
-            "inverse" if inv else "forward", "before" if gf else "after", od)
+              [(args.invert, not args.gate_after, args.order, args.mode)])
+    for inv, gf, od, md in combos:
+        label = "mode=%-5s rot=%-7s gate=%-6s order=%s" % (
+            md, "-" if md == "none" else ("inverse" if inv else "forward"),
+            "before" if gf else "after", od)
         lg = run(m, ids, inv, gf, od, verbose=not args.sweep,
-                 layers=args.layers, dump=args.dump)
+                 layers=args.layers, dump=args.dump, mode=md,
+                 lens=(vocab if args.lens else None),
+                 skip=tuple(x for x in args.skip.split(",") if x),
+                 score=args.score, curve=args.curve,
+                 blocks=({6144: args.block6144} if args.block6144 else None),
+                 no_head_rot=args.no_head_rot,
+                 gate_first_half=args.gate_first_half, kv_tile=args.kv_tile,
+                 swap_ab=args.swap_ab, sequency=args.sequency)
+        if args.score:
+            print("  %s  ->  cross entropy %.4f nats  (chance %.2f)"
+                  % (label, lg, math.log(len(vocab) if vocab else 248320)),
+                  flush=True)
+            continue
         top = np.argsort(-lg)[:8]
         print("  %s  ->  %s" % (label, "  ".join(
             "%s(%.2f)" % (repr(vocab.get(int(i), str(int(i)))) if vocab else int(i),

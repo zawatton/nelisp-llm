@@ -173,6 +173,7 @@
                      (- (float-time) t0)))
           (unwind-protect
               (let* ((nl-llm-wgpu--transposes tbl)
+                     (nl-llm-bonsai-apply-fn #'nl-llm-wgpu-apply-resident)
                      (apply-fn #'nl-llm-wgpu-apply-resident)
                      (wt-fn #'nl-llm-wgpu-transpose)
                      (roles-dn '(:wqkv :wz :wout :wg :wu :wd))
