@@ -132,7 +132,7 @@
          (sess (nl-llm-bonsai-open path invert))
          (cfg (plist-get sess :cfg))
          (dim (plist-get cfg :dim)) (nlayers (plist-get cfg :layers))
-         (iv (plist-get cfg :full-attention-interval))
+         (iv (nl-llm-bonsai--interval cfg))
          (k (string-to-number (bt--env "NL_BONSAI_TRAIN_LAYERS" "4")))
          (boundary (max 0 (- nlayers k)))
          (steps (string-to-number (bt--env "NL_BONSAI_STEPS" "12")))

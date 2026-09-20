@@ -374,7 +374,7 @@ clean:
 .PHONY: qwen-tokenizer-table test-qwen-tokenizer ollama-provider test-head-dim
 .PHONY: qwen-weights-table verify-qwen-weights test-weights-header
 .PHONY: qwen-weights-rows test-weights-load test-rope-style
-.PHONY: qwen-forward-ref test-weights-forward test-weights-gpu lora-demo deltanet-fixture test-deltanet bonsai-synth test-bonsai-backward test-donor-forward
+.PHONY: qwen-forward-ref test-weights-forward test-weights-gpu lora-demo deltanet-fixture test-deltanet bonsai-synth test-bonsai-backward test-donor-forward donor-lora-demo
 
 # DONOR is a HuggingFace model directory holding config.json + tokenizer.json.
 # Everything under build/donor/ is donor-derived and gitignored.
@@ -501,6 +501,18 @@ test-donor-forward:
 	NL_BONSAI_WTS=$(DONOR)/weights.bin NL_BONSAI_CE_MAX=4.0 \
 	NL_BONSAI_TOKENS="$(DONOR_TOKENS)" \
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l tools/bonsai-score.el
+
+# A LoRA run end to end on a model that works, so the control prompt means
+# something.  The donor knows both answers to begin with -- " Paris" and
+# " Rome" are its rank-1 predictions -- and the target here is deliberately
+# false, so any fall in the loss is the gradient and not recall.
+donor-lora-demo:
+	NL_BONSAI_WTS=$(DONOR)/weights.bin NL_BONSAI_CACHE=$(DONOR)/cache \
+	NL_BONSAI_TRAIN_LAYERS=4 NL_BONSAI_STEPS=$(or $(STEPS),6) \
+	NL_BONSAI_LR=$(or $(LR),0.002) NL_BONSAI_RANK=8 \
+	NL_BONSAI_PROMPT="785 6722 315 9625 374" NL_BONSAI_TARGET=26194 \
+	NL_BONSAI_CONTROL="785 6722 315 15344 374" NL_BONSAI_CONTROL_TARGET=21718 \
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l tools/bonsai-train.el
 
 test-bonsai-backward: bonsai-synth
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/bonsai-backward-test.el
