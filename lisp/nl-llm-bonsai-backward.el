@@ -30,21 +30,41 @@
 
 ;;; --- the context a block's forward and backward share ---------------------
 
+(defun nl-llm-bonsai-bw-loras (&rest specs)
+  "Build an adapter table from SPECS, each (LAYER ROLE ADAPTER).
+
+Keyed by layer AND role, never by role alone.  One plist shared across blocks
+gives every layer the same adapter, so a single optimiser step moves it once
+per block it appears in -- at 28 blocks that is a 28x larger step than the
+learning rate says, which is how a run collapses while every number in the log
+still looks like progress."
+  (let ((tbl (make-hash-table :test 'equal)))
+    (dolist (s specs)
+      (puthash (cons (nth 0 s) (nth 1 s)) (nth 2 s) tbl))
+    tbl))
+
 (defun nl-llm-bonsai-bw-make (sess &optional loras apply-fn wt-fn)
   "A backward context over SESS.
-LORAS is a plist of ROLE -> adapter for the layer being trained, or nil for a
-frozen one.  APPLY-FN and WT-FN stand in for the CPU when a GPU path is in
-scope; they are called with (LIN X BASE) and (LIN G)."
+LORAS is a `nl-llm-bonsai-bw-loras' table, or nil for a frozen model.
+APPLY-FN and WT-FN stand in for the CPU when a GPU path is in scope; they are
+called with (LIN X BASE) and (LIN G)."
   (list :sess sess :cfg (plist-get sess :cfg) :loras loras
         :apply-fn apply-fn :wt-fn wt-fn
-        :grads (make-hash-table :test 'eq)))
+        :grads (make-hash-table :test 'equal)))
+
+(defun nl-llm-bonsai-bw--lora (bc role)
+  (let ((tbl (plist-get bc :loras)))
+    (and tbl (gethash (cons (plist-get bc :layer) role) tbl))))
 
 (defun nl-llm-bonsai-bw-grads (bc)
-  "The accumulated adapter gradients, as a plist of ROLE -> (:da V :db V)."
+  "The accumulated adapter gradients, as an alist of (LAYER . ROLE) -> plist."
   (let (out)
-    (maphash (lambda (role g) (setq out (plist-put out role g)))
-             (plist-get bc :grads))
+    (maphash (lambda (key g) (push (cons key g) out)) (plist-get bc :grads))
     out))
+
+(defun nl-llm-bonsai-bw-grad (bc layer role)
+  "The accumulated (:da V :db V) for LAYER's ROLE, or nil."
+  (gethash (cons layer role) (plist-get bc :grads)))
 
 (defun nl-llm-bonsai-bw--rotate (sess v n back)
   "Rotate V (N long) in place, or pull a gradient BACK through the rotation.
@@ -69,7 +89,7 @@ Orthogonal, so the pullback is the inverse and costs the same as the forward."
   "Apply LIN at ROLE to X at BASE; return (Y . SAVED).
 SAVED is nil unless the role has an adapter, in which case it carries the
 rank-long A.x and the input slice the backward needs."
-  (let ((lora (plist-get (plist-get bc :loras) role)))
+  (let ((lora (nl-llm-bonsai-bw--lora bc role)))
     (if (null lora)
         (cons (nl-llm-bonsai-bw--apply bc lin x (or base 0)) nil)
       (let ((r (nl-llm-wlora-forward lin lora x (or base 0)
@@ -81,7 +101,7 @@ rank-long A.x and the input slice the backward needs."
   "Pull G back through LIN at ROLE; return the input gradient.
 An adapter's own gradients are accumulated on BC rather than returned, so a
 caller that only wants to propagate does not have to thread them."
-  (let ((lora (plist-get (plist-get bc :loras) role)))
+  (let ((lora (nl-llm-bonsai-bw--lora bc role)))
     (if (null lora)
         (nl-llm-bonsai-bw--transpose bc lin g)
       (let ((r (nl-llm-wlora-backward lin lora (plist-get saved :xs)
@@ -89,9 +109,10 @@ caller that only wants to propagate does not have to thread them."
                                       (lambda (l gg)
                                         (nl-llm-bonsai-bw--transpose bc l gg)))))
         (let* ((tbl (plist-get bc :grads))
-               (old (gethash role tbl)))
+               (key (cons (plist-get bc :layer) role))
+               (old (gethash key tbl)))
           (if (null old)
-              (puthash role (list :da (plist-get r :da) :db (plist-get r :db)) tbl)
+              (puthash key (list :da (plist-get r :da) :db (plist-get r :db)) tbl)
             (let ((da (plist-get old :da)) (db (plist-get old :db))
                   (nda (plist-get r :da)) (ndb (plist-get r :db)))
               (dotimes (i (length da)) (aset da i (+ (aref da i) (aref nda i))))

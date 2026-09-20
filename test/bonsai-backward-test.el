@@ -121,11 +121,11 @@ complaint when it does not, so a line never reads as its own opposite."
         ;; perturb it so the check has something to measure
         (dotimes (i (length bdata))
           (aset bdata i (* 0.05 (aref (bbt--rand (length bdata) 4242) i))))
-        (let* ((loras (list role lora))
+        (let* ((loras (nl-llm-bonsai-bw-loras (list ly role lora)))
                (bc (nl-llm-bonsai-bw-make sess loras))
                (fw (nl-llm-bonsai-bw-block-forward bc ly (copy-sequence x) seq))
                (_ (nl-llm-bonsai-bw-block-backward bc (nth 1 fw) w seq))
-               (g (plist-get (nl-llm-bonsai-bw-grads bc) role))
+               (g (nl-llm-bonsai-bw-grad bc ly role))
                (h 1.0e-4) (worst 0.0) (kind ""))
           (dolist (slot '(:a :b))
             (let* ((data (photon-tensor-data (plist-get lora slot)))
