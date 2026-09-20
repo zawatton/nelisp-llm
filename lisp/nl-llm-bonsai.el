@@ -37,6 +37,16 @@ Qwen3-0.6B donor.  The largest single improvement found, and invisible in
 every norm -- the gains are near 1, so double-applying them is a mild
 distortion that only compounds over sixty-four blocks.")
 
+(defun nl-llm-bonsai--gate (z)
+  "The attention block\='s output gate: a sigmoid, not a SiLU.
+
+Qwen3-Next gates its attention output with `sigmoid\=' and its Gated DeltaNet
+norm with `silu\='; the two are easy to interchange and the shapes do not
+object.  SiLU is negative below zero and unbounded above it, so using it here
+does not gate the context, it distorts it.  Measured on 86 tokens of prose:
+9.42 nats with the sigmoid against 12.68 with the SiLU, where chance is 12.42."
+  (/ 1.0 (+ 1.0 (exp (- z)))))
+
 (defun nl-llm-bonsai--gain (wts role layer n)
   "The gain vector for ROLE at LAYER, or ones when it is folded into the weights."
   (if nl-llm-bonsai-folded-gains
@@ -305,7 +315,7 @@ rotary does and what rotating the whole head would silently not do."
         (let ((g (make-vector qdim 0.0)))
           (dotimes (i qdim)
             (aset g i (* (aref ctx (+ (* tt qdim) i))
-                         (nl-llm-dn--silu (aref gate (+ (* tt qdim) i))))))
+                         (nl-llm-bonsai--gate (aref gate (+ (* tt qdim) i))))))
           (nl-llm-bonsai-rotate sess g qdim)
           (let ((o (nl-llm-bonsai--apply wo g 0)))
             (dotimes (i dim)
