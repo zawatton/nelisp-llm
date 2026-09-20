@@ -156,7 +156,7 @@ def run(m, ids, invert, gate_first, qkv_order, verbose=False,
         sequency=False, sign_order=None, decay_after_read=False,
         qscale="pre", gnorm_eps=None, gain_after_rot=False,
         no_hh_rot=False, no_out_rot=False, conv_reverse=False,
-        head_minor=False, conv_act="all"):
+        head_minor=False, conv_act="all", no_l2norm=False):
     kv = m.kv
     dim = kv["qwen35.embedding_length"]
     nblk = kv["qwen35.block_count"]
@@ -320,21 +320,23 @@ def run(m, ids, invert, gate_first, qkv_order, verbose=False,
             # is then a systematic per-block error, which is exactly the shape
             # of the depth curve.
             sc = 1.0 / math.sqrt(sd)
+            l2 = (lambda z: z) if no_l2norm else l2n
+
             def split0(a, nh):
                 return (a.reshape(seq, sd, nh).transpose(0, 2, 1) if head_minor
                         else a.reshape(seq, nh, sd))
             if qscale == "pre":
-                qh = l2n(split0(qc, nk) * sc)
-                kh = l2n(split0(kc, nk) * sc)
+                qh = l2(split0(qc, nk) * sc)
+                kh = l2(split0(kc, nk) * sc)
             elif qscale == "post-q":
-                qh = l2n(split0(qc, nk)) * sc
-                kh = l2n(split0(kc, nk))
+                qh = l2(split0(qc, nk)) * sc
+                kh = l2(split0(kc, nk))
             elif qscale == "post-both":
-                qh = l2n(split0(qc, nk)) * sc
-                kh = l2n(split0(kc, nk)) * sc
+                qh = l2(split0(qc, nk)) * sc
+                kh = l2(split0(kc, nk)) * sc
             else:
-                qh = l2n(split0(qc, nk))
-                kh = l2n(split0(kc, nk))
+                qh = l2(split0(qc, nk))
+                kh = l2(split0(kc, nk))
             # Whether a projection's output runs [head][dim] or [dim][head]
             # is a reshape either way and a different model.
             def split(a, nh):
@@ -438,6 +440,8 @@ def main():
                     help="rotate the normalised value, then apply the gain")
     ap.add_argument("--conv-reverse", action="store_true")
     ap.add_argument("--conv-act", default="all", choices=("all", "v", "none"))
+    ap.add_argument("--no-l2norm", action="store_true",
+                    help="feed the recurrence unnormalised q and k")
     ap.add_argument("--head-minor", action="store_true",
                     help="q/k/v/z run [dim][head] rather than [head][dim]")
     ap.add_argument("--no-out-rot", action="store_true",
@@ -503,7 +507,8 @@ def main():
                  decay_after_read=args.decay_after_read,
                  gain_after_rot=args.gain_after_rot, no_hh_rot=args.no_hh_rot,
                  no_out_rot=args.no_out_rot, conv_reverse=args.conv_reverse,
-                 head_minor=args.head_minor, conv_act=args.conv_act)
+                 head_minor=args.head_minor, conv_act=args.conv_act,
+                 no_l2norm=args.no_l2norm)
         if args.score:
             print("  %s  ->  cross entropy %.4f nats  (chance %.2f)"
                   % (label, lg, math.log(len(vocab) if vocab else 248320)),
