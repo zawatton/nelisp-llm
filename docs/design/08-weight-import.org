@@ -1238,11 +1238,53 @@ character at channel 4096 and nowhere else), q/k/v/z as [head][dim], key heads
 shared by =repeat_interleave=, =ssm_alpha= as the decay, the convolution's
 activation over all channels, and the gate before the gated norm.
 
+** The measurement, and what validates it
+Cross entropy of ordinary prose, with a positive control: the donor this
+project already imports, run through the same tokenise -> forward ->
+cross-entropy code, scores 3.115 nats on 86 tokens (chance 11.93), median rank
+of the true token 3 of 151936, top-1 30.6%.  That is what working looks like,
+and it establishes that the scorer is sound.  Bonsai sits at 11.2 nats.
+
+Two methodological corrections came out of building it, both of which had been
+producing false signals:
+
+- A 21-token repetitive passage is far too short.  Differences of 10x in a
+  token's rank on it -- which is how the embedding transform and the attention
+  gate looked -- shrink to 0.2 nats on 147 tokens of prose, where every
+  configuration sits between 10.9 and 11.2.  Those sweeps were ranking noise.
+- =tools/bonsai-tokenizer.py='s greedy longest match is not the model's BPE.
+  It splits "eighteenth" as "eighteen|th" where the real merges give
+  "eight|eenth".  =tools/bonsai-bpe.py= implements the file's own merges.
+  Correcting it moved the score by 0.06 nats, so it was not the problem -- but
+  it was a real confound against a control that used the donor's real
+  tokenizer.
+
+A third instrument was killed by its own null.  The rotation mixes a weight's
+input axis, so undoing it should restore structure to the column norms; the
+inverse transform appeared to restore twice as much as the forward one across
+six tensors.  Substituting a DIFFERENT random sign vector -- as orthogonal as
+the real one, and unable to un-rotate anything -- reproduces the same numbers
+to three decimal places.  The effect is mechanical, not evidence.
+
 ** Where to look next
+The forward reads every one of the file's 851 tensors, =general.basename= is
+"folded" so the rotation is in the weights as assumed, the file is structurally
+sound (64 distinct blocks, all finite, the data region ending exactly at the
+file size), and the weights are ternary per 128-element block.  What is wrong
+is an order or a convention, not a part and not the file's integrity.
+
 Inside the Gated DeltaNet block, after eliminating the gate's side of the
 norm, the decay's side of the memory read, the query scale's side of the L2
 norm, the L2 norm itself, the alpha/beta assignment, the convolution's tap
 order and activation scope, the head-axis layout, the key-head sharing
 pattern, the 6144 rotation's block size, and whether =ssm_out= wants a rotated
-input.  Screen at 4 and 16 blocks rather than 64: it turns a five-minute
+input, whether =ssm_a= holds A or A_log, and whether =ssm_alpha=/=ssm_beta=
+want the rotated activation.  In the attention block: the gate's activation
+(sigmoid against silu), the gate's half, a per-head rather than flat split of
+=attn_q=, the rotary's pairing, and the key-head sharing pattern.  Shared: the
+embedding's transform, the head's transform, an embedding scale of
+sqrt(d_model), and the feed-forward's gate/up assignment.  None of them moves
+the score by more than 0.3 nats on a passage long enough to measure.
+
+Screen at 4 and 16 blocks rather than 64: it turns a five-minute
 question into a thirty-second one, and the depth trend is visible by block 15.
