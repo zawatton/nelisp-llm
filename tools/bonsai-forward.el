@@ -57,7 +57,7 @@ what comes out reads as a continuation of what went in."
   (let* ((path (bf--getenv "NL_BONSAI_WTS" "build/bonsai/wts-full.bin"))
          (invert (and (getenv "NL_BONSAI_INVERT")
                       (> (length (getenv "NL_BONSAI_INVERT")) 0)))
-         (sess (nl-llm-bonsai-open path))
+         (sess (nl-llm-bonsai-open path invert))
          (cfg (plist-get sess :cfg))
          (dim (plist-get cfg :dim))
          (nlayers (plist-get cfg :layers))
@@ -73,7 +73,7 @@ what comes out reads as a continuation of what went in."
          (i 0) (t-start (float-time)) (t-up 0.0) (t-run 0.0))
     (when (and (> cap 0) (< cap nlayers)) (setq nlayers cap))
     (dolist (tk ids)
-      (let ((e (nl-llm-weights-embed wts tk)))
+      (let ((e (nl-llm-bonsai-embed sess tk)))
         (dotimes (j dim) (aset x (+ (* i dim) j) (aref e j))))
       (setq i (1+ i)))
     (message "  prompt         %s"
@@ -85,10 +85,7 @@ what comes out reads as a continuation of what went in."
     (nelisp-gpu-server-start)
     (unwind-protect
         (progn
-          (cl-letf (((symbol-function 'nl-llm-bonsai-rotate)
-                     (lambda (s v n &optional _i)
-                       (nl-llm-had-rotate v n (plist-get (plist-get s :signs) n)
-                                          invert))))
+          (progn
             (dotimes (ly nlayers)
               (let* ((lins (nl-llm-bonsai-linears sess ly))
                      (tbl (make-hash-table :test 'eq))

@@ -217,6 +217,8 @@ matrix; everything between them is `nl-llm-deltanet.el'."
   "Rotate the first RDIMS of the HD-long block at BASE, half-split, in place.
 The remaining HD - RDIMS dimensions pass through, which is what a partial
 rotary does and what rotating the whole head would silently not do."
+  (unless (<= rdims hd)
+    (error "nl-llm-bonsai: rotary covers %d of a %d-wide head" rdims hd))
   (let* ((half (/ rdims 2)) (orig (make-vector rdims 0.0)))
     (dotimes (i rdims) (aset orig i (aref vec (+ base i))))
     (dotimes (i half)
@@ -305,6 +307,25 @@ rotary does and what rotating the whole head would silently not do."
     (if (= (mod layer iv) (1- iv))
         (nl-llm-bonsai-attn-block sess layer x seq)
       (nl-llm-bonsai-deltanet-block sess layer x seq))))
+
+(defun nl-llm-bonsai-embed (sess token)
+  "TOKEN's embedding, in the basis the rest of the model works in.
+
+`token_embd.weight' is the one tensor the file lists under
+`prism.hadamard.inverse_weight_names'; the other 401 are under
+`weight_names'.  The asymmetry is what makes one runtime operation correct
+everywhere: a consuming projection was folded as W' = W.A\=' so that W'.(A.x)
+is W.x, while the embedding was folded as E' = E.A so that applying the same
+A to a stored row returns the true one.  So the rotation the blocks apply to
+every normalised activation is applied here too, once, and the residual stream
+is then in the unrotated basis the RMSNorm gains expect.
+
+Leaving it out costs nothing visible: the transform is orthogonal, so the
+embedding has the right norm either way and the stack runs to completion and
+produces a token.  It is simply the wrong token, from the first block on."
+  (nl-llm-bonsai-rotate
+   sess (nl-llm-weights-embed (plist-get sess :wts) token)
+   (plist-get (plist-get sess :cfg) :dim)))
 
 (defun nl-llm-bonsai-head (sess)
   "The output projection, loaded once and cached on SESS.

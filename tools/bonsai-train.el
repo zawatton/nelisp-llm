@@ -79,7 +79,7 @@
                (bt--load path (* seq dim)))
       (let ((x (make-vector (* seq dim) 0.0)) (i 0) (t0 (float-time)))
         (dolist (tk ids)
-          (let ((e (nl-llm-weights-embed wts tk)))
+          (let ((e (nl-llm-bonsai-embed sess tk)))
             (dotimes (j dim) (aset x (+ (* i dim) j) (aref e j))))
           (setq i (1+ i)))
         (dotimes (ly boundary)
