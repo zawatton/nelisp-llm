@@ -106,6 +106,12 @@ what comes out reads as a continuation of what went in."
                            ly (bf--rms x) (bf--rms x (* (1- seq) dim) dim)
                            (- t1 t0) (- (float-time) t1)))))
 
+            (let ((dump (getenv "NL_BONSAI_DUMP")))
+              (when (and dump (> (length dump) 0))
+                (let ((coding-system-for-write 'binary))
+                  (write-region (nelisp-gpu--floats-bytes (list x)) nil dump
+                                nil 'silent))
+                (message "  dumped %s (%d floats)" dump (length x))))
             ;; The head, rotated like every other rotated projection.
             (let* ((t0 (float-time))
                    (head (nl-llm-bonsai-head sess))
