@@ -1361,6 +1361,53 @@ Targets: =make test-donor-forward= (two minutes, asserts 4.0 nats) and =make
 donor-lora-demo=.  Assuming the donor's gains are folded when they are not
 takes the first from 2.56 to 11.90 against a chance of 11.93.
 
+** Native ternary (2026-09-21)
+Every 2-D weight in the file is ternary inside each 128-element block -- a
+single magnitude plus zero, in 100% of blocks across all 23 tensor names,
+53.74 GB of the file's 53.81.  Only =ssm_alpha=, =ssm_beta= (0.02 GB each) and
+the 1-D norms are not, and those fall back to int8 and f32.  So the per-row
+int8 export was requantizing something that did not need it.
+
+=ternary2=: sixteen two-bit fields per little-endian uint32 -- 00 = 0,
+01 = +1, 11 = -1, two's complement in two bits so a kernel sign-extends with
+an arithmetic shift -- and one f32 scale per 128-column block.  The scale
+granularity is a property of the tensor (=:block=), so one loop in
+=nl-llm-weights-apply= serves both a scale per row and a scale per 128
+columns.
+
+The whole model: 7.59 GB against 26.92 GB, 851 tensors (402 ternary, 353 f32,
+96 int8), and all 402 ternary tensors bit-identical to the GGUF they came
+from, where the int8 export was 0.0039 relative away from it.
+
+On the device, against the int8 path on the same two blocks:
+
+| measure            | ternary | int8    |
+|--------------------+---------+---------|
+| table size         | 0.93 GB | 3.70 GB |
+| upload a block     |   0.21s |   0.35s |
+| upload the head    |   0.85s |   1.25s |
+| compute a block    |   14.2s |   16.2s |
+| compute the head   |    4.9s |    7.7s |
+
+Better on every axis, which is not the usual shape of a size win.  The
+compute is faster because the kernel reads a quarter of the bytes, and it is
+also more accurate: a ternary weight is an add or a subtract, so there is
+nothing for DP4A to accelerate and the activation stays float instead of
+being quantized to int8 -- which removes the last lossy step in this path.
+
+Two eager decodes had to go, and the measurement found both.  The scales went
+up through =nelisp-gpu--floats-bytes=, one float at a time in Elisp; at 48
+times as many scales as the int8 path they took ten times longer to upload
+than the weights (11.3s a block against 1.1s).  And =nl-llm-weights-linear=
+decoded them at load -- 9.9 million floats and twelve seconds for the head,
+for a path that never looks at them in Emacs.  Both now go the way the
+payload does.
+
+Targets: =make ternary-export= (a two-layer table and its fixture),
+=make test-ternary= (16 checks, exactness held to EXACT rather than a
+tolerance), =make test-ternary-gpu= (5), and =make ternary-kernel= in
+nelisp-gpu (6).
+
 ** Where to look next
 The forward reads every one of the file's 851 tensors, =general.basename= is
 "folded" so the rotation is in the weights as assumed, the file is structurally
