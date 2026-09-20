@@ -203,6 +203,62 @@ complaint when it does not, so a line never reads as its own opposite."
         (bbt-check "head: earlier positions get no gradient" (= leak 0.0)
                    "worst |dX| before the read position %.3e" leak)))
 
+    ;; --- the same gradients on the donor's real weights ---------------
+    ;;
+    ;; The synthetic model has the right shapes and arbitrary numbers in them.
+    ;; The donor has numbers a real training run produced, is checked layer by
+    ;; layer against tools/qwen-forward-ref.py, and exercises the branches the
+    ;; synthetic one cannot: gains applied rather than folded, no rotation, an
+    ;; ungated attn_q, a tied head, and a rotary over the whole head.
+    (let ((donor "build/donor/qwen3-0.6b/weights.bin"))
+      (if (not (file-readable-p donor))
+          (message "%-52s ----  no donor at %s" "donor gradients" donor)
+        (let* ((ds (nl-llm-bonsai-open donor))
+               (dcfg (plist-get ds :cfg))
+               (ddim (plist-get dcfg :dim))
+               (dseq 4)
+               (dx (bbt--rand (* dseq ddim) 4242))
+               (dw (bbt--rand (* dseq ddim) 31)))
+          (bbt-check "donor: no rotation, gains applied, ungated q"
+                     (and (null (plist-get ds :rotate))
+                          (null (plist-get ds :folded))
+                          (plist-get dcfg :tied-head))
+                     "rotate %S folded %S tied %S"
+                     (plist-get ds :rotate) (plist-get ds :folded)
+                     (plist-get dcfg :tied-head))
+          (dotimes (ly 2)
+            (let* ((bc (nl-llm-bonsai-bw-make ds))
+                   (plain (nl-llm-bonsai-block ds ly (copy-sequence dx) dseq))
+                   (taped (nth 0 (nl-llm-bonsai-bw-block-forward
+                                  bc ly (copy-sequence dx) dseq)))
+                   (worst 0.0))
+              (dotimes (i (length plain))
+                (setq worst (max worst (abs (- (aref plain i) (aref taped i))))))
+              (bbt-check (format "donor layer %d: taped == plain" ly)
+                         (= worst 0.0) "worst |difference| %.3e" worst)))
+          (dotimes (ly 2)
+            (let* ((bc (nl-llm-bonsai-bw-make ds))
+                   (fw (nl-llm-bonsai-bw-block-forward bc ly (copy-sequence dx) dseq))
+                   (grad (nl-llm-bonsai-bw-block-backward bc (nth 1 fw) dw dseq))
+                   (h 1.0e-4) (worst 0.0) (at -1))
+              (dolist (j (list 0 7 (1- ddim) ddim (+ (* 2 ddim) 13)
+                               (+ (* 3 ddim) ddim -1)))
+                (let ((xp (copy-sequence dx)) (xm (copy-sequence dx)))
+                  (aset xp j (+ (aref dx j) h))
+                  (aset xm j (- (aref dx j) h))
+                  (let* ((lp (bbt--dot (nth 0 (nl-llm-bonsai-bw-block-forward
+                                               (nl-llm-bonsai-bw-make ds) ly xp dseq))
+                                       dw))
+                         (lm (bbt--dot (nth 0 (nl-llm-bonsai-bw-block-forward
+                                               (nl-llm-bonsai-bw-make ds) ly xm dseq))
+                                       dw))
+                         (num (/ (- lp lm) (* 2.0 h)))
+                         (rel (/ (abs (- num (aref grad j)))
+                                 (max 1.0e-8 (abs num) (abs (aref grad j))))))
+                    (when (> rel worst) (setq worst rel at j)))))
+              (bbt-check (format "donor layer %d: dX matches finite differences" ly)
+                         (< worst 5.0e-4) "worst rel %.3e at %d" worst at))))))
+
     (message "bonsai-backward: %d passed, %d failed" bbt-pass bbt-fail)
     (when (> bbt-fail 0) (kill-emacs 1))))
 

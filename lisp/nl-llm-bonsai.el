@@ -306,7 +306,7 @@ rotary does and what rotating the whole head would silently not do."
          (wv (plist-get lins :wv)) (wo (plist-get lins :wo))
          (wg (plist-get lins :wg)) (wu (plist-get lins :wu))
          (wd (plist-get lins :wd))
-         (gated (nl-llm-bonsai--gated-q-p lins cfg))
+         (has-gate (nl-llm-bonsai--gated-q-p lins cfg))
          (q (make-vector (* seq qdim) 0.0)) (k (make-vector (* seq kvdim) 0.0))
          (v (make-vector (* seq kvdim) 0.0)) (gate (make-vector (* seq qdim) 0.0))
          (out (make-vector (* seq dim) 0.0)))
@@ -320,7 +320,7 @@ rotary does and what rotating the whole head would silently not do."
           ;; when the model has an output gate at all
           (dotimes (i qdim)
             (aset q (+ (* tt qdim) i) (aref yq i))
-            (when gated
+            (when has-gate
               (aset gate (+ (* tt qdim) i) (aref yq (+ qdim i)))))
           (dotimes (i kvdim)
             (aset k (+ (* tt kvdim) i) (aref yk i))
@@ -340,7 +340,7 @@ rotary does and what rotating the whole head would silently not do."
       (dotimes (tt seq)
         (let ((g (make-vector qdim 0.0)))
           (dotimes (i qdim)
-            (aset g i (if gated
+            (aset g i (if has-gate
                           (* (aref ctx (+ (* tt qdim) i))
                              (nl-llm-bonsai--gate (aref gate (+ (* tt qdim) i))))
                         (aref ctx (+ (* tt qdim) i)))))

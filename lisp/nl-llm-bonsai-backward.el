@@ -66,14 +66,12 @@ called with (LIN X BASE) and (LIN G)."
   "The accumulated (:da V :db V) for LAYER's ROLE, or nil."
   (gethash (cons layer role) (plist-get bc :grads)))
 
-(defun nl-llm-bonsai-bw--rotate (sess v n back)
-  "Rotate V (N long) in place, or pull a gradient BACK through the rotation.
-Orthogonal, so the pullback is the inverse and costs the same as the forward."
-  (let ((s (plist-get (plist-get sess :signs) n))
-        (nl-llm-had-block (or (plist-get sess :block) nl-llm-had-block))
-        (inv (plist-get sess :invert)))
-    (unless s (error "nl-llm-bonsai-bw: no signs for width %d" n))
-    (nl-llm-had-rotate v n s (if back (not inv) inv))))
+(defalias 'nl-llm-bonsai-bw--rotate 'nl-llm-bonsai-rotate
+  "The forward\='s rotation, which already takes the BACK flag.
+
+This was a second copy of it, and the copy did not learn that a model
+declaring no `:hadamard-widths' has no rotation -- so the first model without
+one failed here and nowhere else.  One definition cannot drift from itself.")
 
 (defun nl-llm-bonsai-bw--apply (bc lin x base)
   (if (plist-get bc :apply-fn)
@@ -412,7 +410,7 @@ Returns (OUT TAPE)."
          (lins (nl-llm-bonsai-linears sess layer))
          (wq (plist-get lins :wq)) (wk (plist-get lins :wk))
          (wv (plist-get lins :wv)) (wo (plist-get lins :wo))
-         (gated (nl-llm-bonsai--gated-q-p lins cfg))
+         (has-gate (nl-llm-bonsai--gated-q-p lins cfg))
          (q (make-vector (* seq qdim) 0.0)) (k (make-vector (* seq kvdim) 0.0))
          (v (make-vector (* seq kvdim) 0.0)) (gate (make-vector (* seq qdim) 0.0))
          (proj (make-vector seq nil))
@@ -426,7 +424,7 @@ Returns (OUT TAPE)."
         (aset proj tt (list :sq (cdr rq) :sk (cdr rk) :sv (cdr rv)))
         (dotimes (i qdim)
           (aset q (+ (* tt qdim) i) (aref (car rq) i))
-          (when gated
+          (when has-gate
             (aset gate (+ (* tt qdim) i) (aref (car rq) (+ qdim i)))))
         (dotimes (i kvdim)
           (aset k (+ (* tt kvdim) i) (aref (car rk) i))
@@ -446,7 +444,7 @@ Returns (OUT TAPE)."
         (dotimes (tt seq)
           (let ((g (make-vector qdim 0.0)))
             (dotimes (i qdim)
-              (aset g i (if gated
+              (aset g i (if has-gate
                             (* (aref ctx (+ (* tt qdim) i))
                                (nl-llm-bonsai--gate (aref gate (+ (* tt qdim) i))))
                           (aref ctx (+ (* tt qdim) i)))))
@@ -458,7 +456,8 @@ Returns (OUT TAPE)."
                       (+ (aref x (+ (* tt dim) i)) (aref (car ro) i)))))))
         (let ((ffn (nl-llm-bonsai-bw--ffn-forward bc out seq)))
           (list out
-                (list :kind :attn :layer layer :x x :ln1 ln1 :qn qn :kn kn :gated gated
+                (list :kind :attn :layer layer :x x :ln1 ln1 :qn qn :kn kn
+                      :has-gate has-gate
                       :q q :k k :v v :qpre qpre :kpre kpre :gate gate :ctx ctx
                       :proj proj :gated gated :ffn ffn)))))))
 
@@ -480,7 +479,7 @@ Returns (OUT TAPE)."
          (wv (plist-get lins :wv)) (wo (plist-get lins :wo))
          (x (plist-get tape :x)) (ln1 (plist-get tape :ln1))
          (ctx (plist-get tape :ctx)) (gate (plist-get tape :gate))
-         (gated (plist-get tape :gated))
+         (has-gate (plist-get tape :has-gate))
          (dmid (nl-llm-bonsai-bw--ffn-backward bc (plist-get tape :ffn) dout seq))
          (dx (copy-sequence dmid))
          (dctx (make-vector (* seq qdim) 0.0))
@@ -493,7 +492,7 @@ Returns (OUT TAPE)."
              (dgrot (nl-llm-bonsai-bw--bwd bc :wo wo (plist-get s :so) dt))
              (dg (nl-llm-bonsai-bw--rotate sess dgrot qdim t)))
         (dotimes (i qdim)
-          (if (not gated)
+          (if (not has-gate)
               (aset dctx (+ (* tt qdim) i) (aref dg i))
             (let* ((gi (aref gate (+ (* tt qdim) i)))
                    (ci (aref ctx (+ (* tt qdim) i)))
@@ -519,12 +518,12 @@ Returns (OUT TAPE)."
       ;; the three projections; the query's gradient carries the gate's half
       (dotimes (tt seq)
         (let* ((s (aref (plist-get tape :proj) tt))
-               (dyq (make-vector (if gated (* 2 qdim) qdim) 0.0))
+               (dyq (make-vector (if has-gate (* 2 qdim) qdim) 0.0))
                (dyk (make-vector kvdim 0.0))
                (dyv (make-vector kvdim 0.0)))
           (dotimes (i qdim)
             (aset dyq i (aref dq (+ (* tt qdim) i)))
-            (when gated
+            (when has-gate
               (aset dyq (+ qdim i) (aref dgate (+ (* tt qdim) i)))))
           (dotimes (i kvdim)
             (aset dyk i (aref dk (+ (* tt kvdim) i)))
