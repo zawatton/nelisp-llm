@@ -17,3 +17,4 @@ __pycache__/
 build/deltanet-fixture.json
 build/bonsai/
 build/bonsai-synth.bin
+build/ternary-fixture.eld

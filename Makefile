@@ -374,7 +374,7 @@ clean:
 .PHONY: qwen-tokenizer-table test-qwen-tokenizer ollama-provider test-head-dim
 .PHONY: qwen-weights-table verify-qwen-weights test-weights-header
 .PHONY: qwen-weights-rows test-weights-load test-rope-style
-.PHONY: qwen-forward-ref test-weights-forward test-weights-gpu lora-demo deltanet-fixture test-deltanet bonsai-synth test-bonsai-backward test-donor-forward donor-lora-demo
+.PHONY: qwen-forward-ref test-weights-forward test-weights-gpu lora-demo deltanet-fixture test-deltanet bonsai-synth test-bonsai-backward test-donor-forward donor-lora-demo ternary-export test-ternary
 
 # DONOR is a HuggingFace model directory holding config.json + tokenizer.json.
 # Everything under build/donor/ is donor-derived and gitignored.
@@ -513,6 +513,16 @@ donor-lora-demo:
 	NL_BONSAI_PROMPT="785 6722 315 9625 374" NL_BONSAI_TARGET=26194 \
 	NL_BONSAI_CONTROL="785 6722 315 15344 374" NL_BONSAI_CONTROL_TARGET=21718 \
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l tools/bonsai-train.el
+
+# The model's own ternary, kept rather than requantized.  --layers 2 is
+# enough to cover every tensor kind and costs a minute; the full table is
+# `tools/bonsai-export.py' without it.
+ternary-export:
+	python3 tools/bonsai-export.py build/bonsai/f16.gguf build/bonsai/wts-t2.bin --layers 2
+	python3 tools/ternary-verify.py build/bonsai/wts-t2.bin build/bonsai/f16.gguf build/ternary-fixture.eld
+
+test-ternary:
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/ternary-test.el
 
 test-bonsai-backward: bonsai-synth
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/bonsai-backward-test.el

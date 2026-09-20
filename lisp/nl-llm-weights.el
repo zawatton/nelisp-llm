@@ -155,12 +155,16 @@ with `bitcast-u', so an uploader can hand them over without touching a float."
 
 ;;;###autoload
 (defun nl-llm-weights-scales (wts tn)
-  "Return TN's per-output-row scales from WTS as a float vector.
-Signals for an f32 tensor, which has no scales."
-  (unless (equal (plist-get tn :kind) "int8x4")
-    (error "nl-llm-weights: %s is %s, not int8x4"
+  "Return TN's scales from WTS as a float vector, row-major by block.
+One entry per output row for `int8x4\=', one per 128-column block of each row
+for `ternary2\='.  Signals for an f32 tensor, which has no scales."
+  (unless (member (plist-get tn :kind) '("int8x4" "ternary2"))
+    (error "nl-llm-weights: %s is %s, not a quantized matrix"
            (plist-get tn :name) (plist-get tn :kind)))
-  (let* ((rows (car (plist-get tn :shape)))
+  (let* ((shape (plist-get tn :shape))
+         (rows (* (car shape)
+                  (/ (+ (nth 1 shape) (nl-llm-weights-block tn) -1)
+                     (nl-llm-weights-block tn))))
          (beg (+ (nl-llm-weights-payload-at wts) (plist-get tn :scale-offset)))
          (raw (nl-llm-weights--slice (nl-llm-weights-path wts)
                                      beg (+ beg (* 4 rows))))
@@ -170,24 +174,42 @@ Signals for an f32 tensor, which has no scales."
     out))
 
 ;;;###autoload
+(defsubst nl-llm-weights--trit (raw i)
+  "The two-bit value at index I of RAW, sign-extended.
+Sixteen per uint32 is four per byte, so the byte is I/4 and the shift 2*(I%4).
+00 is zero, 01 is +1 and 11 is -1 -- two\='s complement in two bits, which is
+what lets a kernel sign-extend with an arithmetic shift."
+  (let ((v (logand (ash (aref raw (ash i -2)) (* -2 (logand i 3))) 3)))
+    (if (= v 3) -1 v)))
+
+;;;###autoload
 (defun nl-llm-weights-lanes (wts tn row)
-  "Return TN's ROW as its raw signed int8 lanes, a vector of COLS integers.
-The padding lanes that round a row up to a whole word are not returned."
-  (unless (equal (plist-get tn :kind) "int8x4")
-    (error "nl-llm-weights: %s is %s, not int8x4"
-           (plist-get tn :name) (plist-get tn :kind)))
-  (let* ((shape (plist-get tn :shape))
-         (rows (car shape)) (cols (nth 1 shape))
-         (words (plist-get tn :words)))
-    (unless (and (integerp row) (>= row 0) (< row rows))
-      (error "nl-llm-weights: row %S outside 0..%d" row (1- rows)))
-    (let* ((stride (* 4 words))
-           (beg (+ (car (nl-llm-weights--extent wts tn)) (* row stride)))
-           (raw (nl-llm-weights--slice (nl-llm-weights-path wts)
-                                       beg (+ beg stride)))
-           (out (make-vector cols 0)))
-      (dotimes (i cols) (aset out i (nl-llm-weights--i8 (aref raw i))))
-      out)))
+  "Return TN's ROW as its raw signed lanes, a vector of COLS integers.
+int8 for an `int8x4' tensor and -1/0/+1 for a `ternary2' one.  The padding
+lanes that round a row up to a whole word are not returned."
+  (let ((kind (plist-get tn :kind)))
+    (unless (member kind '("int8x4" "ternary2"))
+      (error "nl-llm-weights: %s is %s, not a quantized matrix"
+             (plist-get tn :name) kind))
+    (let* ((shape (plist-get tn :shape))
+           (rows (car shape)) (cols (nth 1 shape))
+           (words (plist-get tn :words)))
+      (unless (and (integerp row) (>= row 0) (< row rows))
+        (error "nl-llm-weights: row %S outside 0..%d" row (1- rows)))
+      (let* ((stride (* 4 words))
+             (beg (+ (car (nl-llm-weights--extent wts tn)) (* row stride)))
+             (raw (nl-llm-weights--slice (nl-llm-weights-path wts)
+                                         beg (+ beg stride)))
+             (out (make-vector cols 0)))
+        (if (equal kind "ternary2")
+            (dotimes (i cols) (aset out i (nl-llm-weights--trit raw i)))
+          (dotimes (i cols) (aset out i (nl-llm-weights--i8 (aref raw i)))))
+        out))))
+
+(defun nl-llm-weights-block (tn)
+  "How many columns share one scale in TN: COLS for int8x4, 128 for ternary2."
+  (or (plist-get tn :block)
+      (if (equal (plist-get tn :kind) "ternary2") 128 (nth 1 (plist-get tn :shape)))))
 
 ;;;###autoload
 (defun nl-llm-weights-row (wts tn row &optional scales)
@@ -206,10 +228,14 @@ returned as stored."
         (dotimes (i cols) (aset out i (nl-llm-weights--f32 raw (* 4 i))))
         out)
     (let* ((lanes (nl-llm-weights-lanes wts tn row))
-           (scale (aref (or scales (nl-llm-weights-scales wts tn)) row))
+           (sc (or scales (nl-llm-weights-scales wts tn)))
+           (bsize (nl-llm-weights-block tn))
            (n (length lanes))
+           (nb (/ (+ n bsize -1) bsize))
+           (base (* row nb))
            (out (make-vector n 0.0)))
-      (dotimes (i n) (aset out i (* (aref lanes i) scale)))
+      (dotimes (i n)
+        (aset out i (* (aref lanes i) (aref sc (+ base (/ i bsize))))))
       out)))
 
 ;;;###autoload
@@ -219,7 +245,7 @@ Only for the small unquantized tensors -- RMSNorm gains and the Qwen3
 q_norm/k_norm vectors.  An int8x4 tensor is refused: dequantizing one into boxed
 floats is the 14 GB mistake this file exists to avoid."
   (unless (equal (plist-get tn :kind) "f32")
-    (error "nl-llm-weights-f32-tensor: %s is int8x4; use `nl-llm-weights-row' \
+    (error "nl-llm-weights-f32-tensor: %s is quantized; use `nl-llm-weights-row' \
 or `nl-llm-weights-bytes'" (plist-get tn :name)))
   (require 'photon-tensor)
   (let* ((shape (plist-get tn :shape))
@@ -234,10 +260,12 @@ or `nl-llm-weights-bytes'" (plist-get tn :name)))
 ;;; --- linears, applied without dequantizing the weight --------------------
 
 (cl-defstruct (nl-llm-weights-lin (:constructor nl-llm-weights-lin--make))
-  payload  ; the tensor's packed int8 payload once read; nil until it is needed
+  payload  ; the tensor's packed payload once read; nil until it is needed
   path offset nbytes  ; where those bytes live, so a reader can go straight there
-  scales   ; per-output-row f32 scales
+  scales   ; f32 scales, row-major by block
   rows cols words
+  block    ; columns per scale: COLS for int8x4, 128 for ternary2
+  ternary  ; non-nil when the payload is two bits a weight rather than eight
   name)
 
 (defun nl-llm-weights-lin-bytes (lin)
@@ -264,7 +292,7 @@ instead of 12288 -- while staying bounded, which is the point of holding bytes
 rather than tensors."
   (let* ((tn (nl-llm-weights-tensor wts role layer))
          (shape (plist-get tn :shape)))
-    (unless (equal (plist-get tn :kind) "int8x4")
+    (unless (member (plist-get tn :kind) '("int8x4" "ternary2"))
       (error "nl-llm-weights-linear: %s is %s, not a quantized matrix"
              (plist-get tn :name) (plist-get tn :kind)))
     (nl-llm-weights-lin--make
@@ -274,6 +302,8 @@ rather than tensors."
      :scales (nl-llm-weights-scales wts tn)
      :rows (car shape) :cols (nth 1 shape)
      :words (plist-get tn :words)
+     :block (nl-llm-weights-block tn)
+     :ternary (equal (plist-get tn :kind) "ternary2")
      :name (plist-get tn :name))))
 
 ;;;###autoload
@@ -288,17 +318,32 @@ returned."
          (rows (nl-llm-weights-lin-rows lin))
          (cols (nl-llm-weights-lin-cols lin))
          (stride (* 4 (nl-llm-weights-lin-words lin)))
+         (tern (nl-llm-weights-lin-ternary lin))
+         (bsize (or (nl-llm-weights-lin-block lin) cols))
+         (nb (/ (+ cols bsize -1) bsize))
          (base (or xbase 0))
          (y (or out (make-vector rows 0.0)))
          (o 0))
     (while (< o rows)
-      (let ((p (* o stride)) (acc 0.0) (i 0))
+      (let ((p (* o stride)) (tot 0.0) (i 0) (blk 0))
         (while (< i cols)
-          (let ((byte (aref b (+ p i))))
-            (setq acc (+ acc (* (if (> byte 127) (- byte 256) byte)
-                                (aref x (+ base i))))))
-          (setq i (1+ i)))
-        (aset y o (* acc (aref scales o))))
+          (let ((end (min cols (+ i bsize))) (acc 0.0))
+            (if tern
+                (while (< i end)
+                  (let ((v (logand (ash (aref b (+ p (ash i -2)))
+                                        (* -2 (logand i 3)))
+                                   3)))
+                    (setq acc (+ acc (* (if (= v 3) -1 v)
+                                        (aref x (+ base i))))))
+                  (setq i (1+ i)))
+              (while (< i end)
+                (let ((byte (aref b (+ p i))))
+                  (setq acc (+ acc (* (if (> byte 127) (- byte 256) byte)
+                                      (aref x (+ base i))))))
+                (setq i (1+ i))))
+            (setq tot (+ tot (* acc (aref scales (+ (* o nb) blk)))))
+            (setq blk (1+ blk))))
+        (aset y o tot))
       (setq o (1+ o)))
     y))
 
@@ -319,6 +364,9 @@ identity <W.x, g> = <x, W^T.g>, which no index swap survives."
          (rows (nl-llm-weights-lin-rows lin))
          (cols (nl-llm-weights-lin-cols lin))
          (stride (* 4 (nl-llm-weights-lin-words lin)))
+         (tern (nl-llm-weights-lin-ternary lin))
+         (bsize (or (nl-llm-weights-lin-block lin) cols))
+         (nb (/ (+ cols bsize -1) bsize))
          (x (or out (make-vector cols 0.0)))
          (o 0))
     (unless (= (length g) rows)
@@ -326,14 +374,29 @@ identity <W.x, g> = <x, W^T.g>, which no index swap survives."
              (length g) rows))
     (dotimes (i cols) (aset x i 0.0))
     (while (< o rows)
-      (let ((s (* (aref scales o) (aref g o))))
-        (unless (= s 0.0)
-          (let ((p (* o stride)) (i 0))
+      (let ((go (aref g o)))
+        (unless (= go 0.0)
+          ;; the scale folds into the multiplier once per block rather than
+          ;; once per row, which is the only thing per-block scales change here
+          (let ((p (* o stride)) (i 0) (blk 0))
             (while (< i cols)
-              (let ((byte (aref b (+ p i))))
-                (aset x i (+ (aref x i)
-                             (* (if (> byte 127) (- byte 256) byte) s))))
-              (setq i (1+ i))))))
+              (let ((end (min cols (+ i bsize)))
+                    (s (* (aref scales (+ (* o nb) blk)) go)))
+                (if (= s 0.0)
+                    (setq i end)
+                  (if tern
+                      (while (< i end)
+                        (let ((v (logand (ash (aref b (+ p (ash i -2)))
+                                              (* -2 (logand i 3)))
+                                         3)))
+                          (aset x i (+ (aref x i) (* (if (= v 3) -1 v) s))))
+                        (setq i (1+ i)))
+                    (while (< i end)
+                      (let ((byte (aref b (+ p i))))
+                        (aset x i (+ (aref x i)
+                                     (* (if (> byte 127) (- byte 256) byte) s))))
+                      (setq i (1+ i)))))
+                (setq blk (1+ blk)))))))
       (setq o (1+ o)))
     x))
 
@@ -360,6 +423,7 @@ implementation to disagree with if either drifts."
                     (logand (max -127 (min 127 q)) 255)))))))
     (nl-llm-weights-lin--make
      :payload bytes :scales scales :rows rows :cols cols :words words
+     :block cols :ternary nil
      :name (or name "synthetic"))))
 
 ;;;###autoload

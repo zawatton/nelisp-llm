@@ -63,6 +63,54 @@ def quantize_rows(w):
     return q, scales
 
 
+TERNARY_BLOCK = 128
+
+
+def ternary_blocks(w, block=TERNARY_BLOCK):
+    """Split W into BLOCK-wide groups and return (trits, scales) or None.
+
+    Every projection in this model is already ternary inside each 128-element
+    group -- a single magnitude plus zero, in 100% of groups -- so the group's
+    absmax IS its scale and the values divide into it exactly.  Storing that
+    directly is both smaller than the per-row int8 requantization and lossless,
+    where the int8 path is merely near-lossless.  Returns None when the tensor
+    is not ternary, so the caller can fall back.
+    """
+    rows, cols = w.shape
+    if cols % block:
+        return None
+    g = w.reshape(rows, cols // block, block)
+    mag = np.abs(g)
+    scale = mag.max(axis=2)
+    nz = mag > 0
+    with np.errstate(invalid="ignore"):
+        lo = np.where(nz, mag, np.inf).min(axis=2)
+    ok = ~nz.any(axis=2) | np.isclose(scale, lo, rtol=1e-3)
+    if not ok.all():
+        return None
+    safe = np.where(scale > 0, scale, 1.0)
+    trits = np.rint(g / safe[:, :, None]).astype(np.int8)
+    if np.abs(trits).max() > 1:
+        return None
+    return trits.reshape(rows, cols), scale.astype(np.float32)
+
+
+def pack_ternary2(trits):
+    """Sixteen two-bit values per little-endian uint32; 00 = 0, 01 = +1, 11 = -1.
+
+    Two's complement in two bits, so a kernel sign-extends with an arithmetic
+    shift rather than a comparison.
+    """
+    rows, cols = trits.shape
+    words = (cols + 15) // 16
+    padded = np.zeros((rows, words * 16), dtype=np.int8)
+    padded[:, :cols] = trits
+    codes = (padded.astype(np.uint32) & 3).reshape(rows, words, 16)
+    shifts = (2 * np.arange(16, dtype=np.uint32))
+    packed = (codes << shifts).sum(axis=2, dtype=np.uint32)
+    return packed.astype("<u4").tobytes(), words
+
+
 def pack_int8x4(q):
     out, cols = q.shape
     ng = (cols + 3) // 4
@@ -110,6 +158,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("gguf")
     ap.add_argument("out")
+    ap.add_argument("--int8", action="store_true",
+                    help="requantize to per-row int8 instead of keeping the "
+                         "model's own ternary")
     ap.add_argument("--layers", type=int, default=None,
                     help="stop after this many blocks (for partial files)")
     args = ap.parse_args()
@@ -131,6 +182,21 @@ def main():
         nonlocal off, worst
         if quant:
             w = arr if arr.ndim == 2 else arr.reshape(1, -1)
+            tern = ternary_blocks(w) if not args.int8 else None
+            if tern is not None:
+                trits, sc = tern
+                blob, ng = pack_ternary2(trits)
+                payload = blob + sc.tobytes()
+                entries.append(dict(name="%s.%d" % (role, layer), role=role,
+                                    layer=layer, kind="ternary2",
+                                    shape=[int(w.shape[0]), int(w.shape[1])],
+                                    words=int(ng), block=TERNARY_BLOCK,
+                                    offset=off,
+                                    scale_offset=off + len(blob),
+                                    nbytes=len(payload)))
+                chunks.append(payload)
+                off += len(payload)
+                return
             q, sc = quantize_rows(w)
             blob, ng = pack_int8x4(q)
             deq = q.astype(np.float32) * sc[:, None]
@@ -142,7 +208,8 @@ def main():
             entries.append(dict(name="%s.%d" % (role, layer), role=role,
                                 layer=layer, kind="int8x4",
                                 shape=[int(w.shape[0]), int(w.shape[1])],
-                                words=int(ng), offset=off,
+                                words=int(ng), block=int(w.shape[1]),
+                                offset=off,
                                 scale_offset=off + len(blob),
                                 nbytes=len(payload)))
         else:
@@ -152,7 +219,7 @@ def main():
                      else [1, int(a.size)])
             entries.append(dict(name="%s.%d" % (role, layer), role=role,
                                 layer=layer, kind="f32", shape=shape,
-                                words=0, offset=off, scale_offset=off,
+                                words=0, block=0, offset=off, scale_offset=off,
                                 nbytes=len(payload)))
         chunks.append(payload)
         off += len(payload)
@@ -212,6 +279,10 @@ def main():
         for c in chunks:
             fh.write(c)
     total = os.path.getsize(args.out)
+    kinds = {}
+    for e in entries:
+        kinds[e["kind"]] = kinds.get(e["kind"], 0) + 1
+    print("  kinds: %s" % kinds)
     print("wrote %s: %d tensors, %.2f GB, header %d bytes"
           % (args.out, len(entries), total / 1e9, len(blob)))
     print("  worst per-tensor relative dequantization error: %.4f (%s)" % worst)
