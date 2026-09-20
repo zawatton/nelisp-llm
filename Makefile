@@ -374,7 +374,7 @@ clean:
 .PHONY: qwen-tokenizer-table test-qwen-tokenizer ollama-provider test-head-dim
 .PHONY: qwen-weights-table verify-qwen-weights test-weights-header
 .PHONY: qwen-weights-rows test-weights-load test-rope-style
-.PHONY: qwen-forward-ref test-weights-forward test-weights-gpu lora-demo deltanet-fixture test-deltanet bonsai-synth test-bonsai-backward test-donor-forward donor-lora-demo ternary-export test-ternary
+.PHONY: qwen-forward-ref test-weights-forward test-weights-gpu lora-demo deltanet-fixture test-deltanet bonsai-synth test-bonsai-backward test-donor-forward donor-lora-demo ternary-export test-ternary test-ternary-gpu
 
 # DONOR is a HuggingFace model directory holding config.json + tokenizer.json.
 # Everything under build/donor/ is donor-derived and gitignored.
@@ -523,6 +523,9 @@ ternary-export:
 
 test-ternary:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/ternary-test.el
+
+test-ternary-gpu:
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/ternary-gpu-test.el
 
 test-bonsai-backward: bonsai-synth
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/bonsai-backward-test.el

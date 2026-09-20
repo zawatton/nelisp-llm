@@ -68,7 +68,7 @@
   ;; Control: perturb one lane and the identity must break.
   (let* ((bytes (copy-sequence (nl-llm-weights-lin-bytes lin)))
          (bad (nl-llm-weights-lin--make
-               :payload bytes :scales (nl-llm-weights-lin-scales lin)
+               :payload bytes :scale-cache (nl-llm-weights-lin-scales lin)
                :rows rows :cols cols
                :words (nl-llm-weights-lin-words lin) :name "perturbed")))
     (aset bytes 3 (mod (+ (aref bytes 3) 40) 256))

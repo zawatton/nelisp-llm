@@ -43,7 +43,7 @@
 
 (defun tt-lin (bytes sc rows cols words bsize name)
   (nl-llm-weights-lin--make
-   :payload bytes :scales sc :rows rows :cols cols :words words
+   :payload bytes :scale-cache sc :rows rows :cols cols :words words
    :block bsize :ternary t :name name))
 
 (defun tt-fixture-rows ()

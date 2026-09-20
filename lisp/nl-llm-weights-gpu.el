@@ -93,6 +93,21 @@ The bytes go up exactly as they came off disk -- no float is built, and nothing
 is allocated per word."
   (nl-llm-wgpu--upload-payload lin))
 
+(defun nl-llm-wgpu--upload-scales (lin)
+  "Put LIN\='s scales on the GPU, from the file when the file has them.
+
+A per-row int8 weight has one scale a row; a ternary one has a scale every
+128 columns, which for the output head is 9.9 million floats.
+`nelisp-gpu--floats-bytes\=' encodes those one at a time in Elisp, so the
+scales -- 3% of the bytes -- took ten times longer to upload than the weights
+until they went the same way the weights do."
+  (if (nl-llm-weights-lin-scale-offset lin)
+      (nelisp-gpu-server-upload-file (nl-llm-weights-lin-path lin)
+                                     (nl-llm-weights-lin-scale-offset lin)
+                                     (nl-llm-weights-lin-scale-nbytes lin))
+    (nelisp-gpu-server-upload-bytes
+     (nelisp-gpu--floats-bytes (list (nl-llm-weights-lin-scales lin))))))
+
 (defun nl-llm-wgpu--upload-payload (lin)
   "Put LIN's packed lanes on the GPU without routing them through Emacs.
 The server reads the tensor's region of the weight file itself.  Sending the
@@ -121,8 +136,7 @@ step.  Uploading them once turns the dominant cost of both directions into
 nothing."
   (let ((rows (nl-llm-weights-lin-rows lin)))
     (list :w (nl-llm-wgpu--upload-payload lin)
-          :s (nelisp-gpu-server-upload-bytes
-              (nelisp-gpu--floats-bytes (list (nl-llm-weights-lin-scales lin))))
+          :s (nl-llm-wgpu--upload-scales lin)
           :b (nelisp-gpu-server-upload-bytes
               (nelisp-gpu--floats-bytes (list (make-vector rows 0.0))))
           :rows rows :words (nl-llm-weights-lin-words lin))))
@@ -132,10 +146,53 @@ nothing."
   (and (consp handle) (plist-member handle :w)))
 
 ;;;###autoload
+(defun nl-llm-wgpu--nblk (lin)
+  "How many scale blocks a row of LIN has."
+  (let ((cols (nl-llm-weights-lin-cols lin))
+        (bsize (or (nl-llm-weights-lin-block lin)
+                   (nl-llm-weights-lin-cols lin))))
+    (/ (+ cols bsize -1) bsize)))
+
+(defun nl-llm-wgpu--apply-ternary (lin handle x base bias)
+  "LIN applied on the GPU through `ternary-rows\='.
+
+The activation goes across as float rather than packed to int8.  A ternary
+weight is an add or a subtract, so there is nothing for DP4A to accelerate,
+and not packing removes the activation quantization -- which after the
+weights stop being requantized is the only lossy step left in this path."
+  (let* ((cols (nl-llm-weights-lin-cols lin))
+         (rows (nl-llm-weights-lin-rows lin))
+         (words (nl-llm-weights-lin-words lin))
+         (nblk (nl-llm-wgpu--nblk lin))
+         (res (nl-llm-wgpu--resident-p handle))
+         (slice (if (and (= (or base 0) 0) (= (length x) cols))
+                    x
+                  (let ((v (make-vector cols 0.0)))
+                    (dotimes (i cols) (aset v i (aref x (+ (or base 0) i))))
+                    v))))
+    (nth 0 (nelisp-gpu-server-run2
+            'ternary-rows
+            (list (cons 'in slice)
+                  (list 'res (if res (plist-get handle :w) handle)
+                        (* rows words))
+                  (if (and res (null bias))
+                      (list 'res (plist-get handle :b) rows)
+                    (cons 'in (or bias (make-vector rows 0.0))))
+                  (if res
+                      (list 'res (plist-get handle :s) (* rows nblk))
+                    (cons 'in (nl-llm-weights-lin-scales lin)))
+                  (cons 'out rows))
+            (list 1 rows cols nblk words)
+            (/ (+ rows 63) 64)))))
+
+;;;###autoload
 (defun nl-llm-wgpu-apply (lin handle x &optional base bias)
-  "Run LIN (resident at HANDLE) on X at BASE through `bitlinear-dp4a-rows'.
-BIAS defaults to zeros, which is what Qwen3's projections have.  Returns the
+  "Run LIN (resident at HANDLE) on X at BASE on the GPU.
+`ternary-rows\=' for a two-bit weight, `bitlinear-dp4a-rows\=' for an int8 one.
+BIAS defaults to zeros, which is what these projections have.  Returns the
 ROWS-long result as a float vector."
+  (if (nl-llm-weights-lin-ternary lin)
+      (nl-llm-wgpu--apply-ternary lin handle x base bias)
   (let* ((cols (nl-llm-weights-lin-cols lin))
          (rows (nl-llm-weights-lin-rows lin))
          (words (nl-llm-weights-lin-words lin))
@@ -158,7 +215,7 @@ ROWS-long result as a float vector."
                       (cons 'out rows))
                 (list 1 rows words)
                 (/ (+ rows 63) 64)))
-      (nelisp-gpu-server-free hact))))
+      (nelisp-gpu-server-free hact)))))
 
 ;;;###autoload
 (defun nl-llm-wgpu-apply-t (lin handle g)
@@ -177,17 +234,20 @@ comparison to go with it."
     (unless (= (length g) rows)
       (error "nl-llm-wgpu-apply-t: G is %d long, weight has %d rows"
              (length g) rows))
-    (let ((res (nl-llm-wgpu--resident-p handle)))
+    (let ((res (nl-llm-wgpu--resident-p handle))
+          (nblk (nl-llm-wgpu--nblk lin)))
       (nth 0 (nelisp-gpu-server-run2
-              'dp4a-rows-t
+              (if (nl-llm-weights-lin-ternary lin) 'ternary-rows-t 'dp4a-rows-t)
               (list (list 'res (if res (plist-get handle :w) handle)
                           (* rows words))
                     (if res
-                        (list 'res (plist-get handle :s) rows)
+                        (list 'res (plist-get handle :s) (* rows nblk))
                       (cons 'in (nl-llm-weights-lin-scales lin)))
                     (cons 'in g)
                     (cons 'out cols))
-              (list rows cols words 1)
+              (if (nl-llm-weights-lin-ternary lin)
+                  (list rows cols nblk words 1)
+                (list rows cols words 1))
               (/ (+ cols 63) 64))))))
 
 ;;;###autoload

@@ -262,11 +262,30 @@ or `nl-llm-weights-bytes'" (plist-get tn :name)))
 (cl-defstruct (nl-llm-weights-lin (:constructor nl-llm-weights-lin--make))
   payload  ; the tensor's packed payload once read; nil until it is needed
   path offset nbytes  ; where those bytes live, so a reader can go straight there
-  scales   ; f32 scales, row-major by block
+  scale-offset scale-nbytes  ; and where the scales live, for the same reason
+  scale-cache  ; f32 scales, row-major by block, once read
   rows cols words
   block    ; columns per scale: COLS for int8x4, 128 for ternary2
   ternary  ; non-nil when the payload is two bits a weight rather than eight
   name)
+
+(defun nl-llm-weights-lin-scales (lin)
+  "LIN\='s scales, read on demand and cached.
+
+A ternary head has a scale every 128 columns of 248320 rows -- 9.9 million
+floats, decoded one at a time in Elisp.  The GPU path never needs them in
+Emacs at all, since `nelisp-gpu-server-upload-file\=' reads the same bytes
+itself, so decoding them eagerly spent twelve seconds per head for nothing."
+  (or (nl-llm-weights-lin-scale-cache lin)
+      (setf (nl-llm-weights-lin-scale-cache lin)
+            (let* ((beg (nl-llm-weights-lin-scale-offset lin))
+                   (n (/ (nl-llm-weights-lin-scale-nbytes lin) 4))
+                   (raw (nl-llm-weights--slice
+                         (nl-llm-weights-lin-path lin) beg
+                         (+ beg (nl-llm-weights-lin-scale-nbytes lin))))
+                   (out (make-vector n 0.0)))
+              (dotimes (i n) (aset out i (nl-llm-weights--f32 raw (* 4 i))))
+              out))))
 
 (defun nl-llm-weights-lin-bytes (lin)
   "LIN's packed int8 payload as a unibyte string, read on demand and cached.
@@ -299,7 +318,12 @@ rather than tensors."
      :path (nl-llm-weights-path wts)
      :offset (car (nl-llm-weights--extent wts tn))
      :nbytes (plist-get tn :nbytes)
-     :scales (nl-llm-weights-scales wts tn)
+     :scale-offset (+ (nl-llm-weights-payload-at wts)
+                      (plist-get tn :scale-offset))
+     :scale-nbytes (* 4 (car shape)
+                      (/ (+ (nth 1 shape) (nl-llm-weights-block tn) -1)
+                         (nl-llm-weights-block tn)))
+
      :rows (car shape) :cols (nth 1 shape)
      :words (plist-get tn :words)
      :block (nl-llm-weights-block tn)
@@ -422,7 +446,7 @@ implementation to disagree with if either drifts."
               (aset bytes (+ (* o words 4) i)
                     (logand (max -127 (min 127 q)) 255)))))))
     (nl-llm-weights-lin--make
-     :payload bytes :scales scales :rows rows :cols cols :words words
+     :payload bytes :scale-cache scales :rows rows :cols cols :words words
      :block cols :ternary nil
      :name (or name "synthetic"))))
 
