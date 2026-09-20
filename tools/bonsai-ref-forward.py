@@ -27,6 +27,8 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gguf
 
+vocab_g = None
+
 
 _SEQ = {}
 
@@ -156,7 +158,11 @@ def run(m, ids, invert, gate_first, qkv_order, verbose=False,
         sequency=False, sign_order=None, decay_after_read=False,
         qscale="pre", gnorm_eps=None, gain_after_rot=False,
         no_hh_rot=False, no_out_rot=False, conv_reverse=False,
-        head_minor=False, conv_act="all", no_l2norm=False):
+        head_minor=False, conv_act="all", no_l2norm=False,
+        rot_ba=False, rope_interleaved=False, attn_kv_tile=False,
+        swap_gate_up=False, per_position=False, embed_invert=False,
+        no_attn_gate=False, attn_gate_silu=False,
+        gate_per_head=False, embed_scale=0.0, ssm_a_is_A=True):
     kv = m.kv
     dim = kv["qwen35.embedding_length"]
     nblk = kv["qwen35.block_count"]
@@ -191,11 +197,30 @@ def run(m, ids, invert, gate_first, qkv_order, verbose=False,
     #   none       the whole network lives in the rotated basis
     #   embed      the stream is rotated, entered once at the embedding
     rot = _rot if mode in ("act", "actplain") else ident
-    erot = _rot if mode in ("act", "embed") else ident
+    _erot = _rot
+    if embed_invert:
+        # `inverse_weight_names` holds token_embd alone.  Reading that as "the
+        # same transform the activations get" and reading it as "the other one"
+        # are both defensible from the name, and the embedding is where content
+        # enters the model -- so getting it wrong leaves position and syntax
+        # intact and scrambles every token identity.
+        _erot = Rot(kv["prism.hadamard.sign_widths"],
+                    kv["prism.hadamard.sign_values"],
+                    kv["prism.hadamard.block_size"], not invert,
+                    blocks=blocks, sequency=sequency, order=sign_order)
+    erot = _erot if mode in ("act", "embed") else ident
     hrot = ident if no_head_rot else rot
 
     emb = m.t("token_embd.weight")
     x = erot(emb[list(ids)].astype(np.float32))
+    if embed_scale:
+        # The stored embedding has rms 0.0129 while the first block's output
+        # has rms 0.89 -- a factor of 69, against sqrt(5120) = 71.6.  Models
+        # in the Gemma line multiply the embedding by sqrt(d_model) at the
+        # input for exactly this reason.  Without it the token's identity is
+        # 1.5% of the residual from the first block on, which is a model whose
+        # syntax works and whose content does not.
+        x = x * (embed_scale if embed_scale > 0 else math.sqrt(dim))
     lens_w = lens_n = None
     if curve:
         # The whole curve in one pass over the weights, because a pass is four
@@ -247,8 +272,15 @@ def run(m, ids, invert, gate_first, qkv_order, verbose=False,
             a = rot(rms(x, ln1, eps))
             yq = a @ m.t(p + "attn_q.weight").T
             # `attn_q` is twice as wide as the query: it carries the output
-            # gate alongside.  Which half is which is not written down.
-            if gate_first_half:
+            # gate alongside.  Two things about the split are not written
+            # down -- whether it is flat ([all q | all gate]) or per head
+            # ([q gate] within each head), and which side is the gate.
+            if gate_per_head:
+                yqh = yq.reshape(seq, heads, 2 * hdim)
+                lo, hi = yqh[:, :, :hdim], yqh[:, :, hdim:]
+                q = (hi if gate_first_half else lo).reshape(seq, heads * hdim)
+                gate = (lo if gate_first_half else hi).reshape(seq, heads * hdim)
+            elif gate_first_half:
                 gate, q = yq[:, :heads * hdim], yq[:, heads * hdim:]
             else:
                 q, gate = yq[:, :heads * hdim], yq[:, heads * hdim:]
@@ -263,12 +295,26 @@ def run(m, ids, invert, gate_first, qkv_order, verbose=False,
             th = pos * inv_f
             c, s = np.cos(th), np.sin(th)
             for t_ in (q, k):
-                a1 = t_[:, :, :half].copy()
-                a2 = t_[:, :, half:rdims].copy()
-                t_[:, :, :half] = a1 * c - a2 * s
-                t_[:, :, half:rdims] = a2 * c + a1 * s
-            kk = np.repeat(k, heads // kvh, axis=1)
-            vv = np.repeat(v.reshape(seq, kvh, hdim), heads // kvh, axis=1)
+                if rope_interleaved:
+                    # GPT-J order: the pair is (2i, 2i+1), adjacent.
+                    a1 = t_[:, :, 0:rdims:2].copy()
+                    a2 = t_[:, :, 1:rdims:2].copy()
+                    t_[:, :, 0:rdims:2] = a1 * c - a2 * s
+                    t_[:, :, 1:rdims:2] = a2 * c + a1 * s
+                else:
+                    # GPT-NeoX order: the pair is (i, i + rdims/2).
+                    a1 = t_[:, :, :half].copy()
+                    a2 = t_[:, :, half:rdims].copy()
+                    t_[:, :, :half] = a1 * c - a2 * s
+                    t_[:, :, half:rdims] = a2 * c + a1 * s
+            rep = heads // kvh
+            vr = v.reshape(seq, kvh, hdim)
+            if attn_kv_tile:
+                kk = np.tile(k, (1, rep, 1))
+                vv = np.tile(vr, (1, rep, 1))
+            else:
+                kk = np.repeat(k, rep, axis=1)
+                vv = np.repeat(vr, rep, axis=1)
             sc = 1.0 / math.sqrt(hdim)
             att = np.einsum("qhd,khd->hqk", q, kk) * sc
             mask = np.triu(np.full((seq, seq), -np.inf, dtype=np.float32), 1)
@@ -276,7 +322,16 @@ def run(m, ids, invert, gate_first, qkv_order, verbose=False,
             att = np.exp(att - att.max(axis=-1, keepdims=True))
             att = att / att.sum(axis=-1, keepdims=True)
             ctx = np.einsum("hqk,khd->qhd", att, vv).reshape(seq, heads * hdim)
-            g = ctx * silu(gate)
+            # Qwen3-Next's attention gates its output with a sigmoid; the
+            # GDN's RMSNormGated is the one that uses silu.  silu is negative
+            # below zero and unbounded above it, so using it here does not
+            # gate the context, it scrambles it.
+            if no_attn_gate:
+                g = ctx
+            elif attn_gate_silu:
+                g = ctx * silu(gate)
+            else:
+                g = ctx * (1.0 / (1.0 + np.exp(-gate)))
             # The 6144-wide rotation before the output projection is the one
             # thing both mixing halves do and the feed-forward never does --
             # and the feed-forward is the only half that improves with depth.
@@ -289,8 +344,16 @@ def run(m, ids, invert, gate_first, qkv_order, verbose=False,
             # `ssm_alpha` is read as the decay input (it meets dt_bias and
             # softplus) and `ssm_beta` as the write strength (it meets a
             # sigmoid).  The names suggest it; the file does not say it.
-            al = plain @ m.t(p + "ssm_alpha.weight").T
-            be = plain @ m.t(p + "ssm_beta.weight").T
+            # `ssm_alpha` and `ssm_beta` are the one pair of projections the
+            # rotation list leaves out -- and they are also the one pair that
+            # was never quantized.  If the list names what was incoherence-
+            # processed FOR QUANTIZATION, the transform may still have been
+            # folded into these, and they would want the rotated activation
+            # like everything else.  In the original model they are one matrix
+            # (`in_proj_ba`) reading the same input as `in_proj_qkvz`.
+            ba_in = a if rot_ba else plain
+            al = ba_in @ m.t(p + "ssm_alpha.weight").T
+            be = ba_in @ m.t(p + "ssm_beta.weight").T
             if swap_ab:
                 al, be = be, al
             cw = m.t(p + "ssm_conv1d.weight")          # (cd, kern)
@@ -345,7 +408,13 @@ def run(m, ids, invert, gate_first, qkv_order, verbose=False,
             vh = split(vc, nv)
             alog = m.t(p + "ssm_a")
             dtb = m.t(p + "ssm_dt.bias")
-            gt = np.exp(-np.exp(alog) * np.log1p(np.exp(al + dtb)))
+            # The tensor is named `ssm_a`, not `ssm_a_log`.  llama.cpp's
+            # Mamba conversion stores -exp(A_log) under that name, so the
+            # exponential has already been taken and taking it again gives
+            # exp(-60) = 1e-26, a decay of exactly 1.0 -- a gated delta rule
+            # that never forgets, in every block, at every position.
+            dt = np.log1p(np.exp(al + dtb))
+            gt = np.exp(alog * dt) if ssm_a_is_A else np.exp(-np.exp(alog) * dt)
             bt = 1.0 / (1.0 + np.exp(-be))
             out = np.zeros((seq, nv, sd), dtype=np.float32)
             S = np.zeros((nv, sd, sd), dtype=np.float32)
@@ -387,7 +456,9 @@ def run(m, ids, invert, gate_first, qkv_order, verbose=False,
                  else rot(rms(x, ln2, eps)))
             gg = b @ m.t(p + "ffn_gate.weight").T
             uu = b @ m.t(p + "ffn_up.weight").T
-            hh_ = silu(gg) * uu
+            # Which of the two feed-forward projections passes through the
+            # activation.  Wrong, it is still a SwiGLU of the right shape.
+            hh_ = silu(uu) * gg if swap_gate_up else silu(gg) * uu
             x = x + (hh_ if no_hh_rot else rot(hh_)) @ m.t(p + "ffn_down.weight").T
         if lens is not None:
             look("block %d" % ly)
@@ -414,7 +485,20 @@ def run(m, ids, invert, gate_first, qkv_order, verbose=False,
         lg = lg - lg.max(axis=-1, keepdims=True)
         lse = np.log(np.exp(lg).sum(axis=-1))
         tgt = np.asarray(ids[1:], dtype=np.int64)
-        return float(np.mean(lse[:-1] - lg[np.arange(len(tgt)), tgt]))
+        per = lse[:-1] - lg[np.arange(len(tgt)), tgt]
+        if per_position:
+            # The mean hides everything.  A model that predicts the repeated
+            # half of a repetitive passage and nothing else has the same mean
+            # as one that predicts nothing, and only one of those is working.
+            order = np.argsort(-lg, axis=-1)
+            for i, t in enumerate(tgt):
+                rank = int(np.where(order[i] == t)[0][0]) + 1
+                print("    pos %2d -> %-14s ce %7.3f  rank %7d  top %s"
+                      % (i, repr(vocab_g.get(int(t), int(t))) if vocab_g else t,
+                         per[i], rank,
+                         repr(vocab_g.get(int(order[i][0]), int(order[i][0])))
+                         if vocab_g else int(order[i][0])), flush=True)
+        return float(np.mean(per))
     h = hrot(rms(x[-1], hn, eps))
     return h @ hw.T
 
@@ -440,6 +524,14 @@ def main():
                     help="rotate the normalised value, then apply the gain")
     ap.add_argument("--conv-reverse", action="store_true")
     ap.add_argument("--conv-act", default="all", choices=("all", "v", "none"))
+    ap.add_argument("--swap-gate-up", action="store_true",
+                    help="ffn_up passes through the activation, not ffn_gate")
+    ap.add_argument("--rope-interleaved", action="store_true",
+                    help="rotary pairs (2i, 2i+1) instead of (i, i + rdims/2)")
+    ap.add_argument("--attn-kv-tile", action="store_true",
+                    help="query head h reads kv head h mod kvh, not h div rep")
+    ap.add_argument("--rot-ba", action="store_true",
+                    help="feed ssm_alpha / ssm_beta the rotated activation")
     ap.add_argument("--no-l2norm", action="store_true",
                     help="feed the recurrence unnormalised q and k")
     ap.add_argument("--head-minor", action="store_true",
@@ -467,6 +559,21 @@ def main():
                     help="report cross entropy every N blocks in one pass")
     ap.add_argument("--score", action="store_true",
                     help="report cross entropy of the prompt instead of a token")
+    ap.add_argument("--embed-invert", action="store_true",
+                    help="the stored embedding takes the other transform")
+    ap.add_argument("--ssm-a-log", dest="ssm_a_is_A", action="store_false",
+                    help="read ssm_a as A_log and exponentiate it")
+    ap.add_argument("--embed-scale", type=float, nargs="?", const=-1.0,
+                    default=0.0,
+                    help="scale the embedding; bare flag means sqrt(d_model)")
+    ap.add_argument("--attn-gate-silu", action="store_true",
+                    help="gate the attention output with silu, not sigmoid")
+    ap.add_argument("--gate-per-head", action="store_true",
+                    help="attn_q splits [q gate] within each head")
+    ap.add_argument("--no-attn-gate", action="store_true",
+                    help="attn_output reads the context ungated")
+    ap.add_argument("--per-position", action="store_true",
+                    help="print the cross entropy and rank of every target")
     args = ap.parse_args()
 
     vocab = None
@@ -477,6 +584,8 @@ def main():
                 i, _, t = line.rstrip("\n").partition("\t")
                 vocab[int(i)] = t.replace("Ġ", " ")
 
+    global vocab_g
+    vocab_g = vocab
     m = Model(args.gguf)
     ids = [int(x) for x in args.tokens.split()]
     print("prompt: %s" % "|".join(vocab.get(i, str(i)) for i in ids)
@@ -508,7 +617,14 @@ def main():
                  gain_after_rot=args.gain_after_rot, no_hh_rot=args.no_hh_rot,
                  no_out_rot=args.no_out_rot, conv_reverse=args.conv_reverse,
                  head_minor=args.head_minor, conv_act=args.conv_act,
-                 no_l2norm=args.no_l2norm)
+                 no_l2norm=args.no_l2norm, rot_ba=args.rot_ba,
+                 rope_interleaved=args.rope_interleaved,
+                 attn_kv_tile=args.attn_kv_tile, swap_gate_up=args.swap_gate_up,
+                 per_position=args.per_position, embed_invert=args.embed_invert,
+                 no_attn_gate=args.no_attn_gate,
+                 attn_gate_silu=args.attn_gate_silu,
+                 gate_per_head=args.gate_per_head, embed_scale=args.embed_scale,
+                 ssm_a_is_A=args.ssm_a_is_A)
         if args.score:
             print("  %s  ->  cross entropy %.4f nats  (chance %.2f)"
                   % (label, lg, math.log(len(vocab) if vocab else 248320)),
