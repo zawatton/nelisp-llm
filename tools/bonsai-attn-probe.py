@@ -42,7 +42,7 @@ uniform = math.log(QPOS + 1)
 
 def probe(x, ly):
     p = "blk.%d." % ly
-    a = rot(R.rms(x, m.t(p + "attn_norm.weight"), eps))
+    a = rot(R.rms(x, np.ones(x.shape[1], np.float32), eps))
     yq = a @ m.t(p + "attn_q.weight").T
     q = yq[:, :heads * hdim]
     k = a @ m.t(p + "attn_k.weight").T
@@ -91,7 +91,7 @@ for ly in range(nblk):
               dump=None) if False else x
     # cheaper: run the block inline
     if (ly % iv) == (iv - 1):
-        a = rot(R.rms(x, ln1, eps))
+        a = rot(R.rms(x, np.ones(x.shape[1], np.float32), eps))
         yq = a @ m.t(p + "attn_q.weight").T
         q, gate = yq[:, :heads * hdim], yq[:, heads * hdim:]
         k = a @ m.t(p + "attn_k.weight").T
@@ -115,11 +115,11 @@ for ly in range(nblk):
         att = np.exp(att - att.max(axis=-1, keepdims=True))
         att = att / att.sum(axis=-1, keepdims=True)
         ctx = np.einsum("hqk,khd->qhd", att, vv).reshape(seq, heads * hdim)
-        x = x + rot(ctx * R.silu(gate)) @ m.t(p + "attn_output.weight").T
+        x = x + rot(ctx / (1.0 + np.exp(-gate))) @ m.t(p + "attn_output.weight").T
     else:
         x = R.run.__wrapped__(x) if False else R.deltanet_half(m, x, ly, rot, eps, kv) \
             if hasattr(R, "deltanet_half") else x
-    b = rot(R.rms(x, ln2, eps))
+    b = rot(R.rms(x, np.ones(x.shape[1], np.float32), eps))
     gg = b @ m.t(p + "ffn_gate.weight").T
     uu = b @ m.t(p + "ffn_up.weight").T
     x = x + rot(R.silu(gg) * uu) @ m.t(p + "ffn_down.weight").T
