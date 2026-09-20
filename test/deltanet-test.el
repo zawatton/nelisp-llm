@@ -279,6 +279,64 @@ python3 tools/deltanet-ref.py\n" dn--fixture))
           (dn--ck (nth 0 sp) (< worst 1.0e-5)
                   (format "worst rel %.2e over %d" worst (length (nth 1 sp))))))))
 
+  ;; --- which side of the norm the gate falls on ---------------------------
+  ;;
+  ;; Both orders run, both are stable, and both give a plausible residual
+  ;; stream, so the only thing that separates them is the model's output.
+  ;; What these checks pin is that the variable is load-bearing, that each
+  ;; order's gradient is its own, and what the difference actually is.
+  (let* ((n 16) (eps 1.0e-6)
+         (x (make-vector n 0.0)) (g (make-vector n 0.0)) (wt (make-vector n 0.0))
+         (dout (make-vector n 0.0)) (seed 20260920))
+    (dotimes (i n)
+      (setq seed (mod (+ (* seed 1103515245) 12345) 2147483648))
+      (aset x i (- (/ (float seed) 1073741824.0) 1.0))
+      (setq seed (mod (+ (* seed 1103515245) 12345) 2147483648))
+      (aset g i (* 2.0 (- (/ (float seed) 1073741824.0) 1.0)))
+      (setq seed (mod (+ (* seed 1103515245) 12345) 2147483648))
+      (aset wt i (+ 0.8 (* 0.4 (/ (float seed) 2147483648.0))))
+      (setq seed (mod (+ (* seed 1103515245) 12345) 2147483648))
+      (aset dout i (- (/ (float seed) 1073741824.0) 1.0)))
+    (let (outs)
+      (dolist (order '(t nil))
+        (let* ((nl-llm-dn-gate-before-norm order)
+               (fw (nl-llm-dn-norm-gated x g wt n eps))
+               (vj (nl-llm-dn-norm-gated-vjp x g wt (nth 1 fw) dout n eps))
+               (loss (lambda ()
+                       (let ((o (nth 0 (nl-llm-dn-norm-gated x g wt n eps)))
+                             (acc 0.0))
+                         (dotimes (i n) (setq acc (+ acc (* (aref o i) (aref dout i)))))
+                         acc))))
+          (push (copy-sequence (nth 0 fw)) outs)
+          (dolist (probe (list (cons "dx" (cons x (plist-get vj :dx)))
+                               (cons "dgate" (cons g (plist-get vj :dgate)))
+                               (cons "dweight" (cons wt (plist-get vj :dweight)))))
+            (let ((worst (dn--fd loss (car (cdr probe)) (cdr (cdr probe)) 1.0e-5)))
+              (dn--ck (format "gated norm %s, gate %s norm" (car probe)
+                              (if order "before" "after"))
+                      (< worst 1.0e-5) (format "worst rel %.2e" worst))))))
+      ;; a control: if the two orders agreed, every check above would be
+      ;; checking one function twice
+      (let ((worst 0.0))
+        (dotimes (i n)
+          (setq worst (max worst (abs (- (aref (nth 0 outs) i) (aref (nth 1 outs) i))))))
+        (dn--ck "control: the two gate orders differ" (> worst 1.0e-6)
+                (format "worst |difference| %.3e" worst))))
+    ;; and what the difference is: gating before the norm bounds the output
+    ;; however large the gate grows, gating after does not
+    (let ((big (make-vector n 0.0)) (norms nil))
+      (dotimes (i n) (aset big i 40.0))
+      (dolist (order '(t nil))
+        (let* ((nl-llm-dn-gate-before-norm order)
+               (o (nth 0 (nl-llm-dn-norm-gated x big wt n eps)))
+               (ss 0.0))
+          (dotimes (i n) (setq ss (+ ss (* (aref o i) (aref o i)))))
+          (push (sqrt (/ ss (float n))) norms)))
+      (dn--ck "gate before the norm bounds the output"
+              (< (nth 1 norms) (* 0.1 (nth 0 norms)))
+              (format "rms %.3f before vs %.3f after, at gate 40"
+                      (nth 1 norms) (nth 0 norms)))))
+
   (princ (format "\n%s: %d failure(s)\n"
                  (if (zerop dn--fail) "deltanet OK" "deltanet") dn--fail))
   (when (> dn--fail 0) (kill-emacs 1)))

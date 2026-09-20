@@ -302,16 +302,39 @@ backward needs and the forward would otherwise throw away."
     (list :dx dx :dw dw :dbias dbias)))
 
 ;;;###autoload
+(defvar nl-llm-dn-gate-before-norm t
+  "Non-nil applies the output gate BEFORE the norm, which is Mamba2's order.
+
+`RMSNormGated' in Mamba2 -- and in the Qwen3-Next line that Ternary Bonsai
+descends from -- multiplies by silu(gate) and then normalises, so the result
+is bounded however large the gate grows.  Normalising first and gating after
+gives an output that scales with the gate, which is a different function.
+
+Both run, both are stable, and both produce a plausible residual stream, so
+nothing short of the model\='s own output distinguishes them.  It is a variable
+rather than a decision because that is the honest state of the knowledge: the
+convention is not written down in the weight file.")
+
 (defun nl-llm-dn-norm-gated (x gate weight n eps)
-  "RMSNorm X (N long) by WEIGHT, then multiply by silu(GATE); return (OUT NRM).
-NRM is the normalised value before the weight, which the backward reads."
+  "Gated RMSNorm of X (N long) by WEIGHT; return (OUT NRM).
+NRM is the normalised value before the weight, which the backward reads.
+`nl-llm-dn-gate-before-norm' picks which side of the norm the gate falls on."
   (let ((ss 0.0) (nrm (make-vector n 0.0)) (out (make-vector n 0.0)))
-    (dotimes (i n) (setq ss (+ ss (* (aref x i) (aref x i)))))
-    (let ((inv (/ 1.0 (sqrt (+ (/ ss (float n)) eps)))))
-      (dotimes (i n)
-        (aset nrm i (* (aref x i) inv))
-        (aset out i (* (aref weight i) (aref nrm i)
-                       (nl-llm-dn--silu (aref gate i))))))
+    (if nl-llm-dn-gate-before-norm
+        (let ((h (make-vector n 0.0)))
+          (dotimes (i n)
+            (aset h i (* (aref x i) (nl-llm-dn--silu (aref gate i))))
+            (setq ss (+ ss (* (aref h i) (aref h i)))))
+          (let ((inv (/ 1.0 (sqrt (+ (/ ss (float n)) eps)))))
+            (dotimes (i n)
+              (aset nrm i (* (aref h i) inv))
+              (aset out i (* (aref weight i) (aref nrm i))))))
+      (dotimes (i n) (setq ss (+ ss (* (aref x i) (aref x i)))))
+      (let ((inv (/ 1.0 (sqrt (+ (/ ss (float n)) eps)))))
+        (dotimes (i n)
+          (aset nrm i (* (aref x i) inv))
+          (aset out i (* (aref weight i) (aref nrm i)
+                         (nl-llm-dn--silu (aref gate i)))))))
     (list out nrm)))
 
 ;;;###autoload
@@ -320,19 +343,36 @@ NRM is the normalised value before the weight, which the backward reads."
   (let ((dx (make-vector n 0.0)) (dgate (make-vector n 0.0))
         (dweight (make-vector n 0.0)) (dnrm (make-vector n 0.0))
         (ss 0.0) (dot 0.0))
-    (dotimes (i n) (setq ss (+ ss (* (aref x i) (aref x i)))))
-    (let ((inv (/ 1.0 (sqrt (+ (/ ss (float n)) eps)))))
-      (dotimes (i n)
-        (let* ((sg (nl-llm-dn--silu (aref gate i)))
-               (yi (* (aref weight i) (aref nrm i))))
-          (aset dgate i (* yi (aref dout i) (nl-llm-dn--silu-d (aref gate i))))
-          (let ((dy (* (aref dout i) sg)))
-            (aset dweight i (* dy (aref nrm i)))
-            (aset dnrm i (* dy (aref weight i))))))
-      (dotimes (i n) (setq dot (+ dot (* (aref dnrm i) (aref x i)))))
-      (dotimes (i n)
-        (aset dx i (- (* (aref dnrm i) inv)
-                      (/ (* inv inv inv (aref x i) dot) (float n))))))
+    (if nl-llm-dn-gate-before-norm
+        (let ((h (make-vector n 0.0)) (dh (make-vector n 0.0)))
+          (dotimes (i n)
+            (aset h i (* (aref x i) (nl-llm-dn--silu (aref gate i))))
+            (setq ss (+ ss (* (aref h i) (aref h i)))))
+          (let ((inv (/ 1.0 (sqrt (+ (/ ss (float n)) eps)))))
+            (dotimes (i n)
+              (aset dweight i (* (aref dout i) (aref nrm i)))
+              (aset dnrm i (* (aref dout i) (aref weight i))))
+            (dotimes (i n) (setq dot (+ dot (* (aref dnrm i) (aref h i)))))
+            (dotimes (i n)
+              (aset dh i (- (* (aref dnrm i) inv)
+                            (/ (* inv inv inv (aref h i) dot) (float n)))))
+            (dotimes (i n)
+              (aset dx i (* (aref dh i) (nl-llm-dn--silu (aref gate i))))
+              (aset dgate i (* (aref dh i) (aref x i)
+                               (nl-llm-dn--silu-d (aref gate i)))))))
+      (dotimes (i n) (setq ss (+ ss (* (aref x i) (aref x i)))))
+      (let ((inv (/ 1.0 (sqrt (+ (/ ss (float n)) eps)))))
+        (dotimes (i n)
+          (let* ((sg (nl-llm-dn--silu (aref gate i)))
+                 (yi (* (aref weight i) (aref nrm i))))
+            (aset dgate i (* yi (aref dout i) (nl-llm-dn--silu-d (aref gate i))))
+            (let ((dy (* (aref dout i) sg)))
+              (aset dweight i (* dy (aref nrm i)))
+              (aset dnrm i (* dy (aref weight i))))))
+        (dotimes (i n) (setq dot (+ dot (* (aref dnrm i) (aref x i)))))
+        (dotimes (i n)
+          (aset dx i (- (* (aref dnrm i) inv)
+                        (/ (* inv inv inv (aref x i) dot) (float n)))))))
     (list :dx dx :dgate dgate :dweight dweight)))
 
 
