@@ -279,6 +279,53 @@ python3 tools/deltanet-ref.py\n" dn--fixture))
           (dn--ck (nth 0 sp) (< worst 1.0e-5)
                   (format "worst rel %.2e over %d" worst (length (nth 1 sp))))))))
 
+  ;; --- the other side of the norm for the query scale ---------------------
+  ;;
+  ;; `nl-llm-dn-scale-after-norm' is not the default, but a branch nothing
+  ;; exercises is a branch that stops working quietly -- and this one is meant
+  ;; to be switched back on the moment the DeltaNet defect is found.
+  (let* ((nl-llm-dn-scale-after-norm t)
+         (seq 4) (dk 6) (dv 5) (h 1.0e-5)
+         (q (make-vector (* seq dk) 0.0)) (k (make-vector (* seq dk) 0.0))
+         (v (make-vector (* seq dv) 0.0))
+         (a (make-vector seq 0.0)) (b (make-vector seq 0.0))
+         (w (make-vector (* seq dv) 0.0))
+         (a-log 0.25) (dt-bias -0.15))
+    (dotimes (i (* seq dk))
+      (aset q i (* 0.2 (- (mod (* (1+ i) 7919) 17) 8)))
+      (aset k i (* 0.2 (- (mod (* (1+ i) 4909) 19) 9))))
+    (dotimes (i (* seq dv)) (aset v i (* 0.3 (- (mod (* (1+ i) 3319) 13) 6))))
+    (dotimes (i seq)
+      (aset a i (* 0.4 (- (mod (* (1+ i) 11) 7) 3)))
+      (aset b i (* 0.5 (- (mod (* (1+ i) 13) 5) 2))))
+    (dotimes (i (* seq dv)) (aset w i (* 0.1 (- (mod (* (1+ i) 6151) 11) 5))))
+    (let* ((loss (lambda ()
+                   (let ((o (nth 0 (nl-llm-dn-forward q k v a b a-log dt-bias
+                                                      seq dk dv)))
+                         (acc 0.0))
+                     (dotimes (i (* seq dv))
+                       (setq acc (+ acc (* (aref w i) (aref o i)))))
+                     acc)))
+           (fw (nl-llm-dn-forward q k v a b a-log dt-bias seq dk dv))
+           (gr (nl-llm-dn-backward q k v a b a-log dt-bias seq dk dv
+                                   (nth 1 fw) w)))
+      (dolist (spec (list (cons "dL/dq" (cons q (plist-get gr :dq)))
+                          (cons "dL/dk" (cons k (plist-get gr :dk)))
+                          (cons "dL/dv" (cons v (plist-get gr :dv)))))
+        (let ((worst (dn--fd loss (car (cdr spec)) (cdr (cdr spec)) h)))
+          (dn--ck (format "%s, scale after the norm" (car spec))
+                  (< worst 1.0e-5) (format "worst rel %.2e" worst))))
+      ;; and a control: the two orders must not agree, or this check and the
+      ;; default one are testing the same function twice
+      (let* ((o1 (nth 0 (nl-llm-dn-forward q k v a b a-log dt-bias seq dk dv)))
+             (o2 (let ((nl-llm-dn-scale-after-norm nil))
+                   (nth 0 (nl-llm-dn-forward q k v a b a-log dt-bias seq dk dv))))
+             (worst 0.0))
+        (dotimes (i (* seq dv))
+          (setq worst (max worst (abs (- (aref o1 i) (aref o2 i))))))
+        (dn--ck "control: the two scale placements differ" (> worst 1.0e-6)
+                (format "worst |difference| %.3e" worst)))))
+
   ;; --- which side of the norm the gate falls on ---------------------------
   ;;
   ;; Both orders run, both are stable, and both give a plausible residual

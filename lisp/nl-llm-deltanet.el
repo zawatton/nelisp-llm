@@ -67,6 +67,23 @@
 
 (defun nl-llm-dn-beta (b) (/ 1.0 (+ 1.0 (exp (- b)))))
 
+(defvar nl-llm-dn-scale-after-norm nil
+  "Non-nil applies 1/sqrt(d_k) to the query AFTER the L2 norm, and not to the key.
+
+The default is nil, which is transformers\=' order: the scale goes on before
+the norm, where the norm undoes it, so the query entering the recurrence is
+exactly l2norm(q).  That is also what the equations want -- o_t = S_t\=' q~ is
+a retrieval by a unit key, and there is no softmax here for an attention scale
+to live in.
+
+The variable exists because the other order measures better on Ternary Bonsai
+2 27B -- 9.63 nats against 11.56, and the DeltaNet halves stop degrading with
+depth -- and that is worth recording rather than burying.  It is not adopted,
+because it wins by attenuating the recurrence\='s output eleven-fold (the
+residual rms drops from 2.34 to 1.09), and those blocks are currently harmful,
+so muting them helps whatever the truth is.  When the DeltaNet defect is
+found, this is one of the first things to re-measure.")
+
 ;;;###autoload
 (defun nl-llm-dn-forward (q k v a b a-log dt-bias seq dk dv)
   "Gated delta rule over SEQ positions for one head; return (OUT TAPE).
@@ -80,10 +97,15 @@ retrieved values."
     (dotimes (tt seq)
       (let* ((g (nl-llm-dn-gate (aref a tt) a-log dt-bias))
              (bt (nl-llm-dn-beta (aref b tt)))
-             (qt (nl-llm-dn--l2norm
-                  (nl-llm-dn--scaled q (* tt dk) dk (/ 1.0 (sqrt (float dk)))) dk))
-             (kt (nl-llm-dn--l2norm
-                  (nl-llm-dn--scaled k (* tt dk) dk (/ 1.0 (sqrt (float dk)))) dk))
+             (isq (/ 1.0 (sqrt (float dk))))
+             (qt (if nl-llm-dn-scale-after-norm
+                     (nl-llm-dn--scaled
+                      (nl-llm-dn--l2norm (nl-llm-dn--scaled q (* tt dk) dk 1.0) dk)
+                      0 dk isq)
+                   (nl-llm-dn--l2norm (nl-llm-dn--scaled q (* tt dk) dk isq) dk)))
+             (kt (if nl-llm-dn-scale-after-norm
+                     (nl-llm-dn--l2norm (nl-llm-dn--scaled k (* tt dk) dk 1.0) dk)
+                   (nl-llm-dn--l2norm (nl-llm-dn--scaled k (* tt dk) dk isq) dk)))
              (mem (make-vector dv 0.0))
              (delta (make-vector dv 0.0)))
         (push (copy-sequence s) states)   ; S_{t-1}, which the backward reads
@@ -208,13 +230,22 @@ value the forward returned."
           (setq dg (+ dg (* (aref dp i) (aref sprev i))))
           (aset ds i (* g (aref dp i))))
         ;; back through the normalisations and the parameterisations
-        (let* ((qsc (nl-llm-dn--scaled q (* tt dk) dk inv-sqrt))
-               (ksc (nl-llm-dn--scaled k (* tt dk) dk inv-sqrt))
-               (dqs (nl-llm-dn--l2norm-vjp qsc dk dqn))
-               (dks (nl-llm-dn--l2norm-vjp ksc dk dkn)))
-          (dotimes (i dk)
-            (aset dq (+ (* tt dk) i) (* inv-sqrt (aref dqs i)))
-            (aset dkv (+ (* tt dk) i) (* inv-sqrt (aref dks i)))))
+        (if nl-llm-dn-scale-after-norm
+            (let* ((qsc (nl-llm-dn--scaled q (* tt dk) dk 1.0))
+                   (ksc (nl-llm-dn--scaled k (* tt dk) dk 1.0))
+                   (dqs (nl-llm-dn--l2norm-vjp
+                         qsc dk (nl-llm-dn--scaled dqn 0 dk inv-sqrt)))
+                   (dks (nl-llm-dn--l2norm-vjp ksc dk dkn)))
+              (dotimes (i dk)
+                (aset dq (+ (* tt dk) i) (aref dqs i))
+                (aset dkv (+ (* tt dk) i) (aref dks i))))
+          (let* ((qsc (nl-llm-dn--scaled q (* tt dk) dk inv-sqrt))
+                 (ksc (nl-llm-dn--scaled k (* tt dk) dk inv-sqrt))
+                 (dqs (nl-llm-dn--l2norm-vjp qsc dk dqn))
+                 (dks (nl-llm-dn--l2norm-vjp ksc dk dkn)))
+            (dotimes (i dk)
+              (aset dq (+ (* tt dk) i) (* inv-sqrt (aref dqs i)))
+              (aset dkv (+ (* tt dk) i) (* inv-sqrt (aref dks i))))))
         (let* ((z (+ (aref a tt) dt-bias))
                (sp (nl-llm-dn--softplus z))
                (sig (/ 1.0 (+ 1.0 (exp (- z)))))
