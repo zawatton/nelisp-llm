@@ -24,8 +24,14 @@
 
 ;;; Code:
 
-(defconst nl-llm-had-block 1024
-  "The block size the model declares.  A power of two, as the transform needs.")
+(defvar nl-llm-had-block 1024
+  "The block size in force.  A power of two, as the transform needs.
+
+A variable and not a constant because the size travels in the weight file's
+`:hadamard-block' and a runtime that hardcodes 1024 answers wrongly for any
+model that declares something else -- silently, since a block-diagonal
+rotation of the wrong block size is still orthogonal and still preserves every
+norm.  `nl-llm-bonsai-open' binds it from the header.")
 
 (defun nl-llm-had--fwht (v base n)
   "In-place fast Walsh-Hadamard transform of N elements of V at BASE.

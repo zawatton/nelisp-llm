@@ -60,8 +60,13 @@ structural answer to it."
     (nl-llm-weights-apply lin x base)))
 
 ;;;###autoload
-(defun nl-llm-bonsai-open (path)
-  "Open the table at PATH and return a session plist."
+(defun nl-llm-bonsai-open (path &optional invert)
+  "Open the table at PATH and return a session plist.
+INVERT selects the other of the two orthogonal transforms.  Which one the
+weights were folded with is not in the file: the Sylvester-Walsh matrix is
+symmetric, so \"signs then Hadamard\" and \"Hadamard then signs\" are exact
+transposes of each other, and every norm-based instrument is blind to the
+difference because both are orthogonal."
   (let* ((wts (nl-llm-weights-open path))
          (cfg (nl-llm-weights-config wts))
          (widths (plist-get cfg :hadamard-widths))
@@ -69,15 +74,21 @@ structural answer to it."
          (signs nil))
     (dolist (w widths)
       (setq signs (plist-put signs w (nl-llm-had-signs vals widths w))))
-    (list :wts wts :cfg cfg :signs signs
+    (list :wts wts :cfg cfg :signs signs :invert invert
+          :block (or (plist-get cfg :hadamard-block) nl-llm-had-block)
           :lins (make-hash-table :test 'eql))))
 
 ;;;###autoload
-(defun nl-llm-bonsai-rotate (sess x n &optional invert)
-  "Apply the model's folded rotation to the N-long X in place."
-  (let ((s (plist-get (plist-get sess :signs) n)))
+(defun nl-llm-bonsai-rotate (sess x n &optional back)
+  "Apply the model's folded rotation to the N-long X in place.
+BACK pulls a gradient through it instead, which is the inverse transform --
+the rotation is orthogonal, so that is all a pullback is.  The session's
+`:invert' says which of the two orthogonal candidates is the forward one."
+  (let ((s (plist-get (plist-get sess :signs) n))
+        (nl-llm-had-block (or (plist-get sess :block) nl-llm-had-block))
+        (inv (plist-get sess :invert)))
     (unless s (error "nl-llm-bonsai-rotate: no signs for width %d" n))
-    (nl-llm-had-rotate x n s invert)))
+    (nl-llm-had-rotate x n s (if back (not inv) inv))))
 
 ;;;###autoload
 (defun nl-llm-bonsai-deltanet-block (sess layer x seq)

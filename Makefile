@@ -374,7 +374,7 @@ clean:
 .PHONY: qwen-tokenizer-table test-qwen-tokenizer ollama-provider test-head-dim
 .PHONY: qwen-weights-table verify-qwen-weights test-weights-header
 .PHONY: qwen-weights-rows test-weights-load test-rope-style
-.PHONY: qwen-forward-ref test-weights-forward test-weights-gpu lora-demo deltanet-fixture test-deltanet
+.PHONY: qwen-forward-ref test-weights-forward test-weights-gpu lora-demo deltanet-fixture test-deltanet bonsai-synth test-bonsai-backward
 
 # DONOR is a HuggingFace model directory holding config.json + tokenizer.json.
 # Everything under build/donor/ is donor-derived and gitignored.
@@ -485,6 +485,13 @@ lora-demo:
 # tools/deltanet-ref.py and the gradients from finite differences.
 deltanet-fixture:
 	python3 tools/deltanet-ref.py
+
+bonsai-synth:
+	python3 tools/bonsai-synth.py build/bonsai-synth.bin
+
+# The hybrid block's gradients, on a model small enough for finite differences.
+test-bonsai-backward: bonsai-synth
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/bonsai-backward-test.el
 
 test-deltanet:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/deltanet-test.el
