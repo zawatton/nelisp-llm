@@ -116,18 +116,19 @@ Reads the header only; tensor payload stays on disk until asked for."
   "Return the model configuration of WTS as a plist.
 Shaped so it can be spliced into the model plist `nl-llm-model-forward' reads:
 :dim :heads :kv-heads :head-dim :rope-base, plus :layers :ff :vocab
-:rms-eps :tied-head for the caller to assemble with."
-  (let ((h (nl-llm-weights-header wts)))
-    (list :dim (plist-get h :dim)
-          :heads (plist-get h :heads)
-          :kv-heads (plist-get h :kv-heads)
-          :head-dim (plist-get h :head-dim)
-          :rope-base (plist-get h :rope-base)
-          :layers (plist-get h :layers)
-          :ff (plist-get h :ff)
-          :vocab (plist-get h :vocab)
-          :rms-eps (plist-get h :rms-eps)
-          :tied-head (plist-get h :tied-head))))
+:rms-eps :tied-head for the caller to assemble with.
+
+Every other header key is carried through as well, minus :tensors, which is
+the directory rather than configuration and is large.  A second architecture
+brings its own keys -- a hybrid model has a full-attention interval, an SSM's
+shapes, a folded rotation's block size and signs -- and a config that named
+the first model's ten keys would drop all of them silently."
+  (let* ((h (nl-llm-weights-header wts)) (out nil) (rest h))
+    (while rest
+      (unless (eq (car rest) :tensors)
+        (setq out (plist-put out (car rest) (cadr rest))))
+      (setq rest (cddr rest)))
+    out))
 
 ;;;###autoload
 (defun nl-llm-weights-tensor (wts role &optional layer)
@@ -233,10 +234,25 @@ or `nl-llm-weights-bytes'" (plist-get tn :name)))
 ;;; --- linears, applied without dequantizing the weight --------------------
 
 (cl-defstruct (nl-llm-weights-lin (:constructor nl-llm-weights-lin--make))
-  bytes    ; the tensor's packed int8 payload, verbatim
+  payload  ; the tensor's packed int8 payload once read; nil until it is needed
+  path offset nbytes  ; where those bytes live, so a reader can go straight there
   scales   ; per-output-row f32 scales
   rows cols words
   name)
+
+(defun nl-llm-weights-lin-bytes (lin)
+  "LIN's packed int8 payload as a unibyte string, read on demand and cached.
+A projection of a 27B model is tens of megabytes and the GPU path never needs
+it in Emacs at all -- `nelisp-gpu-server-upload-file' reads the same region
+itself from `nl-llm-weights-lin-path' -- so loading it eagerly would spend the
+memory and the read on every caller for the sake of the few that look at
+lanes."
+  (or (nl-llm-weights-lin-payload lin)
+      (setf (nl-llm-weights-lin-payload lin)
+            (nl-llm-weights--slice (nl-llm-weights-lin-path lin)
+                                   (nl-llm-weights-lin-offset lin)
+                                   (+ (nl-llm-weights-lin-offset lin)
+                                      (nl-llm-weights-lin-nbytes lin))))))
 
 ;;;###autoload
 (defun nl-llm-weights-linear (wts role &optional layer)
@@ -252,7 +268,9 @@ rather than tensors."
       (error "nl-llm-weights-linear: %s is %s, not a quantized matrix"
              (plist-get tn :name) (plist-get tn :kind)))
     (nl-llm-weights-lin--make
-     :bytes (nl-llm-weights-bytes wts tn)
+     :path (nl-llm-weights-path wts)
+     :offset (car (nl-llm-weights--extent wts tn))
+     :nbytes (plist-get tn :nbytes)
      :scales (nl-llm-weights-scales wts tn)
      :rows (car shape) :cols (nth 1 shape)
      :words (plist-get tn :words)
@@ -341,7 +359,7 @@ implementation to disagree with if either drifts."
               (aset bytes (+ (* o words 4) i)
                     (logand (max -127 (min 127 q)) 255)))))))
     (nl-llm-weights-lin--make
-     :bytes bytes :scales scales :rows rows :cols cols :words words
+     :payload bytes :scales scales :rows rows :cols cols :words words
      :name (or name "synthetic"))))
 
 ;;;###autoload

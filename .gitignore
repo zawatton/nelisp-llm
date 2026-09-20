@@ -15,3 +15,4 @@
 /test/fixtures/qwen-forward-ref.eld
 __pycache__/
 build/deltanet-fixture.json
+build/bonsai/

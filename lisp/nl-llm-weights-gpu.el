@@ -91,7 +91,20 @@ what the activation quantization costs."
   "Upload LIN's int8 payload to a resident GPU buffer; return the handle.
 The bytes go up exactly as they came off disk -- no float is built, and nothing
 is allocated per word."
-  (nelisp-gpu-server-upload-bytes (nl-llm-weights-lin-bytes lin)))
+  (nl-llm-wgpu--upload-payload lin))
+
+(defun nl-llm-wgpu--upload-payload (lin)
+  "Put LIN's packed lanes on the GPU without routing them through Emacs.
+The server reads the tensor's region of the weight file itself.  Sending the
+same bytes down the pipe measured 3.6 MB/s against 2568 MB/s here, which for a
+27B model is the difference between forty minutes of marshalling and one."
+  (if (nl-llm-weights-lin-path lin)
+      (nelisp-gpu-server-upload-file (nl-llm-weights-lin-path lin)
+                                     (nl-llm-weights-lin-offset lin)
+                                     (nl-llm-weights-lin-nbytes lin))
+    ;; A linear built in memory -- `nl-llm-weights-quantize' for a test -- has
+    ;; no file behind it, so those bytes still go down the pipe.
+    (nelisp-gpu-server-upload-bytes (nl-llm-weights-lin-bytes lin))))
 
 ;;;###autoload
 (defun nl-llm-wgpu-upload-lin (lin)
@@ -107,7 +120,7 @@ against a kernel that runs in single-digit milliseconds, paid 1177 times in a
 step.  Uploading them once turns the dominant cost of both directions into
 nothing."
   (let ((rows (nl-llm-weights-lin-rows lin)))
-    (list :w (nelisp-gpu-server-upload-bytes (nl-llm-weights-lin-bytes lin))
+    (list :w (nl-llm-wgpu--upload-payload lin)
           :s (nelisp-gpu-server-upload-bytes
               (nelisp-gpu--floats-bytes (list (nl-llm-weights-lin-scales lin))))
           :b (nelisp-gpu-server-upload-bytes

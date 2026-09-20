@@ -242,6 +242,16 @@ value the forward returned."
 
 (defun nl-llm-dn--silu (z) (/ z (+ 1.0 (exp (- z)))))
 
+;;;###autoload
+(defun nl-llm-dn--rmsnorm-into (vec base n gain eps)
+  "RMSNorm the N-long block of VEC at BASE by GAIN, in place."
+  (let ((ss 0.0))
+    (dotimes (i n) (setq ss (+ ss (* (aref vec (+ base i)) (aref vec (+ base i))))))
+    (let ((inv (/ 1.0 (sqrt (+ (/ ss (float n)) eps)))))
+      (dotimes (i n)
+        (aset vec (+ base i) (* (aref vec (+ base i)) inv (aref gain i))))))
+  vec)
+
 (defun nl-llm-dn--silu-d (z)
   "Derivative of SiLU at Z."
   (let ((sg (/ 1.0 (+ 1.0 (exp (- z))))))

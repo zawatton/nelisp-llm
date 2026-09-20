@@ -1,0 +1,332 @@
+;;; nl-llm-bonsai.el --- run a hybrid qwen35 model from an imported table  -*- lexical-binding: t; -*-
+
+;; Ternary Bonsai 2 27B is Qwen3.5/3.8-27B's architecture: 64 blocks in which
+;; every fourth is gated full attention and the other three are Gated DeltaNet.
+;; `nl-llm-deltanet.el' has the recurrence and its block; this drives them from
+;; an `nl-llm-wts-v1' table written by tools/bonsai-export.py, and supplies the
+;; two things that table brings and Qwen3 did not: a folded orthogonal rotation
+;; that has to be undone on activations, and a second block type.
+;;
+;; The weights are int8 per output row here, quantized by the exporter from the
+;; model's F16 build.  That is this project's format, not the model's: the
+;; shipped PTQ1_0 and PQ2_0 builds are PrismML's own ternary packings with
+;; group scales, which stock tooling refuses and which nothing here reads.
+
+;;; Code:
+
+(require 'nl-llm-weights)
+(require 'nl-llm-deltanet)
+(require 'nl-llm-hadamard)
+(require 'nl-llm-weights-forward)   ; rmsnorm and silu-mul
+
+(defvar nl-llm-bonsai-apply-fn nil
+  "When non-nil, a function (LIN X BASE) applying a linear in place of the CPU.
+The same hook shape the Qwen3 path uses, so `nl-llm-wgpu-apply-resident' drops
+straight in.  A block is about 385M multiply-accumulates a position and nearly
+all of them are in these projections, so this is where the time is.")
+
+(defun nl-llm-bonsai-linears (sess layer)
+  "The LAYER's quantized linears, loaded once and cached on SESS.
+
+Cached because identity matters, not only cost.  A GPU handle table is keyed
+by `eq' on the linear object, so a block that called `nl-llm-weights-linear'
+again would hand the lookup an equal-but-not-eq object, miss every time, and
+fall back to the CPU -- which looks like \"the GPU did not help\" rather than
+like a defect.  That has now happened three times in this work; a cache is the
+structural answer to it."
+  (let* ((tbl (plist-get sess :lins))
+         (hit (gethash layer tbl)))
+    (or hit
+        (let* ((wts (plist-get sess :wts))
+               (cfg (plist-get sess :cfg))
+               (iv (plist-get cfg :full-attention-interval))
+               (roles (if (= (mod layer iv) (1- iv))
+                          '(:wq :wk :wv :wo :wg :wu :wd)
+                        '(:wqkv :wz :walpha :wbeta :wout :wg :wu :wd)))
+               (pl nil))
+          (dolist (r roles)
+            (setq pl (plist-put pl r (nl-llm-weights-linear wts r layer))))
+          (puthash layer pl tbl)
+          pl))))
+
+(defun nl-llm-bonsai-forget-layer (sess layer)
+  "Drop LAYER's cached linears, so a long run does not hold all 64."
+  (remhash layer (plist-get sess :lins)))
+
+(defun nl-llm-bonsai--apply (lin x base)
+  "LIN applied to the COLS-long slice of X at BASE, dequantizing per row."
+  (if nl-llm-bonsai-apply-fn
+      (funcall nl-llm-bonsai-apply-fn lin x base)
+    (nl-llm-weights-apply lin x base)))
+
+;;;###autoload
+(defun nl-llm-bonsai-open (path)
+  "Open the table at PATH and return a session plist."
+  (let* ((wts (nl-llm-weights-open path))
+         (cfg (nl-llm-weights-config wts))
+         (widths (plist-get cfg :hadamard-widths))
+         (vals (vconcat (plist-get cfg :hadamard-signs)))
+         (signs nil))
+    (dolist (w widths)
+      (setq signs (plist-put signs w (nl-llm-had-signs vals widths w))))
+    (list :wts wts :cfg cfg :signs signs
+          :lins (make-hash-table :test 'eql))))
+
+;;;###autoload
+(defun nl-llm-bonsai-rotate (sess x n &optional invert)
+  "Apply the model's folded rotation to the N-long X in place."
+  (let ((s (plist-get (plist-get sess :signs) n)))
+    (unless s (error "nl-llm-bonsai-rotate: no signs for width %d" n))
+    (nl-llm-had-rotate x n s invert)))
+
+;;;###autoload
+(defun nl-llm-bonsai-deltanet-block (sess layer x seq)
+  "One Gated DeltaNet block of LAYER over X (SEQ x dim); return the output.
+The projections are int8, so each is applied row by row rather than as a dense
+matrix; everything between them is `nl-llm-deltanet.el'."
+  (let* ((wts (plist-get sess :wts)) (cfg (plist-get sess :cfg))
+         (dim (plist-get cfg :dim))
+         (nk (plist-get cfg :ssm-groups)) (nv (plist-get cfg :ssm-heads))
+         (hd (plist-get cfg :ssm-state)) (kern (plist-get cfg :ssm-conv-kernel))
+         (ff (plist-get cfg :ff))
+         (eps (or (plist-get cfg :rms-eps) 1.0e-6))
+         (kd (* nk hd)) (vd (* nv hd)) (cd (+ kd kd vd))
+         (ln1 (nl-llm-weights-row wts (nl-llm-weights-tensor wts :ln1g layer) 0))
+         (ln2 (nl-llm-weights-row wts (nl-llm-weights-tensor wts :ln2g layer) 0))
+         (snorm (nl-llm-weights-row wts (nl-llm-weights-tensor wts :ssm-norm layer) 0))
+         (alog (nl-llm-weights-row wts (nl-llm-weights-tensor wts :a-log layer) 0))
+         (dtb (nl-llm-weights-row wts (nl-llm-weights-tensor wts :dt-bias layer) 0))
+
+         (lins (nl-llm-bonsai-linears sess layer))
+         (wqkv (plist-get lins :wqkv)) (wz (plist-get lins :wz))
+         (wa (plist-get lins :walpha)) (wb (plist-get lins :wbeta))
+         (wout (plist-get lins :wout)) (wg (plist-get lins :wg))
+         (wu (plist-get lins :wu)) (wd (plist-get lins :wd))
+         ;; ssm_conv1d is [4, 10240] in GGUF's fastest-first order, which the
+         ;; exporter reshapes to 10240 rows of 4 -- already channel-major, the
+         ;; layout the block wants, so this reads rows and does not transpose
+         (convw (let* ((tn (nl-llm-weights-tensor wts :conv-w layer))
+                       (o (make-vector (* cd kern) 0.0)))
+                  (dotimes (c cd)
+                    (let ((row (nl-llm-weights-row wts tn c)))
+                      (dotimes (r kern) (aset o (+ (* c kern) r) (aref row r)))))
+                  o))
+         (convb (make-vector cd 0.0))
+         (mixed (make-vector (* seq cd) 0.0))
+         (z (make-vector (* seq vd) 0.0))
+         (ba (make-vector (* seq 2 nv) 0.0))
+         (out (make-vector (* seq dim) 0.0)))
+    ;; Normalise, then feed each projection the basis ITS weight was folded
+    ;; for.  The file lists which weights carry the rotation, and ssm_alpha and
+    ;; ssm_beta are not among them -- only attn_qkv, attn_gate, ssm_out and the
+    ;; three feed-forward matrices are.  Handing the gates a rotated activation
+    ;; runs clean and poisons the recurrence, because alpha is the decay and
+    ;; beta the write strength: an early version did exactly that and the
+    ;; block's output came out 1300 times its input.
+    (dotimes (tt seq)
+      (let* ((plain (nl-llm-wf--rmsnorm x (* tt dim) dim ln1 eps))
+             (a (nl-llm-bonsai-rotate sess (copy-sequence plain) dim)))
+        (let ((yq (nl-llm-bonsai--apply wqkv a 0))
+              (yz (nl-llm-bonsai--apply wz a 0))
+              (ya (nl-llm-bonsai--apply wa plain 0))
+              (yb (nl-llm-bonsai--apply wb plain 0)))
+          (dotimes (i cd) (aset mixed (+ (* tt cd) i) (aref yq i)))
+          (dotimes (i vd) (aset z (+ (* tt vd) i) (aref yz i)))
+          (dotimes (i nv)
+            (aset ba (+ (* tt 2 nv) i) (aref ya i))
+            (aset ba (+ (* tt 2 nv) nv i) (aref yb i))))))
+    (let* ((cv (nl-llm-dn-conv mixed convw convb seq cd kern))
+           (conv-out (nth 0 cv))
+           (ctx (make-vector (* seq vd) 0.0))
+           (grp (/ nv nk)))
+      (dotimes (h nv)
+        (let* ((kh (/ h grp))
+               (qh (make-vector (* seq hd) 0.0)) (khv (make-vector (* seq hd) 0.0))
+               (vh (make-vector (* seq hd) 0.0))
+               (ah (make-vector seq 0.0)) (bh (make-vector seq 0.0)))
+          (dotimes (tt seq)
+            (dotimes (i hd)
+              (aset qh (+ (* tt hd) i) (aref conv-out (+ (* tt cd) (* kh hd) i)))
+              (aset khv (+ (* tt hd) i) (aref conv-out (+ (* tt cd) kd (* kh hd) i)))
+              (aset vh (+ (* tt hd) i)
+                    (aref conv-out (+ (* tt cd) kd kd (* h hd) i))))
+            (aset ah tt (aref ba (+ (* tt 2 nv) h)))
+            (aset bh tt (aref ba (+ (* tt 2 nv) nv h))))
+          (let ((oh (nth 0 (nl-llm-dn-forward qh khv vh ah bh (aref alog h)
+                                              (aref dtb h) seq hd hd))))
+            (dotimes (tt seq)
+              (dotimes (i hd)
+                (aset ctx (+ (* tt vd) (* h hd) i) (aref oh (+ (* tt hd) i))))))))
+      ;; gated norm per (position, head), then out_proj, then the residual
+      (dotimes (tt seq)
+        (let ((g (make-vector vd 0.0)))
+          (dotimes (h nv)
+            (let ((xs (make-vector hd 0.0)) (gs (make-vector hd 0.0)))
+              (dotimes (i hd)
+                (aset xs i (aref ctx (+ (* tt vd) (* h hd) i)))
+                (aset gs i (aref z (+ (* tt vd) (* h hd) i))))
+              (let ((r (nth 0 (nl-llm-dn-norm-gated xs gs snorm hd eps))))
+                (dotimes (i hd) (aset g (+ (* h hd) i) (aref r i))))))
+          (nl-llm-bonsai-rotate sess g vd)
+          (let ((o (nl-llm-bonsai--apply wout g 0)))
+            (dotimes (i dim)
+              (aset out (+ (* tt dim) i) (+ (aref x (+ (* tt dim) i)) (aref o i)))))))
+      ;; the feed-forward half
+      (dotimes (tt seq)
+        (let ((b (nl-llm-wf--rmsnorm out (* tt dim) dim ln2 eps)))
+          (nl-llm-bonsai-rotate sess b dim)
+          (let* ((gg (nl-llm-bonsai--apply wg b 0))
+                 (uu (nl-llm-bonsai--apply wu b 0))
+                 (hh (nl-llm-wf--silu-mul gg uu ff)))
+            (nl-llm-bonsai-rotate sess hh ff)
+            (let ((dd (nl-llm-bonsai--apply wd hh 0)))
+              (dotimes (i dim)
+                (aset out (+ (* tt dim) i)
+                      (+ (aref out (+ (* tt dim) i)) (aref dd i))))))))
+      out)))
+
+
+;;; --- the full-attention block, every fourth one ---------------------------
+;;
+;; Not the Qwen3 attention this project already has.  Three differences, none
+;; of which changes a shape:
+;;
+;;   * head_dim is 256 against Qwen3-0.6B's 128, and 24 query heads to 4 key
+;;     heads rather than 16 to 8;
+;;   * the rotation covers 64 of those 256 dimensions, not all of them, and
+;;     the base is 10,000,000 rather than 1,000,000;
+;;   * the query projection is 24 * 256 * 2 wide because it carries an output
+;;     gate alongside the query.
+;;
+;; A partial rotation is the kind of thing that runs clean and answers wrong:
+;; rotating all 256 dimensions of a head whose model rotates 64 produces a
+;; correctly shaped, entirely incorrect key.
+
+(defun nl-llm-bonsai--rope-partial (vec base hd rdims pos rbase)
+  "Rotate the first RDIMS of the HD-long block at BASE, half-split, in place.
+The remaining HD - RDIMS dimensions pass through, which is what a partial
+rotary does and what rotating the whole head would silently not do."
+  (let* ((half (/ rdims 2)) (orig (make-vector rdims 0.0)))
+    (dotimes (i rdims) (aset orig i (aref vec (+ base i))))
+    (dotimes (i half)
+      (let* ((theta (/ (float pos) (expt rbase (/ (* 2.0 i) (float rdims)))))
+             (c (cos theta)) (s (sin theta))
+             (a (aref orig i)) (b (aref orig (+ i half))))
+        (aset vec (+ base i) (- (* a c) (* b s)))
+        (aset vec (+ base i half) (+ (* b c) (* a s)))))
+    vec))
+
+;;;###autoload
+(defun nl-llm-bonsai-attn-block (sess layer x seq)
+  "One gated full-attention block of LAYER over X (SEQ x dim)."
+  (let* ((wts (plist-get sess :wts)) (cfg (plist-get sess :cfg))
+         (dim (plist-get cfg :dim))
+         (heads (plist-get cfg :heads)) (kvh (plist-get cfg :kv-heads))
+         (hd (plist-get cfg :head-dim)) (ff (plist-get cfg :ff))
+         (rdims (plist-get cfg :rope-dims))
+         (rbase (plist-get cfg :rope-base))
+         (eps (or (plist-get cfg :rms-eps) 1.0e-6))
+         (qdim (* heads hd)) (kvdim (* kvh hd))
+         (ln1 (nl-llm-weights-row wts (nl-llm-weights-tensor wts :ln1g layer) 0))
+         (ln2 (nl-llm-weights-row wts (nl-llm-weights-tensor wts :ln2g layer) 0))
+         (qn (nl-llm-weights-row wts (nl-llm-weights-tensor wts :q-norm layer) 0))
+         (kn (nl-llm-weights-row wts (nl-llm-weights-tensor wts :k-norm layer) 0))
+         (lins (nl-llm-bonsai-linears sess layer))
+         (wq (plist-get lins :wq)) (wk (plist-get lins :wk))
+         (wv (plist-get lins :wv)) (wo (plist-get lins :wo))
+         (wg (plist-get lins :wg)) (wu (plist-get lins :wu))
+         (wd (plist-get lins :wd))
+         (q (make-vector (* seq qdim) 0.0)) (k (make-vector (* seq kvdim) 0.0))
+         (v (make-vector (* seq kvdim) 0.0)) (gate (make-vector (* seq qdim) 0.0))
+         (out (make-vector (* seq dim) 0.0)))
+    (dotimes (tt seq)
+      (let ((a (nl-llm-wf--rmsnorm x (* tt dim) dim ln1 eps)))
+        (nl-llm-bonsai-rotate sess a dim)
+        (let ((yq (nl-llm-bonsai--apply wq a 0))
+              (yk (nl-llm-bonsai--apply wk a 0))
+              (yv (nl-llm-bonsai--apply wv a 0)))
+          ;; the query projection is [query | gate], each HEADS * HD wide
+          (dotimes (i qdim)
+            (aset q (+ (* tt qdim) i) (aref yq i))
+            (aset gate (+ (* tt qdim) i) (aref yq (+ qdim i))))
+          (dotimes (i kvdim)
+            (aset k (+ (* tt kvdim) i) (aref yk i))
+            (aset v (+ (* tt kvdim) i) (aref yv i))))))
+    ;; QK-norm per head, then the partial rotation
+    (dotimes (tt seq)
+      (dotimes (h heads)
+        (let ((b (+ (* tt qdim) (* h hd))))
+          (nl-llm-dn--rmsnorm-into q b hd qn eps)
+          (nl-llm-bonsai--rope-partial q b hd rdims tt rbase)))
+      (dotimes (h kvh)
+        (let ((b (+ (* tt kvdim) (* h hd))))
+          (nl-llm-dn--rmsnorm-into k b hd kn eps)
+          (nl-llm-bonsai--rope-partial k b hd rdims tt rbase))))
+    (let ((ctx (nl-llm-wf--attend q k v seq heads kvh hd)))
+      ;; the gate, then the output projection and the residual
+      (dotimes (tt seq)
+        (let ((g (make-vector qdim 0.0)))
+          (dotimes (i qdim)
+            (aset g i (* (aref ctx (+ (* tt qdim) i))
+                         (nl-llm-dn--silu (aref gate (+ (* tt qdim) i))))))
+          (nl-llm-bonsai-rotate sess g qdim)
+          (let ((o (nl-llm-bonsai--apply wo g 0)))
+            (dotimes (i dim)
+              (aset out (+ (* tt dim) i)
+                    (+ (aref x (+ (* tt dim) i)) (aref o i)))))))
+      (dotimes (tt seq)
+        (let ((b (nl-llm-wf--rmsnorm out (* tt dim) dim ln2 eps)))
+          (nl-llm-bonsai-rotate sess b dim)
+          (let* ((gg (nl-llm-bonsai--apply wg b 0))
+                 (uu (nl-llm-bonsai--apply wu b 0))
+                 (hh (nl-llm-wf--silu-mul gg uu ff)))
+            (nl-llm-bonsai-rotate sess hh ff)
+            (let ((dd (nl-llm-bonsai--apply wd hh 0)))
+              (dotimes (i dim)
+                (aset out (+ (* tt dim) i)
+                      (+ (aref out (+ (* tt dim) i)) (aref dd i))))))))
+      out)))
+
+;;;###autoload
+(defun nl-llm-bonsai-block (sess layer x seq)
+  "Dispatch LAYER to the block type the model's interval says it is."
+  (let ((iv (plist-get (plist-get sess :cfg) :full-attention-interval)))
+    (if (= (mod layer iv) (1- iv))
+        (nl-llm-bonsai-attn-block sess layer x seq)
+      (nl-llm-bonsai-deltanet-block sess layer x seq))))
+
+(defun nl-llm-bonsai-head (sess)
+  "The output projection, loaded once and cached on SESS.
+Cached for the same reason a block's linears are: the GPU handle table is keyed
+by `eq', so a second `nl-llm-weights-linear' would silently miss."
+  (or (plist-get sess :head-lin)
+      (let ((lin (nl-llm-weights-linear (plist-get sess :wts) :head)))
+        (plist-put sess :head-lin lin)
+        lin)))
+
+;;;###autoload
+(defun nl-llm-bonsai-logits (sess x seq &optional pos)
+  "Logits at POS (default the last position) of the SEQ-long stream X.
+The final norm, then the rotation -- `output.weight' is one of the 401 tensors
+the model lists as rotated, so the head expects a rotated activation exactly as
+the blocks' projections do -- then the head itself."
+  (let* ((cfg (plist-get sess :cfg))
+         (dim (plist-get cfg :dim))
+         (wts (plist-get sess :wts))
+         (lnf (nl-llm-weights-row wts (nl-llm-weights-tensor wts :lnf) 0))
+         (eps (or (plist-get cfg :rms-eps) 1.0e-6))
+         (at (or pos (1- seq)))
+         (h (nl-llm-wf--rmsnorm x (* at dim) dim lnf eps)))
+    (nl-llm-bonsai-rotate sess h dim)
+    (nl-llm-bonsai--apply (nl-llm-bonsai-head sess) h 0)))
+
+;;;###autoload
+(defun nl-llm-bonsai-argmax (v)
+  "Index of the largest element of V, and its value, as (INDEX . VALUE)."
+  (let ((bi 0) (bv (aref v 0)))
+    (dotimes (i (length v))
+      (when (> (aref v i) bv) (setq bv (aref v i) bi i)))
+    (cons bi bv)))
+
+(provide 'nl-llm-bonsai)
+;;; nl-llm-bonsai.el ends here
