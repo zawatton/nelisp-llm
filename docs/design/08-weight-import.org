@@ -1193,3 +1193,56 @@ Ordered so that each check can only pass for the right reason:
 - Qwen3-MoE (30B-A3B) is out of reach for 6 GB VRAM even at int8, but only ~3B
   parameters are active per token.  Expert streaming from the 62 GB host is
   possible in principle and is deliberately out of scope here.
+
+* Ternary Bonsai 2 27B -- import state (2026-09-20)
+
+** What runs
+The 53.81 GB F16 GGUF converts to a 26.92 GB =nl-llm-wts-v1= table (851
+tensors, worst per-tensor relative dequantization error 0.0039), and all 64
+blocks of the 3:1 hybrid run on a 6 GB card with one layer resident at a time.
+Per-layer upload is 0.48s since the server reads the weight file itself
+(=OP_UPLOAD_FILE=); it was 34s through the pipe.  Gradients for both block
+types, the head, the final norm and LoRA adapters agree with central
+differences to 7.3e-09.
+
+The weights are ternary within each 128-element block -- 100% of blocks carry
+a single magnitude plus zero, 32.8% zeros -- while =ssm_alpha= and =ssm_beta=
+are full precision, which is the same boundary the rotation list draws.  A
+single per-row int8 scale loses nothing measurable here: block scales vary by
+at most 1.9x within a row (median 1.2x) and no non-zero weight quantizes to
+zero.  A native ternary payload would be 5x smaller but is not needed for
+accuracy.
+
+** What does not
+The forward is not yet faithful.  On a short repetitive passage the cross
+entropy bottoms out near 9.4 nats against a chance of 12.42 and a unigram
+model's 7-8, so the model is barely better than uniform.
+
+Cross entropy against depth separates the halves where no end-to-end token
+could: the feed-forward halves alone improve with depth (9.76 -> 9.38), the
+attention halves with them improve (10.00 -> 9.86), and the DeltaNet halves do
+not (11.56 -> 11.52).  Within the DeltaNet block every variant that shrinks
+the block's contribution scores better and every variant that grows it scores
+worse, following the residual magnitude rather than the hypothesis -- so what
+it computes is currently uncorrelated with what it should, and a variant that
+"improves" the model is attenuating noise.
+
+** Settled by measurement, not by reading a name
+Activations, the stored embedding and the head all take the rotation; the
+stream is unrotated.  Sylvester row order, forward direction, sign runs
+concatenated in the order =sign_widths= lists, block size 1024 including for
+the 6144-wide value space, the norm gain inside the rotation, the gated norm's
+epsilon as the file's 1e-6, the SwiGLU output rotated before =ffn_down=,
+=attn_qkv= as [q|k|v] (corroborated by the convolution weights changing
+character at channel 4096 and nowhere else), q/k/v/z as [head][dim], key heads
+shared by =repeat_interleave=, =ssm_alpha= as the decay, the convolution's
+activation over all channels, and the gate before the gated norm.
+
+** Where to look next
+Inside the Gated DeltaNet block, after eliminating the gate's side of the
+norm, the decay's side of the memory read, the query scale's side of the L2
+norm, the L2 norm itself, the alpha/beta assignment, the convolution's tap
+order and activation scope, the head-axis layout, the key-head sharing
+pattern, the 6144 rotation's block size, and whether =ssm_out= wants a rotated
+input.  Screen at 4 and 16 blocks rather than 64: it turns a five-minute
+question into a thirty-second one, and the depth trend is visible by block 15.
