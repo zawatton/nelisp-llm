@@ -1271,6 +1271,54 @@ six tensors.  Substituting a DIFFERENT random sign vector -- as orthogonal as
 the real one, and unable to un-rotate anything -- reproduces the same numbers
 to three decimal places.  The effect is mechanical, not evidence.
 
+** The remaining six nats are the content path
+The model predicts syntax and not content: function words rank 2 to 32, and
+content words rank in the tens of thousands.  What separates those cleanly is
+copying, which needs no facts and no grammar -- a sequence of arbitrary tokens
+repeated once, predictable only by carrying token identity forward and reading
+it back.
+
+    second repetition, 7 tokens     median rank   top-1
+    Qwen3-0.6B (the donor)                    1     6/7
+    Ternary Bonsai 2 27B                  54944     0/7
+
+Bonsai fails at every depth (8, 16, 32, 48, 64 blocks) and with the DeltaNet
+halves disabled, so it is not something the stack loses along the way.  It
+also fails below copying: "eenth" after "the eight" ranks 44198, which needs
+no context at all.
+
+The QK side is fine.  Induction attention survives both fixes, peaking on the
+right position in 14 of 16 attention layers at up to p = 0.49 against a chance
+of 0.083 -- the heads look in the right place and the value path carries
+nothing.
+
+=tools/ov-circuit-probe.py= measures that on the weights alone, with no
+forward pass: the composition W_U . W_O . W_V . W_E, whose diagonal is what a
+copy head is.  The donor reaches z = +8.61 against its own null; Bonsai
+reaches +0.17.  Exhausted rather than guessed at: all 81 arrangements of the
+rotation over the circuit's four points, all 96 (output slot, kv head)
+pairings at five layers, both axis orders for =attn_v= and =attn_output=, all
+four assignments of which tensor is the embedding and which the head
+(including both tied readings), the DeltaNet's own value path through
+=ssm_out=, and a row permutation between the two.  Every one lands between
++0.05 and +0.23.
+
+Both mixing paths failing identically puts the defect at the ends rather than
+in the middle.  cos(token_embd[t], output.weight[t]) is +0.0073.  Orthogonal
+Procrustes fitted on half the vocabulary and scored on the other half raises
+that to +0.1184 (z = +5.69, shuffled control +0.06), so the two tensors do
+share token identity -- but the map is dense and unstructured (20.0% of its
+energy in the diagonal 1024-blocks, exactly a random orthogonal matrix's
+share) and feeding it to the OV circuit changes nothing.  What it gives is a
+ceiling: 0.118 is the best an orthogonal alignment can do here, so the
+measured 0.002 is fifty times below what is achievable rather than two.
+
+So either there is a convention at the embedding and unembedding ends that
+none of the above covers, or the F16 export does not carry a faithful pair.
+Settling that needs something external -- the packed PTQ1_0/PQ2_0 build, the
+original implementation, or any independent inference of this model -- since
+every internal reading has now been tried.
+
 ** Where to look next
 The forward reads every one of the file's 851 tensors, =general.basename= is
 "folded" so the rotation is in the weights as assumed, the file is structurally
