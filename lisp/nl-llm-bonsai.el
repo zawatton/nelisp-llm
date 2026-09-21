@@ -66,6 +66,15 @@ tensor says which it is and no header key has to."
   (> (nl-llm-weights-lin-rows (plist-get lins :wq))
      (* (plist-get cfg :heads) (plist-get cfg :head-dim))))
 
+(defvar nl-llm-bonsai-apply-seq-fn nil
+  "When non-nil, a function (LIN X SEQ STRIDE) applying LIN at every position.
+
+A projection called once a position is one round trip a position, and the
+round trip is most of what it costs: profiling a DeltaNet block found the
+projections at 5.46s of 7.37s across forty calls of 136ms, for arithmetic the
+device does in a fraction of that.  The kernels already take the count of
+positions, so the batching is a change here rather than there.")
+
 (defvar nl-llm-bonsai-scan-fn nil
   "When non-nil, a function running the gated delta rule for every head.
 
@@ -109,6 +118,19 @@ structural answer to it."
 (defun nl-llm-bonsai-forget-layer (sess layer)
   "Drop LAYER's cached linears, so a long run does not hold all 64."
   (remhash layer (plist-get sess :lins)))
+
+(defun nl-llm-bonsai--apply-seq (lin x seq stride)
+  "LIN applied to SEQ slices of X strided by STRIDE; returns SEQ x ROWS.
+Without the hook this is the per-position loop written out, so the two agree
+element for element and a block can be read without knowing which is in use."
+  (if nl-llm-bonsai-apply-seq-fn
+      (funcall nl-llm-bonsai-apply-seq-fn lin x seq stride)
+    (let* ((rows (nl-llm-weights-lin-rows lin))
+           (out (make-vector (* seq rows) 0.0)))
+      (dotimes (p seq)
+        (let ((y (nl-llm-bonsai--apply lin x (* p stride))))
+          (dotimes (o rows) (aset out (+ (* p rows) o) (aref y o)))))
+      out)))
 
 (defun nl-llm-bonsai--apply (lin x base)
   "LIN applied to the COLS-long slice of X at BASE, dequantizing per row."
@@ -197,18 +219,21 @@ matrix; everything between them is `nl-llm-deltanet.el'."
     ;; runs clean and poisons the recurrence, because alpha is the decay and
     ;; beta the write strength: an early version did exactly that and the
     ;; block's output came out 1300 times its input.
-    (dotimes (tt seq)
-      (let* ((plain (nl-llm-wf--rmsnorm x (* tt dim) dim ln1 eps))
-             (a (nl-llm-bonsai-rotate sess (copy-sequence plain) dim)))
-        (let ((yq (nl-llm-bonsai--apply wqkv a 0))
-              (yz (nl-llm-bonsai--apply wz a 0))
-              (ya (nl-llm-bonsai--apply wa plain 0))
-              (yb (nl-llm-bonsai--apply wb plain 0)))
-          (dotimes (i cd) (aset mixed (+ (* tt cd) i) (aref yq i)))
-          (dotimes (i vd) (aset z (+ (* tt vd) i) (aref yz i)))
+    (let ((pl (make-vector (* seq dim) 0.0))
+          (ar (make-vector (* seq dim) 0.0)))
+      (dotimes (tt seq)
+        (let ((p (nl-llm-wf--rmsnorm x (* tt dim) dim ln1 eps)))
+          (dotimes (i dim) (aset pl (+ (* tt dim) i) (aref p i)))
+          (nl-llm-bonsai-rotate sess p dim)
+          (dotimes (i dim) (aset ar (+ (* tt dim) i) (aref p i)))))
+      (setq mixed (nl-llm-bonsai--apply-seq wqkv ar seq dim))
+      (setq z (nl-llm-bonsai--apply-seq wz ar seq dim))
+      (let ((ya (nl-llm-bonsai--apply-seq wa pl seq dim))
+            (yb (nl-llm-bonsai--apply-seq wb pl seq dim)))
+        (dotimes (tt seq)
           (dotimes (i nv)
-            (aset ba (+ (* tt 2 nv) i) (aref ya i))
-            (aset ba (+ (* tt 2 nv) nv i) (aref yb i))))))
+            (aset ba (+ (* tt 2 nv) i) (aref ya (+ (* tt nv) i)))
+            (aset ba (+ (* tt 2 nv) nv i) (aref yb (+ (* tt nv) i)))))))
     (let* ((cv (nl-llm-dn-conv mixed convw convb seq cd kern))
            (conv-out (nth 0 cv))
            (ctx (make-vector (* seq vd) 0.0))
@@ -236,32 +261,53 @@ matrix; everything between them is `nl-llm-deltanet.el'."
                   (aset ctx (+ (* tt vd) (* h hd) i)
                         (aref oh (+ (* tt hd) i)))))))))
       ;; gated norm per (position, head), then out_proj, then the residual
-      (dotimes (tt seq)
-        (let ((g (make-vector vd 0.0)))
-          (dotimes (h nv)
-            (let ((xs (make-vector hd 0.0)) (gs (make-vector hd 0.0)))
-              (dotimes (i hd)
-                (aset xs i (aref ctx (+ (* tt vd) (* h hd) i)))
-                (aset gs i (aref z (+ (* tt vd) (* h hd) i))))
-              (let ((r (nth 0 (nl-llm-dn-norm-gated xs gs snorm hd eps))))
-                (dotimes (i hd) (aset g (+ (* h hd) i) (aref r i))))))
-          (nl-llm-bonsai-rotate sess g vd)
-          (let ((o (nl-llm-bonsai--apply wout g 0)))
+      (let ((gr (make-vector (* seq vd) 0.0)))
+        (dotimes (tt seq)
+          (let ((g (make-vector vd 0.0)))
+            (dotimes (h nv)
+              (let ((xs (make-vector hd 0.0)) (gs (make-vector hd 0.0)))
+                (dotimes (i hd)
+                  (aset xs i (aref ctx (+ (* tt vd) (* h hd) i)))
+                  (aset gs i (aref z (+ (* tt vd) (* h hd) i))))
+                (let ((r (nth 0 (nl-llm-dn-norm-gated xs gs snorm hd eps))))
+                  (dotimes (i hd) (aset g (+ (* h hd) i) (aref r i))))))
+            (nl-llm-bonsai-rotate sess g vd)
+            (dotimes (i vd) (aset gr (+ (* tt vd) i) (aref g i)))))
+        (let ((o (nl-llm-bonsai--apply-seq wout gr seq vd)))
+          (dotimes (tt seq)
             (dotimes (i dim)
-              (aset out (+ (* tt dim) i) (+ (aref x (+ (* tt dim) i)) (aref o i)))))))
+              (aset out (+ (* tt dim) i)
+                    (+ (aref x (+ (* tt dim) i)) (aref o (+ (* tt dim) i))))))))
       ;; the feed-forward half
-      (dotimes (tt seq)
-        (let ((b (nl-llm-wf--rmsnorm out (* tt dim) dim ln2 eps)))
-          (nl-llm-bonsai-rotate sess b dim)
-          (let* ((gg (nl-llm-bonsai--apply wg b 0))
-                 (uu (nl-llm-bonsai--apply wu b 0))
-                 (hh (nl-llm-wf--silu-mul gg uu ff)))
-            (nl-llm-bonsai-rotate sess hh ff)
-            (let ((dd (nl-llm-bonsai--apply wd hh 0)))
-              (dotimes (i dim)
-                (aset out (+ (* tt dim) i)
-                      (+ (aref out (+ (* tt dim) i)) (aref dd i))))))))
+      (nl-llm-bonsai--ffn sess out seq dim ff ln2 eps wg wu wd)
       out)))
+
+(defun nl-llm-bonsai--ffn (sess out seq dim ff ln2 eps wg wu wd)
+  "Add the feed-forward half to OUT in place, every position at once.
+The same half in both block types, and the only place three of a block's
+eight projections live."
+  (let ((br (make-vector (* seq dim) 0.0))
+        (hr (make-vector (* seq ff) 0.0)))
+    (dotimes (tt seq)
+      (let ((b (nl-llm-wf--rmsnorm out (* tt dim) dim ln2 eps)))
+        (nl-llm-bonsai-rotate sess b dim)
+        (dotimes (i dim) (aset br (+ (* tt dim) i) (aref b i)))))
+    (let ((gg (nl-llm-bonsai--apply-seq wg br seq dim))
+          (uu (nl-llm-bonsai--apply-seq wu br seq dim)))
+      (dotimes (tt seq)
+        (let ((g1 (make-vector ff 0.0)) (u1 (make-vector ff 0.0)))
+          (dotimes (i ff)
+            (aset g1 i (aref gg (+ (* tt ff) i)))
+            (aset u1 i (aref uu (+ (* tt ff) i))))
+          (let ((hh (nl-llm-wf--silu-mul g1 u1 ff)))
+            (nl-llm-bonsai-rotate sess hh ff)
+            (dotimes (i ff) (aset hr (+ (* tt ff) i) (aref hh i)))))))
+    (let ((dd (nl-llm-bonsai--apply-seq wd hr seq ff)))
+      (dotimes (tt seq)
+        (dotimes (i dim)
+          (aset out (+ (* tt dim) i)
+                (+ (aref out (+ (* tt dim) i)) (aref dd (+ (* tt dim) i)))))))
+    out))
 
 
 ;;; --- the full-attention block, every fourth one ---------------------------
@@ -348,21 +394,25 @@ rotary does and what rotating the whole head would silently not do."
          (q (make-vector (* seq qdim) 0.0)) (k (make-vector (* seq kvdim) 0.0))
          (v (make-vector (* seq kvdim) 0.0)) (gate (make-vector (* seq qdim) 0.0))
          (out (make-vector (* seq dim) 0.0)))
-    (dotimes (tt seq)
-      (let ((a (nl-llm-wf--rmsnorm x (* tt dim) dim ln1 eps)))
-        (nl-llm-bonsai-rotate sess a dim)
-        (let ((yq (nl-llm-bonsai--apply wq a 0))
-              (yk (nl-llm-bonsai--apply wk a 0))
-              (yv (nl-llm-bonsai--apply wv a 0)))
-          ;; the query projection is [query | gate], each HEADS * HD wide,
-          ;; when the model has an output gate at all
+    (let ((ar (make-vector (* seq dim) 0.0))
+          (qw (if has-gate (* 2 qdim) qdim)))
+      (dotimes (tt seq)
+        (let ((a (nl-llm-wf--rmsnorm x (* tt dim) dim ln1 eps)))
+          (nl-llm-bonsai-rotate sess a dim)
+          (dotimes (i dim) (aset ar (+ (* tt dim) i) (aref a i)))))
+      (let ((yq (nl-llm-bonsai--apply-seq wq ar seq dim))
+            (yk (nl-llm-bonsai--apply-seq wk ar seq dim))
+            (yv (nl-llm-bonsai--apply-seq wv ar seq dim)))
+        ;; the query projection is [query | gate], each HEADS * HD wide,
+        ;; when the model has an output gate at all
+        (dotimes (tt seq)
           (dotimes (i qdim)
-            (aset q (+ (* tt qdim) i) (aref yq i))
+            (aset q (+ (* tt qdim) i) (aref yq (+ (* tt qw) i)))
             (when has-gate
-              (aset gate (+ (* tt qdim) i) (aref yq (+ qdim i)))))
+              (aset gate (+ (* tt qdim) i) (aref yq (+ (* tt qw) qdim i)))))
           (dotimes (i kvdim)
-            (aset k (+ (* tt kvdim) i) (aref yk i))
-            (aset v (+ (* tt kvdim) i) (aref yv i))))))
+            (aset k (+ (* tt kvdim) i) (aref yk (+ (* tt kvdim) i)))
+            (aset v (+ (* tt kvdim) i) (aref yv (+ (* tt kvdim) i)))))))
     ;; QK-norm per head, then the partial rotation
     (dotimes (tt seq)
       (dotimes (h heads)
@@ -375,30 +425,25 @@ rotary does and what rotating the whole head would silently not do."
           (nl-llm-bonsai--rope-partial k b hd rdims tt rbase))))
     (let ((ctx (nl-llm-wf--attend q k v seq heads kvh hd)))
       ;; the gate, then the output projection and the residual
-      (dotimes (tt seq)
-        (let ((g (make-vector qdim 0.0)))
-          (dotimes (i qdim)
-            (aset g i (if has-gate
-                          (* (aref ctx (+ (* tt qdim) i))
-                             (nl-llm-bonsai--gate (aref gate (+ (* tt qdim) i))))
-                        (aref ctx (+ (* tt qdim) i)))))
-          (nl-llm-bonsai-rotate sess g qdim)
-          (let ((o (nl-llm-bonsai--apply wo g 0)))
+      (let ((gr (make-vector (* seq qdim) 0.0)))
+        (dotimes (tt seq)
+          (let ((g (make-vector qdim 0.0)))
+            (dotimes (i qdim)
+              (aset g i (if has-gate
+                            (* (aref ctx (+ (* tt qdim) i))
+                               (nl-llm-bonsai--gate (aref gate (+ (* tt qdim) i))))
+                          (aref ctx (+ (* tt qdim) i)))))
+            (nl-llm-bonsai-rotate sess g qdim)
+            (dotimes (i qdim) (aset gr (+ (* tt qdim) i) (aref g i)))))
+        (let ((o (nl-llm-bonsai--apply-seq wo gr seq qdim)))
+          (dotimes (tt seq)
             (dotimes (i dim)
               (aset out (+ (* tt dim) i)
-                    (+ (aref x (+ (* tt dim) i)) (aref o i)))))))
-      (dotimes (tt seq)
-        (let ((b (nl-llm-wf--rmsnorm out (* tt dim) dim ln2 eps)))
-          (nl-llm-bonsai-rotate sess b dim)
-          (let* ((gg (nl-llm-bonsai--apply wg b 0))
-                 (uu (nl-llm-bonsai--apply wu b 0))
-                 (hh (nl-llm-wf--silu-mul gg uu ff)))
-            (nl-llm-bonsai-rotate sess hh ff)
-            (let ((dd (nl-llm-bonsai--apply wd hh 0)))
-              (dotimes (i dim)
-                (aset out (+ (* tt dim) i)
-                      (+ (aref out (+ (* tt dim) i)) (aref dd i))))))))
+                    (+ (aref x (+ (* tt dim) i)) (aref o (+ (* tt dim) i))))))))
+      (nl-llm-bonsai--ffn sess out seq dim ff ln2 eps wg wu wd)
       out)))
+
+
 
 ;;;###autoload
 (defun nl-llm-bonsai-block (sess layer x seq)

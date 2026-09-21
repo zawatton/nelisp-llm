@@ -264,6 +264,40 @@ GAMMA is indexed by position there."
     (cons (apply #'concat (nreverse parts)) gammas)))
 
 ;;;###autoload
+(defun nl-llm-wgpu--apply-seq-ternary (lin handle x base seq stride)
+  "LIN applied to SEQ slices of X through `ternary-rows\=', in one dispatch.
+The activation goes across as float, so unlike the int8 path there is no
+packing step -- only a gather when the slices are strided."
+  (let* ((cols (nl-llm-weights-lin-cols lin))
+         (rows (nl-llm-weights-lin-rows lin))
+         (words (nl-llm-weights-lin-words lin))
+         (nblk (nl-llm-wgpu--nblk lin))
+         (res (nl-llm-wgpu--resident-p handle))
+         (st (or stride cols))
+         (flat (if (and (= (or base 0) 0) (= st cols) (= (length x) (* seq cols)))
+                   x
+                 (let ((v (make-vector (* seq cols) 0.0)))
+                   (dotimes (p seq)
+                     (dotimes (i cols)
+                       (aset v (+ (* p cols) i)
+                             (aref x (+ (or base 0) (* p st) i)))))
+                   v))))
+    (nth 0 (nelisp-gpu-server-run2
+            'ternary-rows
+            (list (cons 'in flat)
+                  (list 'res (if res (plist-get handle :w) handle)
+                        (* rows words))
+                  (if res
+                      (list 'res (plist-get handle :b) rows)
+                    (cons 'in (make-vector rows 0.0)))
+                  (if res
+                      (list 'res (plist-get handle :s) (* rows nblk))
+                    (cons 'in (nl-llm-weights-lin-scales lin)))
+                  (cons 'out (* seq rows)))
+            (list seq rows cols nblk words)
+            (/ (+ (* seq rows) 63) 64)))))
+
+;;;###autoload
 (defun nl-llm-wgpu-apply-seq (lin handle x base seq &optional stride)
   "Apply LIN to SEQ slices of X in one dispatch; return a SEQ x ROWS vector.
 STRIDE defaults to LIN's COLS, which is right when X is a packed sequence of
@@ -273,6 +307,8 @@ width -- so the caller says.
 Arithmetic per (position, row) is what `nl-llm-wgpu-apply' does, so this is
 bit-identical to calling it SEQ times; what changes is that one round trip and
 one activation upload carry all of them instead of SEQ of each."
+  (if (nl-llm-weights-lin-ternary lin)
+      (nl-llm-wgpu--apply-seq-ternary lin handle x base seq stride)
   (let* ((cols (nl-llm-weights-lin-cols lin))
          (rows (nl-llm-weights-lin-rows lin))
          (words (nl-llm-weights-lin-words lin))
@@ -295,7 +331,7 @@ one activation upload carry all of them instead of SEQ of each."
                       (cons 'out (* seq rows)))
                 (list seq rows words)
                 (/ (+ (* seq rows) 63) 64)))
-      (nelisp-gpu-server-free hact))))
+      (nelisp-gpu-server-free hact)))))
 
 ;;;###autoload
 (defun nl-llm-wgpu-apply-t-seq (lin handle g seq)

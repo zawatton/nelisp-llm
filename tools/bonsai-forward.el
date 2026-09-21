@@ -97,6 +97,9 @@ what comes out reads as a continuation of what went in."
                   (unwind-protect
                       (let ((nl-llm-wgpu--transposes tbl)
                             (nl-llm-bonsai-apply-fn #'nl-llm-wgpu-apply-resident)
+                            (nl-llm-bonsai-apply-seq-fn
+                             (unless (getenv "NL_BONSAI_NO_BATCH")
+                               #'nl-llm-wgpu-apply-seq-resident))
                             (nl-llm-bonsai-scan-fn
                              (unless (getenv "NL_BONSAI_CPU_SCAN")
                                #'nl-llm-dngpu-scan)))
