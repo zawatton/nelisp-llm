@@ -24,3 +24,5 @@ build/ternary-fixture.eld
 /build/distilled-soft.eld
 /build/distilled-cold.eld
 /build/distilled-warm.eld
+# Generated from the donor tokenizer by `make qwen-token-table'.
+/build/qwen-token-table.eld

@@ -23,6 +23,7 @@
 
 (require 'cl-lib)
 (require 'nl-llm-agent-openai)
+(require 'nl-llm-teacher-cache)
 
 (defcustom nl-llm-teacher-logprobs-top-k 8
   "How many alternatives per position to ask the teacher for.
@@ -31,9 +32,10 @@ The endpoint caps this; OpenAI's documented maximum is 20."
   :group 'nl-llm-inference-runtime)
 
 (defun nl-llm-teacher-logprobs--alt (entry)
-  "Read one {token, logprob} object into a plist."
+  "Read one {token, logprob, bytes} object into a plist."
   (list :token (plist-get entry :token)
-        :logprob (plist-get entry :logprob)))
+        :logprob (plist-get entry :logprob)
+        :bytes (plist-get entry :bytes)))
 
 (defun nl-llm-teacher-logprobs--position (entry)
   "Read one sampled position, with its alternatives, into a plist."
@@ -41,18 +43,10 @@ The endpoint caps this; OpenAI's documented maximum is 20."
           (list :top (mapcar #'nl-llm-teacher-logprobs--alt
                              (plist-get entry :top_logprobs)))))
 
-;;;###autoload
-(cl-defun nl-llm-teacher-logprobs-ask
-    (prompt &key base-url model options top-k transport timeout-sec)
-  "Ask MODEL at BASE-URL for PROMPT and return text plus per-token soft targets.
-
-The result is (:text S :tokens LIST :model M), where each element of LIST is
-(:token T :logprob L :top ((:token T :logprob L) ...)) in generated order.
-
-TRANSPORT defaults to `nl-llm-agent-openai-default-transport' and exists so a
-test can drive this without a server.  Signals when the response carries no
-`logprobs', because that is indistinguishable from success at every later
-stage."
+(cl-defun nl-llm-teacher-logprobs-fetch
+    (prompt &key base-url model options top-k transport timeout-sec
+            require-logprobs)
+  "Fetch and return the raw parsed-JSON response for PROMPT."
   (let* ((top-k (or top-k nl-llm-teacher-logprobs-top-k))
          ;; `:timeout-sec' belongs to the transport, not the request body: the
          ;; caller keeps one options plist for both, and sending an unknown
@@ -72,7 +66,22 @@ stage."
                             (list :url (concat base-url "/chat/completions")
                                   :headers '(("Content-Type" . "application/json"))
                                   :body body
-                                  :timeout-sec timeout-sec)))
+                                  :timeout-sec timeout-sec))))
+    (when require-logprobs
+      (let* ((choice (car (plist-get response :choices)))
+             (logprobs (plist-get choice :logprobs))
+             (content (plist-get logprobs :content)))
+        (unless content
+          (error "teacher-logprobs: %s returned no logprobs; \
+the endpoint may not implement them" model))))
+    response))
+
+;;;###autoload
+(cl-defun nl-llm-teacher-logprobs-parse (response &key model top-k)
+  "Parse a raw RESPONSE into text plus per-token soft targets.
+
+Signals when RESPONSE carries no `logprobs'."
+  (let* ((top-k (or top-k nl-llm-teacher-logprobs-top-k))
          (choice (car (plist-get response :choices)))
          (logprobs (plist-get choice :logprobs))
          (content (plist-get logprobs :content)))
@@ -85,6 +94,35 @@ the endpoint may not implement them" model))
           :model (or (plist-get response :model) model)
           :top-k top-k
           :tokens (mapcar #'nl-llm-teacher-logprobs--position content))))
+
+;;;###autoload
+(cl-defun nl-llm-teacher-logprobs-ask
+    (prompt &key base-url model options top-k transport timeout-sec)
+  "Fetch and parse MODEL's text plus per-token soft targets."
+  (nl-llm-teacher-logprobs-parse
+   (nl-llm-teacher-logprobs-fetch
+    prompt :base-url base-url :model model :options options :top-k top-k
+    :transport transport :timeout-sec timeout-sec)
+   :model model :top-k top-k))
+
+;;;###autoload
+(cl-defun nl-llm-teacher-logprobs-cached-teacher
+    (&key base-url model options top-k dir stats transport)
+  "Return a cached teacher function for raw logprob responses.
+
+The disk cache wraps `nl-llm-teacher-logprobs-fetch', so it stores the raw
+server response and parses it after a cache hit or miss.  The cache identity
+includes MODEL, BASE-URL, OPTIONS and TOP-K."
+  (let* ((identity (list :model model :base-url base-url :options options
+                         :top-k top-k :kind 'logprobs-raw))
+         (fetch (lambda (prompt)
+                  (nl-llm-teacher-logprobs-fetch
+                   prompt :base-url base-url :model model :options options
+                   :top-k top-k :transport transport :require-logprobs t)))
+         (cached (nl-llm-teacher-cache-wrap fetch identity dir stats)))
+    (lambda (prompt)
+      (nl-llm-teacher-logprobs-parse
+       (funcall cached prompt) :model model :top-k top-k))))
 
 ;;;###autoload
 (defun nl-llm-teacher-logprobs-text (answer)

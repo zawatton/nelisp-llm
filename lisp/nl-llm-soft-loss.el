@@ -3,6 +3,7 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'nl-llm-token-table)
 
 (defun nl-llm-soft-loss-targets (position table)
   "Return representable `(ID . LOGPROB)' targets for POSITION.
@@ -13,6 +14,19 @@ token is not representable has no usable target, even when alternatives are."
     (let (targets)
       (dolist (alternative (plist-get position :top) (nreverse targets))
         (let ((id (gethash (plist-get alternative :token) table)))
+          (when id
+            (push (cons id (float (plist-get alternative :logprob))) targets)))))))
+
+;;;###autoload
+(defun nl-llm-soft-loss-targets-bytes (position table)
+  "Return representable targets for POSITION using TABLE's byte keys.
+
+The sampled token must resolve, while missing alternatives are dropped just as
+in `nl-llm-soft-loss-targets'."
+  (when (nl-llm-token-table-id table position)
+    (let (targets)
+      (dolist (alternative (plist-get position :top) (nreverse targets))
+        (let ((id (nl-llm-token-table-id table alternative)))
           (when id
             (push (cons id (float (plist-get alternative :logprob))) targets)))))))
 

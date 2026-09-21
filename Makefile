@@ -27,7 +27,7 @@ compile-all:
 
 lisp-elc: $(LLM_ELC)
 
-.PHONY: test compile compile-all lisp-elc distill-soft test-teacher-cache test-teacher-logprobs test-distill-soft clean train train-modern train-modern-full gpu-test gpu-train-test gpu-ag-test gpu-block-test gpu-moe-test gpu-stack-test gpu-window-test gpu-gather-test gpu-adam-test gpu-tie-test gpu-sched-test agent-evolve-gpu-test bench-gpu bench-gpu-train bench-ondevice train-stacked-gpu train-corpus-gpu generate-gpu train-full-gpu checkpoint-gpu train-big-gpu stream-decode spec-decode bitnet-model bench-dp4a spec-chain integrated-decode bench-longctx agent-demo agent-model-demo agent-improve-demo agent-code-demo agent-sandbox-demo agent-tasks-demo agent-gpu-finetune-demo agent-ondevice-demo
+.PHONY: test compile compile-all lisp-elc qwen-token-table distill-soft test-teacher-cache test-teacher-logprobs test-token-table test-distill-soft clean train train-modern train-modern-full gpu-test gpu-train-test gpu-ag-test gpu-block-test gpu-moe-test gpu-stack-test gpu-window-test gpu-gather-test gpu-adam-test gpu-tie-test gpu-sched-test agent-evolve-gpu-test bench-gpu bench-gpu-train bench-ondevice train-stacked-gpu train-corpus-gpu generate-gpu train-full-gpu checkpoint-gpu train-big-gpu stream-decode spec-decode bitnet-model bench-dp4a spec-chain integrated-decode bench-longctx agent-demo agent-model-demo agent-improve-demo agent-code-demo agent-sandbox-demo agent-tasks-demo agent-gpu-finetune-demo agent-ondevice-demo
 
 # Depends on `lisp-elc' because `load' prefers a .elc to its .el even when the
 # .el is newer and only warns about it.  A test run after an edit but before a
@@ -48,6 +48,7 @@ test: lisp-elc
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/teacher-logprobs-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/distill-soft-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/soft-loss-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/token-table-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/arch-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/attn-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/moe-test.el
@@ -570,6 +571,7 @@ test-deltanet:
 
 # --- Doc 08 Phase 3: adaptation ------------------------------------------
 .PHONY: test-weights-lora test-weights-backward test-block-backward test-train test-soft-loss
+.PHONY: test-token-table
 .PHONY: test-distill distill
 
 # A trainable LoRA over a frozen int8 base.  The transpose is pinned by the
@@ -601,6 +603,18 @@ test-distill-soft: lisp-elc
 
 test-soft-loss: lisp-elc
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/soft-loss-test.el
+
+# The donor's byte-level vocabulary as an elisp table.  Derived from
+# build/donor/qwen3-0.6b/tokenizer.json, so it is generated rather than
+# committed -- but it has to be generatable, or a gitignored 3.4 MB file with
+# no rule behind it is just a file someone else does not have.
+build/qwen-token-table.eld: tools/qwen-token-table.py
+	python3 tools/qwen-token-table.py $@
+
+qwen-token-table: build/qwen-token-table.eld
+
+test-token-table: lisp-elc build/qwen-token-table.eld
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/token-table-test.el
 
 distill:
 	NL_LLM_DISTILL_PROMPTS=$(PROMPTS) NL_LLM_DISTILL_OUT=$(OUT) \

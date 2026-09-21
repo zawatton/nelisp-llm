@@ -62,14 +62,9 @@ default -- which is how a whole run came back as nothing but timeouts.")
   "Return a cached one-argument teacher that answers with its distribution.
 The cache identity carries the top-k as well as the model and options, because
 a K of 8 and a K of 4 are different answers to the same prompt."
-  (nl-llm-teacher-cache-wrap
-   (lambda (prompt)
-     (nl-llm-teacher-logprobs-ask
-      prompt :base-url soft--base-url :model soft--model
-      :options soft--options :top-k soft--top-k))
-   (list :model soft--model :base-url soft--base-url
-         :options soft--options :top-k soft--top-k :kind 'logprobs)
-   nil soft--stats))
+  (nl-llm-teacher-logprobs-cached-teacher
+   :base-url soft--base-url :model soft--model :options soft--options
+   :top-k soft--top-k :stats soft--stats))
 
 ;; --- run -----------------------------------------------------------------
 

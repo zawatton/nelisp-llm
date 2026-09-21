@@ -103,6 +103,37 @@
   (sl--ck "targets is nil when sampled token is missing"
           (null (nl-llm-soft-loss-targets position table))))
 
+(let* ((position (list :token "a" :bytes '(97)
+                       :top (list (list :token "a" :bytes '(97) :logprob -0.1)
+                                  (list :token "b" :bytes '(98) :logprob -0.4))))
+       (strings (make-hash-table :test #'equal))
+       (bytes (make-hash-table :test #'equal)))
+  (puthash "a" 4 strings)
+  (puthash "b" 9 strings)
+  (puthash "a" 4 bytes)
+  (puthash "b" 9 bytes)
+  (sl--ck "string and bytes target mappings agree for ASCII"
+          (equal (nl-llm-soft-loss-targets position strings)
+                 (nl-llm-soft-loss-targets-bytes position bytes))))
+
+(let* ((position (list :token "�" :bytes '(227 130 170)
+                       :top (list (list :token "�" :bytes '(227 130 170)
+                                         :logprob -0.1))))
+       (table (make-hash-table :test #'equal)))
+  (puthash (nl-llm-token-table-key '(227 130 170)) 17 table)
+  (sl--ck "bytes targets resolve a replacement token's real bytes"
+          (equal (nl-llm-soft-loss-targets-bytes position table)
+                 '((17 . -0.1)))
+          "the token string is replacement text, bytes are UTF-8"))
+
+(let* ((position (list :token "sample" :bytes '(1 2 3)
+                       :top (list (list :token "alternative"
+                                         :bytes '(4 5 6) :logprob -0.2))))
+       (table (make-hash-table :test #'equal)))
+  (puthash (nl-llm-token-table-key '(4 5 6)) 23 table)
+  (sl--ck "bytes targets refuse an unrepresentable sampled token"
+          (null (nl-llm-soft-loss-targets-bytes position table))))
+
 (condition-case nil
     (progn (nl-llm-soft-loss-kl (vector 0.0) nil)
            (sl--ck "empty targets signal an error" nil))
