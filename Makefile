@@ -29,7 +29,11 @@ lisp-elc: $(LLM_ELC)
 
 .PHONY: test compile compile-all lisp-elc distill-soft test-teacher-cache test-teacher-logprobs test-distill-soft clean train train-modern train-modern-full gpu-test gpu-train-test gpu-ag-test gpu-block-test gpu-moe-test gpu-stack-test gpu-window-test gpu-gather-test gpu-adam-test gpu-tie-test gpu-sched-test agent-evolve-gpu-test bench-gpu bench-gpu-train bench-ondevice train-stacked-gpu train-corpus-gpu generate-gpu train-full-gpu checkpoint-gpu train-big-gpu stream-decode spec-decode bitnet-model bench-dp4a spec-chain integrated-decode bench-longctx agent-demo agent-model-demo agent-improve-demo agent-code-demo agent-sandbox-demo agent-tasks-demo agent-gpu-finetune-demo agent-ondevice-demo
 
-test:
+# Depends on `lisp-elc' because `load' prefers a .elc to its .el even when the
+# .el is newer and only warns about it.  A test run after an edit but before a
+# recompile silently exercises the previous build -- which invalidated a
+# mutation check here until the missing dependency was the suspect.
+test: lisp-elc
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/qwen-tokenizer-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/head-dim-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/rope-style-test.el
@@ -43,6 +47,7 @@ test:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/teacher-cache-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/teacher-logprobs-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/distill-soft-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/soft-loss-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/arch-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/attn-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/moe-test.el
@@ -564,7 +569,7 @@ test-deltanet:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/deltanet-test.el
 
 # --- Doc 08 Phase 3: adaptation ------------------------------------------
-.PHONY: test-weights-lora test-weights-backward test-block-backward test-train
+.PHONY: test-weights-lora test-weights-backward test-block-backward test-train test-soft-loss
 .PHONY: test-distill distill
 
 # A trainable LoRA over a frozen int8 base.  The transpose is pinned by the
@@ -585,14 +590,17 @@ PROMPTS ?= examples/distill-prompts.txt
 OUT ?= build/distilled.eld
 SOFT_OUT ?= build/distilled-soft.eld
 TOPK ?= 8
-test-teacher-cache:
+test-teacher-cache: lisp-elc
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/teacher-cache-test.el
 
-test-teacher-logprobs:
+test-teacher-logprobs: lisp-elc
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/teacher-logprobs-test.el
 
-test-distill-soft:
+test-distill-soft: lisp-elc
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/distill-soft-test.el
+
+test-soft-loss: lisp-elc
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/soft-loss-test.el
 
 distill:
 	NL_LLM_DISTILL_PROMPTS=$(PROMPTS) NL_LLM_DISTILL_OUT=$(OUT) \
