@@ -264,8 +264,11 @@ Only for the small unquantized tensors -- RMSNorm gains and the Qwen3
 q_norm/k_norm vectors.  An int8x4 tensor is refused: dequantizing one into boxed
 floats is the 14 GB mistake this file exists to avoid."
   (unless (equal (plist-get tn :kind) "f32")
-    (error "nl-llm-weights-f32-tensor: %s is quantized; use `nl-llm-weights-row' \
-or `nl-llm-weights-bytes'" (plist-get tn :name)))
+    ;; Name the kind.  The message used to say only "is quantized", which was
+    ;; true of int8x4 and ternary2 alike and told a caller nothing about which
+    ;; row accessor it should have reached for instead.
+    (error "nl-llm-weights-f32-tensor: %s is %s, not f32; use `nl-llm-weights-row' \
+or `nl-llm-weights-bytes'" (plist-get tn :name) (plist-get tn :kind)))
   (require 'photon-tensor)
   (let* ((shape (plist-get tn :shape))
          (n (apply #'* shape))

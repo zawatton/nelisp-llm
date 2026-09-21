@@ -126,13 +126,17 @@
 
     ;; Refusing to dequantize a large tensor wholesale is the memory contract,
     ;; so it is a behaviour under test rather than a comment.
-    (wl--ck "int8 tensors refuse wholesale dequantization"
-            (condition-case err
-                (progn (nl-llm-weights-f32-tensor
-                        wts (nl-llm-weights-tensor wts :wte))
-                       nil)
-              (error (and (string-match-p "int8x4"
-                                          (error-message-string err)) t))))
+    ;; Matched against the tensor's own :kind rather than a literal "int8x4",
+    ;; which stopped being the only quantized kind when ternary2 arrived and
+    ;; left this check asserting a substring nothing produced any more.
+    (let* ((tn (nl-llm-weights-tensor wts :wte))
+           (kind (plist-get tn :kind)))
+      (wl--ck "quantized tensors refuse wholesale dequantization"
+              (condition-case err
+                  (progn (nl-llm-weights-f32-tensor wts tn) nil)
+                (error (and (string-match-p (regexp-quote kind)
+                                            (error-message-string err)) t)))
+              (format "refused, naming %s" kind)))
 
     ;; Raw bytes are handed over verbatim, at the length the header declares --
     ;; this is what an uploader sends to a GPU buffer without touching a float.
