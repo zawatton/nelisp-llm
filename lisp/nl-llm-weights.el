@@ -239,6 +239,25 @@ returned as stored."
       out)))
 
 ;;;###autoload
+(defun nl-llm-weights-f32-flat (wts tn)
+  "Return an f32 TN from WTS as one flat float vector, row-major.
+
+One read for the whole tensor.  `nl-llm-weights-row\=' opens and slices the
+file per row, which for the 10240-row convolution weight of a DeltaNet block
+is ten thousand reads of sixteen bytes each, paid on every block."
+  (unless (equal (plist-get tn :kind) "f32")
+    (error "nl-llm-weights-f32-flat: %s is %s, not f32"
+           (plist-get tn :name) (plist-get tn :kind)))
+  (let* ((shape (plist-get tn :shape))
+         (n (apply #'* shape))
+         (ext (nl-llm-weights--extent wts tn))
+         (raw (nl-llm-weights--slice (nl-llm-weights-path wts)
+                                     (car ext) (cdr ext)))
+         (out (make-vector n 0.0)))
+    (dotimes (i n) (aset out i (nl-llm-weights--f32 raw (* 4 i))))
+    out))
+
+;;;###autoload
 (defun nl-llm-weights-f32-tensor (wts tn)
   "Return an f32 TN from WTS as a `photon-tensor'.
 Only for the small unquantized tensors -- RMSNorm gains and the Qwen3

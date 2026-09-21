@@ -16,6 +16,7 @@
 
 (require 'nl-llm-weights)
 (require 'nl-llm-deltanet)
+(require 'nl-llm-deltanet-gpu)
 (require 'nl-llm-hadamard)
 (require 'nl-llm-weights-forward)   ; rmsnorm and silu-mul
 
@@ -64,6 +65,16 @@ Self-describing: the gated form is twice as wide as HEADS * HEAD-DIM, so the
 tensor says which it is and no header key has to."
   (> (nl-llm-weights-lin-rows (plist-get lins :wq))
      (* (plist-get cfg :heads) (plist-get cfg :head-dim))))
+
+(defvar nl-llm-bonsai-scan-fn nil
+  "When non-nil, a function running the gated delta rule for every head.
+
+Called with (QN KN V GATES BETAS SEQ NV DK DV) and returning SEQ x NV x DV,
+which is `nl-llm-dngpu-scan\='s shape.  The recurrence is where a DeltaNet
+block\='s time goes -- 48 heads, a 128x128 state each, updated at every
+position -- and it is sequential only in position, so it belongs on the
+device.  The hook keeps the CPU path, which the gradient suite checks, rather
+than replacing it.")
 
 (defvar nl-llm-bonsai-apply-fn nil
   "When non-nil, a function (LIN X BASE) applying a linear in place of the CPU.
@@ -172,12 +183,8 @@ matrix; everything between them is `nl-llm-deltanet.el'."
          ;; ssm_conv1d is [4, 10240] in GGUF's fastest-first order, which the
          ;; exporter reshapes to 10240 rows of 4 -- already channel-major, the
          ;; layout the block wants, so this reads rows and does not transpose
-         (convw (let* ((tn (nl-llm-weights-tensor wts :conv-w layer))
-                       (o (make-vector (* cd kern) 0.0)))
-                  (dotimes (c cd)
-                    (let ((row (nl-llm-weights-row wts tn c)))
-                      (dotimes (r kern) (aset o (+ (* c kern) r) (aref row r)))))
-                  o))
+         (convw (nl-llm-weights-f32-flat
+                 wts (nl-llm-weights-tensor wts :conv-w layer)))
          (convb (make-vector cd 0.0))
          (mixed (make-vector (* seq cd) 0.0))
          (z (make-vector (* seq vd) 0.0))
@@ -206,24 +213,28 @@ matrix; everything between them is `nl-llm-deltanet.el'."
            (conv-out (nth 0 cv))
            (ctx (make-vector (* seq vd) 0.0))
            (grp (/ nv nk)))
-      (dotimes (h nv)
-        (let* ((kh (/ h grp))
-               (qh (make-vector (* seq hd) 0.0)) (khv (make-vector (* seq hd) 0.0))
-               (vh (make-vector (* seq hd) 0.0))
-               (ah (make-vector seq 0.0)) (bh (make-vector seq 0.0)))
-          (dotimes (tt seq)
-            (dotimes (i hd)
-              (aset qh (+ (* tt hd) i) (aref conv-out (+ (* tt cd) (* kh hd) i)))
-              (aset khv (+ (* tt hd) i) (aref conv-out (+ (* tt cd) kd (* kh hd) i)))
-              (aset vh (+ (* tt hd) i)
-                    (aref conv-out (+ (* tt cd) kd kd (* h hd) i))))
-            (aset ah tt (aref ba (+ (* tt 2 nv) h)))
-            (aset bh tt (aref ba (+ (* tt 2 nv) nv h))))
-          (let ((oh (nth 0 (nl-llm-dn-forward qh khv vh ah bh (aref alog h)
-                                              (aref dtb h) seq hd hd))))
+      (if nl-llm-bonsai-scan-fn
+          (nl-llm-bonsai--scan-heads ctx conv-out ba alog dtb
+                                     seq nv hd kd grp cd)
+        (dotimes (h nv)
+          (let* ((kh (/ h grp))
+                 (qh (make-vector (* seq hd) 0.0)) (khv (make-vector (* seq hd) 0.0))
+                 (vh (make-vector (* seq hd) 0.0))
+                 (ah (make-vector seq 0.0)) (bh (make-vector seq 0.0)))
             (dotimes (tt seq)
               (dotimes (i hd)
-                (aset ctx (+ (* tt vd) (* h hd) i) (aref oh (+ (* tt hd) i))))))))
+                (aset qh (+ (* tt hd) i) (aref conv-out (+ (* tt cd) (* kh hd) i)))
+                (aset khv (+ (* tt hd) i) (aref conv-out (+ (* tt cd) kd (* kh hd) i)))
+                (aset vh (+ (* tt hd) i)
+                      (aref conv-out (+ (* tt cd) kd kd (* h hd) i))))
+              (aset ah tt (aref ba (+ (* tt 2 nv) h)))
+              (aset bh tt (aref ba (+ (* tt 2 nv) nv h))))
+            (let ((oh (nth 0 (nl-llm-dn-forward qh khv vh ah bh (aref alog h)
+                                                (aref dtb h) seq hd hd))))
+              (dotimes (tt seq)
+                (dotimes (i hd)
+                  (aset ctx (+ (* tt vd) (* h hd) i)
+                        (aref oh (+ (* tt hd) i)))))))))
       ;; gated norm per (position, head), then out_proj, then the residual
       (dotimes (tt seq)
         (let ((g (make-vector vd 0.0)))
@@ -268,6 +279,33 @@ matrix; everything between them is `nl-llm-deltanet.el'."
 ;; A partial rotation is the kind of thing that runs clean and answers wrong:
 ;; rotating all 256 dimensions of a head whose model rotates 64 produces a
 ;; correctly shaped, entirely incorrect key.
+
+(defun nl-llm-bonsai--scan-heads (ctx conv-out ba alog dtb seq nv hd kd grp cd)
+  "Fill CTX by running every head\='s recurrence through `nl-llm-bonsai-scan-fn\='.
+
+The per-head slicing the CPU path does one head at a time is done once here,
+into the flat [position][head][dim] layout the device wants.  Queries and keys
+come from the key GROUP a value head belongs to, which is why they are copied
+rather than pointed at: three value heads share one key head."
+  (let ((q (make-vector (* seq nv hd) 0.0))
+        (k (make-vector (* seq nv hd) 0.0))
+        (v (make-vector (* seq nv hd) 0.0))
+        (a (make-vector (* seq nv) 0.0))
+        (b (make-vector (* seq nv) 0.0)))
+    (dotimes (tt seq)
+      (dotimes (h nv)
+        (let ((kh (/ h grp)) (base (* (+ (* tt nv) h) hd)) (cb (* tt cd)))
+          (dotimes (i hd)
+            (aset q (+ base i) (aref conv-out (+ cb (* kh hd) i)))
+            (aset k (+ base i) (aref conv-out (+ cb kd (* kh hd) i)))
+            (aset v (+ base i) (aref conv-out (+ cb kd kd (* h hd) i))))
+          (aset a (+ (* tt nv) h) (aref ba (+ (* tt 2 nv) h)))
+          (aset b (+ (* tt nv) h) (aref ba (+ (* tt 2 nv) nv h))))))
+    (let* ((prep (nl-llm-dngpu-prepare q k a b alog dtb seq nv hd))
+           (out (funcall nl-llm-bonsai-scan-fn
+                         (nth 0 prep) (nth 1 prep) v (nth 2 prep) (nth 3 prep)
+                         seq nv hd hd)))
+      (dotimes (i (length out)) (aset ctx i (aref out i))))))
 
 (defun nl-llm-bonsai--rope-partial (vec base hd rdims pos rbase)
   "Rotate the first RDIMS of the HD-long block at BASE, half-split, in place.
