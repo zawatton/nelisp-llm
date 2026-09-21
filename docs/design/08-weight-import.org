@@ -1389,6 +1389,14 @@ On the device, against the int8 path on the same two blocks:
 | compute a block    |   14.2s |   16.2s |
 | compute the head   |    4.9s |    7.7s |
 
+All 64 blocks, same prompt, same predicted token and the same top ten:
+
+| measure          |  ternary |    int8 |
+|------------------+----------+---------|
+| end to end       |   828.6s |  937.8s |
+| of which upload  |    24.9s |   66.3s |
+| of which compute |   740.6s |  851.6s |
+
 Better on every axis, which is not the usual shape of a size win.  The
 compute is faster because the kernel reads a quarter of the bytes, and it is
 also more accurate: a ternary weight is an add or a subtract, so there is
