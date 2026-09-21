@@ -3,7 +3,31 @@ EMACS ?= emacs
 PHOTON ?= ../nelisp-photon/lisp
 NELISP ?= ../nelisp/target/nelisp
 
-.PHONY: test compile clean train train-modern train-modern-full gpu-test gpu-train-test gpu-ag-test gpu-block-test gpu-moe-test gpu-stack-test gpu-window-test gpu-gather-test gpu-adam-test gpu-tie-test gpu-sched-test agent-evolve-gpu-test bench-gpu bench-gpu-train bench-ondevice train-stacked-gpu train-corpus-gpu generate-gpu train-full-gpu checkpoint-gpu train-big-gpu stream-decode spec-decode bitnet-model bench-dp4a spec-chain integrated-decode bench-longctx agent-demo agent-model-demo agent-improve-demo agent-code-demo agent-sandbox-demo agent-tasks-demo agent-gpu-finetune-demo agent-ondevice-demo
+
+# Byte-compilation.  Nothing here was ever compiled, so every one of these
+# files ran interpreted -- including the float32 codec that every activation
+# crosses on its way to and from the device.  Compiling it is worth 2.4x on
+# that codec alone and 1.6x on a whole transformer block.  The rule is
+# per-file so `make' recompiles only what changed, because a .elc that is
+# older than its .el is still preferred by `load' and only warns.
+GPULISP ?= ../nelisp-gpu/lisp
+LLM_ELC := $(patsubst %.el,%.elc,$(wildcard lisp/*.el))
+
+lisp/%.elc: lisp/%.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -L $(GPULISP) \
+	  --eval '(setq byte-compile-warnings (quote (not docstrings)))' \
+	  -f batch-byte-compile $<
+
+# The siblings first: a call into interpreted photon or nelisp-gpu costs the
+# same whether or not this tree is compiled.
+compile-all:
+	$(MAKE) -C $(dir $(PHOTON)) compile
+	$(MAKE) -C $(dir $(GPULISP)) compile
+	$(MAKE) lisp-elc
+
+lisp-elc: $(LLM_ELC)
+
+.PHONY: test compile compile-all lisp-elc clean train train-modern train-modern-full gpu-test gpu-train-test gpu-ag-test gpu-block-test gpu-moe-test gpu-stack-test gpu-window-test gpu-gather-test gpu-adam-test gpu-tie-test gpu-sched-test agent-evolve-gpu-test bench-gpu bench-gpu-train bench-ondevice train-stacked-gpu train-corpus-gpu generate-gpu train-full-gpu checkpoint-gpu train-big-gpu stream-decode spec-decode bitnet-model bench-dp4a spec-chain integrated-decode bench-longctx agent-demo agent-model-demo agent-improve-demo agent-code-demo agent-sandbox-demo agent-tasks-demo agent-gpu-finetune-demo agent-ondevice-demo
 
 test:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/qwen-tokenizer-test.el
