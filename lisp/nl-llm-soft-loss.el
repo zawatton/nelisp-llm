@@ -4,6 +4,8 @@
 
 (require 'cl-lib)
 (require 'nl-llm-token-table)
+(require 'photon-tensor)
+(require 'photon-autograd)
 
 (defun nl-llm-soft-loss-targets (position table)
   "Return representable `(ID . LOGPROB)' targets for POSITION.
@@ -70,6 +72,71 @@ in `nl-llm-soft-loss-targets'."
                  (aset gradient id (- p q)))
                ids teacher student)
       gradient)))
+
+;;;###autoload
+(defun nl-llm-ag-soft-kl (logits row-targets mask)
+  "Mean top-k soft KL for the selected rows of LOGITS.
+ROW-TARGETS and MASK are vectors with one entry per logit row.  A row is
+included only when MASK selects it and its target is non-nil; this keeps an
+unrepresentable teacher position out of both the value and the gradient."
+  (unless (pav-p logits)
+    (error "Soft KL logits must be an autograd value"))
+  (let* ((lv (pav-value logits))
+         (shape (photon-tensor-shape lv))
+         (rows (and (consp shape) (car shape)))
+         (vocab (and (consp (cdr shape)) (nth 1 shape))))
+    (unless (and (vectorp lv) (= (length shape) 2)
+                 (integerp rows) (> rows 0)
+                 (integerp vocab) (> vocab 0)
+                 (= (length (photon-tensor-data lv)) (* rows vocab)))
+      (error "Soft KL logits must contain a nonempty 2D tensor"))
+    (unless (and (vectorp row-targets) (= (length row-targets) rows))
+      (error "Soft KL row targets must be a vector of length %d" rows))
+    (unless (and (vectorp mask) (= (length mask) rows))
+      (error "Soft KL mask must be a vector of length %d" rows))
+    (let ((saved-targets (copy-sequence row-targets))
+          (saved-mask (copy-sequence mask))
+          (count 0)
+          (loss 0.0)
+          (row 0)
+          (ld (photon-tensor-data lv)))
+      (while (< row rows)
+        (let ((bit (aref saved-mask row))
+              (targets (aref saved-targets row)))
+          (unless (and (integerp bit) (or (= bit 0) (= bit 1)))
+            (error "Soft KL mask value %S at row %d is not 0 or 1" bit row))
+          (when (and (= bit 1) targets)
+            (setq count (1+ count))
+            (let ((row-logits (make-vector vocab 0.0))
+                  (base (* row vocab)))
+              (dotimes (j vocab) (aset row-logits j (aref ld (+ base j))))
+              (setq loss (+ loss (nl-llm-soft-loss-kl row-logits targets)))))
+        (setq row (1+ row))))
+      (when (= count 0)
+        (error "Soft KL requires at least one selected row with targets"))
+      (setq loss (/ loss (float count)))
+      (photon-autograd--record
+       (photon-tensor (list 1 1) (vector loss))
+       (lambda (g)
+         (let* ((upstream (aref (photon-tensor-data g) 0))
+               (scale (/ upstream (float count)))
+               (gradient (make-vector (* rows vocab) 0.0))
+               (i 0))
+           (while (< i rows)
+             (let ((targets (aref saved-targets i)))
+               (when (and (= (aref saved-mask i) 1) targets)
+                 (let ((row-logits (make-vector vocab 0.0))
+                       (base (* i vocab)))
+                   (dotimes (j vocab)
+                     (aset row-logits j (aref ld (+ base j))))
+                   (let ((row-gradient
+                          (nl-llm-soft-loss-kl-grad row-logits targets)))
+                     (dotimes (j vocab)
+                       (aset gradient (+ base j)
+                            (* scale (aref row-gradient j))))))))
+             (setq i (1+ i)))
+           (photon-autograd--addgrad
+            logits (photon-tensor (list rows vocab) gradient))))))))
 
 (provide 'nl-llm-soft-loss)
 ;;; nl-llm-soft-loss.el ends here
