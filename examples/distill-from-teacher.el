@@ -27,6 +27,7 @@
 (require 'nl-llm-agent-provider)
 (require 'nl-llm-agent-openai)
 (require 'nl-llm-distill)
+(require 'nl-llm-teacher-cache)
 
 (defvar distill--base-url
   (or (getenv "NL_LLM_OLLAMA_BASE_URL") "http://127.0.0.1:11434/v1"))
@@ -35,6 +36,17 @@
   (or (getenv "NL_LLM_DISTILL_PROMPTS") "examples/distill-prompts.txt"))
 (defvar distill--out
   (or (getenv "NL_LLM_DISTILL_OUT") "build/distilled.eld"))
+(defvar distill--timeout
+  (string-to-number (or (getenv "NL_LLM_TEACHER_TIMEOUT") "900"))
+  "Seconds to wait for one answer.  A 4B reasoning model on a loaded machine
+takes around two minutes per prompt here, well past the provider's 60-second
+default -- which is how a whole run came back as nothing but timeouts.")
+(defvar distill--options
+  (list :max_tokens (string-to-number
+                     (or (getenv "NL_LLM_TEACHER_MAX_TOKENS") "2048"))
+        :temperature 0.0
+        :timeout-sec distill--timeout))
+(defvar distill--stats (nl-llm-teacher-cache-stats-new))
 
 (defun distill--read-prompts (path)
   "Return the prompt lines of PATH, skipping blanks and # comments."
@@ -53,7 +65,20 @@
   "Return a one-argument function that asks the local teacher for an answer.
 A session per call, so one bad answer cannot poison the next; the provider
 reads only the final `content', so a reasoning model's chain of thought is
-discarded rather than trained on."
+discarded rather than trained on.
+
+Answers go through `nl-llm-teacher-cache', keyed on everything that can change
+one.  At temperature 0 a re-run of the same prompt set is free, which is the
+usual shape of this loop: the dataset gets rebuilt because something
+downstream of it changed, not because the teacher did."
+  (nl-llm-teacher-cache-wrap
+   (distill--ask)
+   (list :model distill--model :base-url distill--base-url
+         :options distill--options)
+   nil distill--stats))
+
+(defun distill--ask ()
+  "Return the uncached one-argument teacher."
   (lambda (prompt)
     (let* ((registry (nl-llm-agent-provider-registry-new))
            (_ (nl-llm-agent-provider-register
@@ -64,7 +89,7 @@ discarded rather than trained on."
                 :models (list distill--model))))
            (session (nl-llm-agent-session-open
                      registry distill--model
-                     :options '(:max_tokens 2048 :temperature 0.0)))
+                     :options distill--options))
            (text (nl-llm-agent-session-complete
                   session (list (cons 'user prompt)))))
       (nl-llm-agent-session-close session)
@@ -101,6 +126,7 @@ discarded rather than trained on."
                  (plist-get first :prompt)
                  (let ((c (plist-get first :completion)))
                    (if (> (length c) 160) (concat (substring c 0 160) "...") c))))
+      (message "%s" (nl-llm-teacher-cache-report distill--stats))
       (message "elapsed %.0fs" (- (float-time) t0)))))
 
 ;;; distill-from-teacher.el ends here
