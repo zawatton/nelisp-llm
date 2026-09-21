@@ -1438,3 +1438,79 @@ the score by more than 0.3 nats on a passage long enough to measure.
 
 Screen at 4 and 16 blocks rather than 64: it turns a five-minute
 question into a thirty-second one, and the depth trend is visible by block 15.
+
+* Making the forward fast enough to iterate on
+Every hypothesis above costs a forward run, so the loop's cost is the
+investigation's cost.  One block of the 27B model took 6.8 seconds; the full
+64 would be seven minutes for one question.  Three changes took that block to
+1.39 seconds, and none of them touched what the model computes -- the dumped
+hidden state after two blocks is byte-identical, 25600 floats, to the run
+before any of it.
+
+The instructive part is that the first two things I measured were both wrong,
+and the profile said so each time.
+
+** Batching the projections: the obvious win that was not one
+The block ran its projections one position at a time, forty server calls per
+block, and the profile put 5.46s of 7.37s in them.  Hoisting the position
+loop into the caller -- =ternary-rows= already takes SEQ -- cut the calls to
+eight and the block to 5.9s.  A 13% gain against a predicted 2.5x.
+
+The eight remaining calls still cost 4.28s, which is the useful number: the
+per-call cost had been almost entirely *work*, not round trip, so removing
+round trips could not have helped much.  Batching is kept because it is free
+and provably exact (=NL_BONSAI_NO_BATCH= keeps the old path, and a dump
+comparison between the two paths reports no differing byte), but it was not
+the win.
+
+** The unpack arithmetic: a second refuted guess
+The inner loop selected each 2-bit field by dividing by a running power of
+four, which is a 32-bit integer division with a variable divisor, executed
+COLS times per output element.  The DSL had no shift operator, so there was no
+other way to write it.
+
+Adding shifts and rewriting the unpack as "shift the field to the sign bit,
+shift back arithmetically" -- which is what the two's-complement 11 encoding
+of -1 was designed for -- moved the block from 4.28s to 4.19s.  Noise.  The
+dispatch was not ALU-bound either.  =make ternary-kernel= reports the same
+worst error to all four digits, 2.067e-07, which is the useful by-product:
+the two spellings are bit-identical, not merely close.
+
+** What it actually was
+Two things, neither in the kernel.
+
+*Resident weights lived in host memory.* The server allocated every buffer
+=HOST_VISIBLE|HOST_COHERENT= and nothing else, which on a discrete card
+without resizable BAR is system RAM.  A shader reading a weight therefore
+crossed PCIe per word, and since adjacent threads walk rows WNG words apart, a
+warp's 32 reads were 32 separate transactions.  0.9 GMAC/s out of a GTX 1060's
+4.4 TFLOPS.  Staging them into DEVICE_LOCAL memory took :wqkv from 94.3ms to
+47.4ms at seq 1 and 475ms to 231ms at seq 5.
+
+*Nothing had ever been byte-compiled.* No Makefile in nelisp-llm, nelisp-gpu
+or nelisp-photon had a rule for it, so the float32 codec that every activation
+crosses -- and the rotations, the RMSNorms, the DeltaNet recurrence -- all ran
+interpreted.  Compiling is 2.4x on the codec (encode 293ms -> 120ms per 87040
+floats, decode 130ms -> 55ms) and took the block from 6.08s to 1.39s.
+
+** How the terms were separated
+Guessing which axis a dispatch is bound by is what produced both refuted
+hypotheses.  What settled it was running the *same* kernel on the *same*
+resident weights three times, shrinking one axis each time: work per row
+(=cols= 5120 -> 128), rows (=out= 10240 -> 64), and positions (=seq= 1 vs 5).
+Whichever shrink the clock follows is the bottleneck.  A fourth timing ran the
+Elisp float encode and decode with no server in the loop at all.
+
+That gave, for :wqkv at seq 5 and before byte-compilation: GPU 73ms, Elisp
+float codec 154ms, fixed per-dispatch cost 4ms.  The host was the majority
+term, which no amount of kernel work would have found.
+
+** A gate that had never finished
+=make verify=, which checks every DSL kernel against the photon-tensor CPU
+oracle, died with a segfault on a different kernel each run -- gelu on one,
+set-cols on the next.  That reads as a kernel defect and is not one: the
+output file was complete and correct on every crashing run, 6656 of 6656
+bytes.  The one-shot runner returned from =main= with every Vulkan object
+alive, leaving the driver's exit-time destructors to race its worker threads.
+Destroying the device explicitly took it from 3 crashes in 20 runs to 0 in 40,
+and =make verify= now reports VERIFY-DONE with 12 of 12 PASS.
