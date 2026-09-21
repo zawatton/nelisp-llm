@@ -183,19 +183,30 @@ REQUEST is a plist containing :url, :headers, :body, and :timeout-sec."
           (json-serialize (plist-get request :body)
                           :null-object nil
                           :false-object :json-false))
-         (buffer
-          (url-retrieve-synchronously
-           url t t (or (plist-get request :timeout-sec) 60))))
+         (timeout (or (plist-get request :timeout-sec) 60))
+         (buffer (url-retrieve-synchronously url t t timeout)))
+    ;; `url-retrieve-synchronously' returns nil when it gave up waiting, which
+    ;; is what a slow local teacher looks like from here.  The old wording --
+    ;; "failed without a response" -- reads as a server fault and cost a whole
+    ;; distillation run before the 60-second default was the suspect.
     (unless buffer
-      (error "OpenAI provider: request failed without a response"))
+      (error "OpenAI provider: no response within %ss; raise :timeout-sec if the model is simply slow" timeout))
     (unwind-protect
         (with-current-buffer buffer
+          ;; No status at all means nothing spoke HTTP: the server is down, the
+          ;; port is refusing, or the name did not resolve.  That used to
+          ;; surface as "malformed HTTP response", which reads as a protocol
+          ;; fault at the far end and sends the reader looking at their request
+          ;; -- twice here, once for 25 minutes.
+          (unless url-http-response-status
+            (error "OpenAI provider: no HTTP response from %s; the server may be down or refusing connections" url))
           (let ((status url-http-response-status)
                 (body-start
                  (progn
                    (goto-char (point-min))
                    (unless (re-search-forward "\r?\n\r?\n" nil t)
-                     (error "OpenAI provider: malformed HTTP response"))
+                     (error "OpenAI provider: HTTP %S with no header terminator"
+                            url-http-response-status))
                    (point))))
             (let ((body (buffer-substring-no-properties
                          body-start (point-max))))
