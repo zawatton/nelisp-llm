@@ -27,7 +27,7 @@ compile-all:
 
 lisp-elc: $(LLM_ELC)
 
-.PHONY: test compile compile-all lisp-elc clean train train-modern train-modern-full gpu-test gpu-train-test gpu-ag-test gpu-block-test gpu-moe-test gpu-stack-test gpu-window-test gpu-gather-test gpu-adam-test gpu-tie-test gpu-sched-test agent-evolve-gpu-test bench-gpu bench-gpu-train bench-ondevice train-stacked-gpu train-corpus-gpu generate-gpu train-full-gpu checkpoint-gpu train-big-gpu stream-decode spec-decode bitnet-model bench-dp4a spec-chain integrated-decode bench-longctx agent-demo agent-model-demo agent-improve-demo agent-code-demo agent-sandbox-demo agent-tasks-demo agent-gpu-finetune-demo agent-ondevice-demo
+.PHONY: test compile compile-all lisp-elc distill-soft test-teacher-cache test-teacher-logprobs test-distill-soft clean train train-modern train-modern-full gpu-test gpu-train-test gpu-ag-test gpu-block-test gpu-moe-test gpu-stack-test gpu-window-test gpu-gather-test gpu-adam-test gpu-tie-test gpu-sched-test agent-evolve-gpu-test bench-gpu bench-gpu-train bench-ondevice train-stacked-gpu train-corpus-gpu generate-gpu train-full-gpu checkpoint-gpu train-big-gpu stream-decode spec-decode bitnet-model bench-dp4a spec-chain integrated-decode bench-longctx agent-demo agent-model-demo agent-improve-demo agent-code-demo agent-sandbox-demo agent-tasks-demo agent-gpu-finetune-demo agent-ondevice-demo
 
 test:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/qwen-tokenizer-test.el
@@ -40,6 +40,9 @@ test:
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/weights-block-backward-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/weights-train-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/distill-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/teacher-cache-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/teacher-logprobs-test.el
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/distill-soft-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/arch-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/attn-test.el
 	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/moe-test.el
@@ -580,9 +583,27 @@ test-distill:
 # Needs `ollama serve' and a pulled model.
 PROMPTS ?= examples/distill-prompts.txt
 OUT ?= build/distilled.eld
+SOFT_OUT ?= build/distilled-soft.eld
+TOPK ?= 8
+test-teacher-cache:
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/teacher-cache-test.el
+
+test-teacher-logprobs:
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/teacher-logprobs-test.el
+
+test-distill-soft:
+	$(EMACS) -Q --batch -L lisp -L $(PHOTON) -l test/distill-soft-test.el
+
 distill:
 	NL_LLM_DISTILL_PROMPTS=$(PROMPTS) NL_LLM_DISTILL_OUT=$(OUT) \
 	  $(EMACS) -Q --batch -L lisp -L $(PHOTON) -l examples/distill-from-teacher.el
+
+# The same run, keeping the teacher's top-K per position instead of only the
+# token it sampled.  TOPK defaults to 8.
+distill-soft:
+	NL_LLM_DISTILL_PROMPTS=$(PROMPTS) NL_LLM_DISTILL_OUT=$(SOFT_OUT) \
+	  NL_LLM_DISTILL_TOPK=$(TOPK) \
+	  $(EMACS) -Q --batch -L lisp -L $(PHOTON) -l examples/distill-soft-from-teacher.el
 
 # Every vjp between one linear and the next, each against finite differences on
 # its own before anything is composed: RMSNorm, the half-split rotation,

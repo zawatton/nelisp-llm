@@ -18,3 +18,9 @@ build/deltanet-fixture.json
 build/bonsai/
 build/bonsai-synth.bin
 build/ternary-fixture.eld
+# Cached teacher answers: reproducible from the teacher, large, and specific to
+# one machine's prompt set.
+/build/teacher-cache/
+/build/distilled-soft.eld
+/build/distilled-cold.eld
+/build/distilled-warm.eld
