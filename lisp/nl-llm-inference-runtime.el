@@ -215,6 +215,20 @@ dependency makes the transaction fail rather than overwrite that change."
                  (unless (byte-code-function-p result)
                    (error "Compiler did not produce byte-code for %s"
                           (car entry)))
+                 ;; `byte-compile' hands a byte-code object straight back, so a
+                 ;; target that arrived compiled from a .elc silently defeats
+                 ;; the whole transaction: the `byte-optimize' and
+                 ;; `macroexp-inhibit-compiler-macros' bindings above have
+                 ;; nothing to act on, the definition keeps whatever defsubst
+                 ;; bodies were inlined into it at file-compile time, and this
+                 ;; module would claim ownership of an object it did not
+                 ;; produce and cannot refresh.  Say so instead.  `auto' then
+                 ;; falls back to source, which leaves the file-compiled
+                 ;; definitions in place -- already fast, just not refreshable.
+                 (when (eq result (cdr entry))
+                   (error "Inference target %s is already byte-compiled\
+ (loaded from a .elc); in-memory preparation cannot inhibit its inlining"
+                          (car entry)))
                  (cons (car entry) result)))
              sources))))
     (unless (nl-llm-inference-runtime--sources-current-p sources context)

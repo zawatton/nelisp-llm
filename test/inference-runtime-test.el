@@ -98,6 +98,60 @@
                    (eq (symbol-function (car entry)) (cdr entry))))
             bindings))
 
+;; This module compiles the inference path in memory with inlining inhibited,
+;; so that a dependency redefined between turns is honoured.  That guarantee is
+;; only expressible when its targets reach it interpreted: `byte-compile' hands
+;; an existing byte-code object straight back, so a target loaded from a .elc
+;; keeps whatever defsubst bodies were inlined into it at file-compile time.
+;;
+;; Both worlds are real -- a checkout with lisp/*.elc built and one without --
+;; so both are checked here.  The refusal is checked first, on whatever state
+;; the tree is actually in; then the target files are reloaded from source, so
+;; the rest of the suite exercises in-memory compilation as it always has,
+;; whether or not a .elc exists.
+(defvar irt--precompiled
+  (cl-remove-if-not (lambda (symbol)
+                      (and (fboundp symbol)
+                           (byte-code-function-p (symbol-function symbol))))
+                    nl-llm-inference-runtime--targets))
+
+(if (null irt--precompiled)
+    (princ (format "%-55s %s  %s\n" "pre-compiled targets" "n/a"
+                   "tree is not byte-compiled; refusal path not exercised"))
+  (irt--check "pre-compiled targets: auto falls back to source"
+              (eq (nl-llm-inference-runtime-prepare 'auto) 'source)
+              (format "%d of %d targets arrived byte-compiled"
+                      (length irt--precompiled)
+                      (length nl-llm-inference-runtime--targets)))
+  (irt--check "pre-compiled targets: byte-code mode refuses, naming one"
+              (condition-case err
+                  (progn (nl-llm-inference-runtime-prepare 'byte-code) nil)
+                (error (and (string-match-p "already byte-compiled"
+                                            (error-message-string err))
+                            t)))))
+
+;; Reload every file that defines a target or a dependency from its source, so
+;; the suite below sees interpreted definitions either way.  `symbol-file'
+;; names the .elc when one was loaded; the .el beside it is what we want.
+(dolist (file (delete-dups
+               (delq nil
+                     (mapcar (lambda (symbol) (symbol-file symbol 'defun))
+                             (append nl-llm-inference-runtime--targets
+                                     nl-llm-inference-runtime--dependencies)))))
+  (let ((source (if (string-suffix-p ".elc" file)
+                    (substring file 0 -1)
+                  file)))
+    (when (file-readable-p source)
+      (load source nil t t))))
+
+(irt--check "target files reloaded from source"
+            (null (cl-remove-if-not
+                   (lambda (symbol)
+                     (and (fboundp symbol)
+                          (byte-code-function-p (symbol-function symbol))))
+                   nl-llm-inference-runtime--targets))
+            "every target is interpreted again")
+
 (let* ((all-symbols
         (delete-dups
          (append nl-llm-inference-runtime--targets
