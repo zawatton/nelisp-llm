@@ -114,18 +114,40 @@
 
 (if (null irt--precompiled)
     (princ (format "%-55s %s  %s\n" "pre-compiled targets" "n/a"
-                   "tree is not byte-compiled; refusal path not exercised"))
-  (irt--check "pre-compiled targets: auto falls back to source"
-              (eq (nl-llm-inference-runtime-prepare 'auto) 'source)
+                   "tree is not byte-compiled; that path not exercised"))
+  ;; A caller asking for byte-code wants compiled numeric kernels and, on a
+  ;; built tree, already has them -- so preparation reports `byte-code' and
+  ;; owns nothing, rather than either refusing or claiming an object it did
+  ;; not make.  What it cannot offer is the refresh guarantee, which is why
+  ;; the suite below reloads from source before testing that.
+  (irt--check "pre-compiled targets: byte-code mode accepts them"
+              (eq (nl-llm-inference-runtime-prepare 'byte-code) 'byte-code)
               (format "%d of %d targets arrived byte-compiled"
                       (length irt--precompiled)
                       (length nl-llm-inference-runtime--targets)))
-  (irt--check "pre-compiled targets: byte-code mode refuses, naming one"
-              (condition-case err
-                  (progn (nl-llm-inference-runtime-prepare 'byte-code) nil)
-                (error (and (string-match-p "already byte-compiled"
-                                            (error-message-string err))
-                            t)))))
+  (irt--check "pre-compiled targets: auto agrees"
+              (eq (nl-llm-inference-runtime-prepare 'auto) 'byte-code))
+  (irt--check "pre-compiled targets: nothing is owned, nothing is clobbered"
+              (and (null nl-llm-inference-runtime--owned)
+                   (progn (nl-llm-inference-runtime-prepare 'source)
+                          (byte-code-function-p
+                           (symbol-function (car irt--precompiled))))))
+  ;; Control: a group that is part compiled and part source cannot be prepared
+  ;; transactionally, and saying so beats silently preparing half of it.
+  (let* ((target (car nl-llm-inference-runtime--targets))
+         (original (symbol-function target)))
+    (unwind-protect
+        (progn
+          (fset target (eval '(lambda (&rest args) (car args)) t))
+          (irt--check "a part-compiled, part-source group is refused"
+                      (condition-case err
+                          (progn (nl-llm-inference-runtime-prepare 'byte-code)
+                                 nil)
+                        (error (and (string-match-p
+                                     "part compiled, part source"
+                                     (error-message-string err))
+                                    t)))))
+      (fset target original))))
 
 (irt--check "target files reloaded from source"
             (null (interpreted-targets-reload))

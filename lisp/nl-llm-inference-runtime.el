@@ -215,20 +215,14 @@ dependency makes the transaction fail rather than overwrite that change."
                  (unless (byte-code-function-p result)
                    (error "Compiler did not produce byte-code for %s"
                           (car entry)))
-                 ;; `byte-compile' hands a byte-code object straight back, so a
-                 ;; target that arrived compiled from a .elc silently defeats
-                 ;; the whole transaction: the `byte-optimize' and
-                 ;; `macroexp-inhibit-compiler-macros' bindings above have
-                 ;; nothing to act on, the definition keeps whatever defsubst
-                 ;; bodies were inlined into it at file-compile time, and this
-                 ;; module would claim ownership of an object it did not
-                 ;; produce and cannot refresh.  Say so instead.  `auto' then
-                 ;; falls back to source, which leaves the file-compiled
-                 ;; definitions in place -- already fast, just not refreshable.
+                 ;; `byte-compile' hands a byte-code object straight back, so
+                 ;; an identity return means nothing was compiled and the
+                 ;; `byte-optimize' and `macroexp-inhibit-compiler-macros'
+                 ;; bindings above had nothing to act on.  The caller screens
+                 ;; that case out before reaching here; this is the invariant
+                 ;; that says so, rather than owning an object we did not make.
                  (when (eq result (cdr entry))
-                   (error "Inference target %s is already byte-compiled\
- (loaded from a .elc); in-memory preparation cannot inhibit its inlining"
-                          (car entry)))
+                   (error "Inference target %s was not compiled" (car entry)))
                  (cons (car entry) result)))
              sources))))
     (unless (nl-llm-inference-runtime--sources-current-p sources context)
@@ -254,8 +248,34 @@ dependency makes the transaction fail rather than overwrite that change."
                (fset (car entry) (cdr source)))))
          (signal (car err) (cdr err)))))))
 
-(defun nl-llm-inference-runtime--prepare-byte-code ()
+(defun nl-llm-inference-runtime-externally-compiled ()
+  "Return the targets already defined as byte-code this module did not make."
+  (cl-remove-if-not
+   (lambda (symbol)
+     (and (fboundp symbol)
+          (byte-code-function-p (symbol-function symbol))
+          (not (assq symbol nl-llm-inference-runtime--owned))))
+   nl-llm-inference-runtime--targets))
+
+(cl-defun nl-llm-inference-runtime--prepare-byte-code ()
   "Prepare owned byte-code, refreshing stale targets or dependencies."
+  ;; A target loaded from a .elc is already byte-code, and `byte-compile'
+  ;; returns such an object unchanged -- so there is nothing in-memory
+  ;; preparation can add.  The caller asked for compiled numeric kernels and
+  ;; has them; what it does not have is this module's refresh guarantee, since
+  ;; whatever defsubst bodies the file compiler inlined are inlined for good.
+  ;; Report the effective mode and own nothing, so `source' will not clobber
+  ;; definitions this module did not install.  A *partial* overlap is a
+  ;; genuinely mixed tree -- part loaded from source, part from .elc -- where
+  ;; the group cannot be prepared transactionally, and that is worth saying.
+  (let ((external (nl-llm-inference-runtime-externally-compiled)))
+    (when external
+      (unless (= (length external) (length nl-llm-inference-runtime--targets))
+        (error "Inference targets are part compiled, part source (%s); \
+load the whole group one way or the other"
+               (mapconcat #'symbol-name external ", ")))
+      (nl-llm-inference-runtime--restore-owned)
+      (cl-return-from nl-llm-inference-runtime--prepare-byte-code 'byte-code)))
   (if (and (nl-llm-inference-runtime--owned-current-p)
            (nl-llm-inference-runtime--context-current-p
             nl-llm-inference-runtime--context))
