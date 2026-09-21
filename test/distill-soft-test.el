@@ -95,6 +95,31 @@
             (format "top-1 covers %.2f"
                     (nl-llm-distill-soft-coverage vocab 1))))
 
+  ;; Position coverage, which is what a student is actually sized on: a
+  ;; position whose sampled token is unrepresentable cannot be trained at all.
+  (let ((full (nl-llm-distill-soft-position-coverage (car soft) 99))
+        (one  (nl-llm-distill-soft-position-coverage (car soft) 1)))
+    (ds--ck "the whole vocabulary serves every position"
+            (and (= (plist-get full :positions) 4)
+                 (= (plist-get full :sampled) 1.0)
+                 (= (plist-get full :complete) 1.0))
+            (format "%S" full))
+    (ds--ck "control: a one-token vocabulary serves almost none"
+            (< (plist-get one :sampled) 1.0)
+            (format "sampled %.2f complete %.2f"
+                    (plist-get one :sampled) (plist-get one :complete)))
+    ;; The two fractions must be able to differ, or reporting both is theatre.
+    ;; "Hi" is sampled at one position whose alternative "Hey" is rarer, so a
+    ;; vocabulary holding "Hi" but not "Hey" serves it partially.
+    (let* ((vocab (nl-llm-distill-soft-vocabulary (car soft)))
+           (n (1+ (cl-position "Hi" (mapcar #'car vocab) :test #'equal)))
+           (part (nl-llm-distill-soft-position-coverage (car soft) n)))
+      (ds--ck "sampled and complete coverage differ where they should"
+              (> (plist-get part :sampled) (plist-get part :complete))
+              (format "at N=%d: sampled %.2f, complete %.2f"
+                      n (plist-get part :sampled)
+                      (plist-get part :complete)))))
+
   ;; A soft dataset must still read as an ordinary one.
   (let* ((path (make-temp-file "ds-" nil ".eld")))
     (unwind-protect

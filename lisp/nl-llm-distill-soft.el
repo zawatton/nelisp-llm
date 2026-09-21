@@ -84,6 +84,39 @@ coverage of 1.0 at N means no soft target ever refers to a token outside it."
     (if (zerop total) 0.0 (/ (float head) total))))
 
 ;;;###autoload
+(defun nl-llm-distill-soft-position-coverage (examples n)
+  "Return how many positions a vocabulary of the N most frequent tokens serves.
+
+Mass coverage is the wrong number to size a student on.  A position whose
+*sampled* token falls outside the kept vocabulary cannot be trained on at all
+-- there is no target to point at -- while one whose sampled token is inside
+and a rare alternative outside can still be trained against a renormalised
+target.  Those are different losses and they are reported separately.
+
+Returns (:positions P :sampled F :complete F): P positions in all, F the
+fraction whose sampled token is representable, and F the fraction whose whole
+top-k is."
+  (let* ((keep (let ((h (make-hash-table :test 'equal)))
+                 (dolist (entry (cl-subseq (nl-llm-distill-soft-vocabulary
+                                            examples)
+                                           0 (min n (length (nl-llm-distill-soft-vocabulary
+                                                             examples)))))
+                   (puthash (car entry) t h))
+                 h))
+         (total 0) (sampled 0) (complete 0))
+    (dolist (e examples)
+      (dolist (position (plist-get e :tokens))
+        (setq total (1+ total))
+        (when (gethash (plist-get position :token) keep)
+          (setq sampled (1+ sampled))
+          (when (cl-every (lambda (alt) (gethash (plist-get alt :token) keep))
+                          (plist-get position :top))
+            (setq complete (1+ complete))))))
+    (list :positions total
+          :sampled (if (zerop total) 0.0 (/ (float sampled) total))
+          :complete (if (zerop total) 0.0 (/ (float complete) total)))))
+
+;;;###autoload
 (defun nl-llm-distill-soft-summary (examples)
   "Return a one-line description of the soft targets in EXAMPLES."
   (let* ((with (cl-remove-if-not (lambda (e) (plist-get e :tokens)) examples))
