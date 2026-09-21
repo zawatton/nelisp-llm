@@ -9,6 +9,7 @@
 (require 'photon-tensor)
 (require 'nl-llm-decode)
 (require 'nl-llm-inference-runtime)
+(load (expand-file-name "test/interpreted-targets.el") nil t t)
 
 (defvar irt--fail 0)
 
@@ -109,11 +110,7 @@
 ;; the tree is actually in; then the target files are reloaded from source, so
 ;; the rest of the suite exercises in-memory compilation as it always has,
 ;; whether or not a .elc exists.
-(defvar irt--precompiled
-  (cl-remove-if-not (lambda (symbol)
-                      (and (fboundp symbol)
-                           (byte-code-function-p (symbol-function symbol))))
-                    nl-llm-inference-runtime--targets))
+(defvar irt--precompiled (interpreted-targets-precompiled))
 
 (if (null irt--precompiled)
     (princ (format "%-55s %s  %s\n" "pre-compiled targets" "n/a"
@@ -130,26 +127,8 @@
                                             (error-message-string err))
                             t)))))
 
-;; Reload every file that defines a target or a dependency from its source, so
-;; the suite below sees interpreted definitions either way.  `symbol-file'
-;; names the .elc when one was loaded; the .el beside it is what we want.
-(dolist (file (delete-dups
-               (delq nil
-                     (mapcar (lambda (symbol) (symbol-file symbol 'defun))
-                             (append nl-llm-inference-runtime--targets
-                                     nl-llm-inference-runtime--dependencies)))))
-  (let ((source (if (string-suffix-p ".elc" file)
-                    (substring file 0 -1)
-                  file)))
-    (when (file-readable-p source)
-      (load source nil t t))))
-
 (irt--check "target files reloaded from source"
-            (null (cl-remove-if-not
-                   (lambda (symbol)
-                     (and (fboundp symbol)
-                          (byte-code-function-p (symbol-function symbol))))
-                   nl-llm-inference-runtime--targets))
+            (null (interpreted-targets-reload))
             "every target is interpreted again")
 
 (let* ((all-symbols

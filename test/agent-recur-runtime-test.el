@@ -22,6 +22,7 @@
 (require 'nl-llm-agent-artifact)
 (require 'nl-llm-agent-improve)
 (require 'nl-llm-agent-recur-provider)
+(load (expand-file-name "test/interpreted-targets.el") nil t t)
 
 (defvar arrt--fail 0)
 
@@ -142,6 +143,11 @@
        (_ (dolist (parameter params)
             (fillarray (photon-tensor-data (pav-grad parameter)) 0.375)))
        (value-before (arrt--parameter-snapshot model t))
+       ;; Before any binding is snapshotted: this suite drives the in-memory
+       ;; compiler, which a target loaded from a .elc cannot serve (see
+       ;; test/interpreted-targets.el).  Reload first so the snapshot, the
+       ;; checks and the restore all describe the same world.
+       (_ (interpreted-targets-reload))
        (runtime-targets nl-llm-inference-runtime--targets)
        (runtime-targets-present
         (and (memq 'photon-tensor-matmul runtime-targets)
