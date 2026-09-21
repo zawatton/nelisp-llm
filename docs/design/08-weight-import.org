@@ -1514,3 +1514,72 @@ bytes.  The one-shot runner returned from =main= with every Vulkan object
 alive, leaving the driver's exit-time destructors to race its worker threads.
 Destroying the device explicitly took it from 3 crashes in 20 runs to 0 in 40,
 and =make verify= now reports VERIFY-DONE with 12 of 12 PASS.
+
+* Soft targets: what the teacher will and will not hand over
+The teacher's top-k per position carries roughly k times the supervision of the
+token it happened to sample, for the same call -- and the call is what a
+distillation run costs.  ollama 0.21 returns `logprobs.content' with
+`top_logprobs' populated, so this is available here and not only in principle.
+
+** The vocabulary is shared, which is what makes the top-k usable at all
+Soft targets arrive as token *strings*, so a student can only use them if it
+can turn each into an id of its own.  Checked rather than assumed: 7181 of the
+teacher's 7186 distinct tokens are in the donor Qwen3-0.6B vocabulary, and two
+of the five absent are =<|endoftext|>= and =<|im_end|>=, which live in
+=added_tokens=.  qwen3:4b and Qwen3-0.6B agree, so a student sharing the
+donor's tokenizer consumes the distribution directly.
+
+** The `bytes' field does not rescue a split character -- measured
+The three remaining tokens are fragments of multi-byte characters.  Qwen's BPE
+is byte-level and splits a 3-byte character across tokens, so the decoded
+`token' string of a partial sequence collapses to U+FFFD.  The response also
+carries a `bytes' array per token, and the obvious conclusion -- that it holds
+the original bytes and therefore resolves them -- is wrong.
+
+Their bytes are =(32 239 191 189 239 191 189)=.  =EF BF BD= is the UTF-8 of
+U+FFFD: the array is the encoding of the *already decoded* string, so the
+information is gone before it reaches us.  Regenerating the dataset with
+`bytes' kept changed the resolve rate not at all, 7193 of 7196 either way.
+
+What that costs is a measurement rather than a worry, and the case that
+matters is Japanese, where every character is three bytes.  Three prompts,
+400 positions each, top-8:
+
+| prompt                        | positions | sampled mangled |
+|-------------------------------+-----------+-----------------|
+| オームの法則を一文で述べよ。  |       400 |       18 (4.5%) |
+| 低圧電路の絶縁抵抗の測定方法  |       400 |        0 (0.0%) |
+| キュービクルの年次点検        |       400 |       20 (5.0%) |
+
+2.77% of all mentions, 7 distinct tokens.  So three to five percent of
+positions are untrainable as soft targets and the rest are fine, which the
+`-targets' functions already handle by returning nil for a position whose
+sampled token does not resolve.  The completion *text* is unaffected -- only
+the per-token split is lossy -- so hard-label distillation loses nothing.
+
+`bytes' is kept anyway: it is the correct key, it costs nothing, and a server
+that does return original bytes would then work without another change.  What
+is not true is that keeping it fixed the fragments.
+
+** Sizing the student: prune nothing, make the embedding cheap
+Mass coverage is the wrong instrument.  What decides whether a position can be
+trained is whether its *sampled* token is representable; whether its rarer
+alternatives are decides only between a renormalised target and a complete one.
+On 9 examples and 7937 positions:
+
+| N    | mass   | sampled | complete |
+|------+--------+---------+----------|
+| 256  | 0.5082 | 0.6869  | 0.0784   |
+| 1024 | 0.7504 | 0.8956  | 0.2808   |
+| 4096 | 0.9510 | 0.9976  | 0.7470   |
+
+and the distinct count does not saturate: the ninth example added 1227 new
+tokens, more than the fourth did.  A Heaps fit over the prefixes gives beta
+near 0.64, reaching the full 151936 somewhere around a thousand examples --
+from nine points, which is weak evidence and the reason the growth table is
+printed rather than summarised.
+
+So pruning does not survive scale, and the answer is to carry the whole
+vocabulary and make it cheap.  At dim 256 the embedding is 38.9M of a 44M
+student, about ninety percent of it, and ternary2 takes the model from 176 MB
+to 11 MB.  The compression belongs where the parameters are.
