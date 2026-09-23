@@ -11,6 +11,9 @@
 ;; Two implementations of the same block will drift otherwise, and a drift
 ;; that only shows up as a slightly wrong gradient is the kind that survives.
 
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'nl-llm-bonsai)
 (require 'nl-llm-bonsai-backward)
 (require 'nl-llm-lora)

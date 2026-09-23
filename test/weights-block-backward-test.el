@@ -1,5 +1,5 @@
 ;;; weights-block-backward-test.el --- a gradient through a whole block  -*- lexical-binding: t; -*-
-;; Run: emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l test/weights-block-backward-test.el
+;; Run: emacs -Q --batch -l test/weights-block-backward-test.el
 ;;
 ;; Doc 08 Phase 3, the composition.  The individual vjps are checked in
 ;; test/weights-backward-test.el; this one takes a gradient through all of them
@@ -23,8 +23,9 @@
 ;; Seq is 2 on purpose.  At seq 1 attention is a single position attending to
 ;; itself and the cross-position terms of dq/dk are never exercised.
 
-(add-to-list 'load-path (expand-file-name "lisp"))
-(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'photon-tensor)
 (require 'nl-llm-attn)
 (require 'nl-llm-weights)

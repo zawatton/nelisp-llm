@@ -3,8 +3,9 @@
 ;; This is an integration test.  It exercises the actual Vulkan/nlga path and
 ;; skips successfully when no supported device is available.
 
-(add-to-list 'load-path (expand-file-name "lisp"))
-(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'nl-llm-agent-evolve)
 (require 'nl-llm-gpu)
 (require 'nl-llm-agent-ondevice)

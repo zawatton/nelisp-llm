@@ -5,9 +5,10 @@
 ;; the identical attention/SwiGLU glue, reusing nl-llm-bitnet--blk), and reports
 ;; the block-linear weight VRAM (1 byte/weight = 4x less than f32).
 ;; Skips (exit 0) without a Vulkan device.
-;;   emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l test/gpu-bitnet-dp4a-model-test.el
-(add-to-list 'load-path (expand-file-name "lisp"))
-(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+;;   emacs -Q --batch -l test/gpu-bitnet-dp4a-model-test.el
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'cl-lib)
 (require 'photon-tensor)
 (require 'nl-llm-decode)

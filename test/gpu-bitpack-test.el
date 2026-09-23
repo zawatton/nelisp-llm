@@ -2,9 +2,10 @@
 ;; Checks the packed-weight forward (nl-llm-bitnet-linear, kernel bitlinear-packed)
 ;; equals the f32 ternary linear X . (beta*ternary(W))^T + bias it encodes, and
 ;; reports the weight-memory reduction from base-4 packing.  Skips without Vulkan.
-;;   emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l test/gpu-bitpack-test.el
-(add-to-list 'load-path (expand-file-name "lisp"))
-(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+;;   emacs -Q --batch -l test/gpu-bitpack-test.el
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'cl-lib)
 (require 'photon-tensor)
 (require 'nl-llm-gpu)

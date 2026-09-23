@@ -1,7 +1,8 @@
 ;;; evolve-async-test.el --- async evolution completion boundary -*- lexical-binding: t; -*-
 
-(add-to-list 'load-path (expand-file-name "lisp"))
-(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'nl-llm-evolve-queue)
 
 (defvar evolve-async--fail 0)

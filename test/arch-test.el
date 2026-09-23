@@ -1,8 +1,9 @@
 ;;; arch-test.el --- tests for nl-llm modern transformer primitives  -*- lexical-binding: t; -*-
 ;; Run from the nelisp-llm root:
-;;   emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l test/arch-test.el
-(add-to-list 'load-path (expand-file-name "lisp"))
-(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+;;   emacs -Q --batch -l test/arch-test.el
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'photon-tensor)
 (require 'nl-llm-arch)
 

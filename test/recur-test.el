@@ -1,5 +1,5 @@
 ;;; recur-test.el --- correctness + gradient checks for recurrent depth  -*- lexical-binding: t; -*-
-;; Run: emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l test/recur-test.el
+;; Run: emacs -Q --batch -l test/recur-test.el
 ;; Six groups (see docs/design/07-recurrent-depth.org "Verification"):
 ;;   1. shape / determinism
 ;;   2. recurrence has effect
@@ -7,8 +7,9 @@
 ;;   4. truncation is exact (maxdiff 0 vs a hand-built detached reference)
 ;;   5. adaptive-exit bounds
 ;;   6. training smoke (sum-mod task)
-(add-to-list 'load-path (expand-file-name "lisp"))
-(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'cl-lib)
 (require 'photon-tensor)
 (require 'photon-autograd)

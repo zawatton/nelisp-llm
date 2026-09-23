@@ -7,6 +7,9 @@
 (add-to-list 'load-path
              (expand-file-name "../lisp"
                                nl-llm-agent-completion-plan-test--here))
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'nl-llm-agent-completion-plan)
 
 (defun nl-llm-agent-completion-plan-test--base (&optional masks)

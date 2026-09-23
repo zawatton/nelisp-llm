@@ -5,9 +5,10 @@
 ;;   (2) the real weight-VRAM reduction from packing the block linears.
 ;; Weights are random (this demo is about memory + numerical equivalence, not
 ;; generation quality).  Skips (exit 0) without a Vulkan device.
-;;   emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l examples/bitnet-model.el
-(add-to-list 'load-path (expand-file-name "lisp"))
-(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+;;   emacs -Q --batch -l examples/bitnet-model.el
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'cl-lib)
 (require 'photon-tensor)
 (require 'nl-llm-decode)

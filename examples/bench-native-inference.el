@@ -9,6 +9,9 @@
 
 ;;; Code:
 
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'cl-lib)
 (require 'bytecomp)
 
@@ -17,7 +20,6 @@
 (defconst bninf--repo-dir
   (file-name-as-directory (expand-file-name ".." bninf--examples-dir)))
 (add-to-list 'load-path (expand-file-name "lisp" bninf--repo-dir))
-(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp" bninf--repo-dir))
 
 ;; Load the measured implementation from source even if a developer happens to
 ;; have stale .elc files elsewhere on `load-path'.

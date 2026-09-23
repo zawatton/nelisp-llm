@@ -6,9 +6,10 @@
 ;; Training only on its OWN passing programs, the model's synthesis success rate
 ;; climbs from the ~1/9 random baseline toward 100%.  This is how the loop scales
 ;; from a toy to real coding ability (docs/design/05-agent-harness.org).  CPU; seeded.
-;;   emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l examples/agent-code-demo.el
-(add-to-list 'load-path (expand-file-name "lisp"))
-(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+;;   emacs -Q --batch -l examples/agent-code-demo.el
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'cl-lib)
 (require 'nl-llm-agent)
 (require 'nl-llm-agent-model)

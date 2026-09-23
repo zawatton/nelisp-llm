@@ -5,9 +5,10 @@
 ;;   - held-out loss for R in {1, 2, 4, 8, 16} (does more test-time depth help?)
 ;;   - the mean iterations used by zero-shot adaptive exit at a few EPS
 ;;   - a path-independence number at R=16 (do different S0 converge together?)
-;;   emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l examples/recur-demo.el
-(add-to-list 'load-path (expand-file-name "lisp"))
-(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+;;   emacs -Q --batch -l examples/recur-demo.el
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'cl-lib)
 (require 'photon-tensor)
 (require 'photon-autograd)

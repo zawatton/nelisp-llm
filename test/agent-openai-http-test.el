@@ -1,9 +1,11 @@
 ;;; agent-openai-http-test.el --- default Emacs HTTP transport  -*- lexical-binding: t; -*-
 
 ;; URL retrieval is stubbed, so this test performs no network access.
-;;   emacs -Q --batch -L lisp -l test/agent-openai-http-test.el
+;;   emacs -Q --batch -l test/agent-openai-http-test.el
 
-(add-to-list 'load-path (expand-file-name "lisp"))
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'cl-lib)
 (require 'url)
 (require 'json)

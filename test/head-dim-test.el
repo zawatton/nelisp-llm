@@ -1,5 +1,5 @@
 ;;; head-dim-test.el --- attention with a head dim decoupled from dim/heads  -*- lexical-binding: t; -*-
-;; Run: emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l test/head-dim-test.el
+;; Run: emacs -Q --batch -l test/head-dim-test.el
 ;;
 ;; Doc 08 Phase 2a.  Qwen3 sets head_dim independently of hidden_size /
 ;; num_attention_heads: Qwen3-0.6B is hidden 1024, 16 query heads, head_dim
@@ -14,8 +14,9 @@
 ;; The layer/model plist key is =:head-dim=, absent meaning (/ dim heads), so
 ;; every existing model and test is unaffected.
 
-(add-to-list 'load-path (expand-file-name "lisp"))
-(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'photon-tensor)
 (require 'nl-llm-attn)
 (require 'nl-llm-block)

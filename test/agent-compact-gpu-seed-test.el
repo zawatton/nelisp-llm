@@ -1,9 +1,10 @@
 ;;; agent-compact-gpu-seed-test.el --- compact masked GPU graph tests -*- lexical-binding: t; -*-
-;; Run: emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l test/agent-compact-gpu-seed-test.el
+;; Run: emacs -Q --batch -l test/agent-compact-gpu-seed-test.el
 
 (setq load-prefer-newer t)
-(add-to-list 'load-path (expand-file-name "lisp"))
-(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'cl-lib)
 (require 'photon-tensor)
 (require 'photon-autograd)

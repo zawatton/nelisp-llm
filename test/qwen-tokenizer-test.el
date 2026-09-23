@@ -1,5 +1,5 @@
 ;;; qwen-tokenizer-test.el --- donor token-id parity  -*- lexical-binding: t; -*-
-;; Run: emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l test/qwen-tokenizer-test.el
+;; Run: emacs -Q --batch -l test/qwen-tokenizer-test.el
 ;;
 ;; Doc 08 Phase 1, Verification checks 1 and 2.  Every fixture id sequence comes
 ;; from the reference `tokenizers' library (tools/qwen-tokenizer-fixtures.py),
@@ -13,8 +13,9 @@
 ;; The table and fixtures are donor-derived and gitignored; the suite skips
 ;; rather than fails when they are absent, so a fresh clone is not red.
 
-(add-to-list 'load-path (expand-file-name "lisp"))
-(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'nl-llm-qwen-tokenizer)
 
 (defvar qt--fail 0)

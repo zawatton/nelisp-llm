@@ -2,9 +2,10 @@
 ;; Trains a block on-device with SGD + global-norm gradient clipping and checks
 ;; the loss trajectory matches a CPU reference that clips the same way, and that
 ;; the clip actually engages (grad norm > threshold).  Skips without a GPU.
-;;   emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l test/gpu-clip-test.el
-(add-to-list 'load-path (expand-file-name "lisp"))
-(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+;;   emacs -Q --batch -l test/gpu-clip-test.el
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'cl-lib)
 (require 'photon-tensor)
 (require 'photon-autograd)

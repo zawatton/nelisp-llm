@@ -5,9 +5,10 @@
 ;; only seq token + seq target indices are refreshed (nlga-update) -- no
 ;; seq x vocab one-hot.  Every weight (embedding included) stays resident.
 ;; Reports the loss trend and the steady-state per-window time.
-;;   emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l examples/train-corpus-gpu.el
-(add-to-list 'load-path (expand-file-name "lisp"))
-(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+;;   emacs -Q --batch -l examples/train-corpus-gpu.el
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'cl-lib)
 (require 'photon-tensor)
 (require 'photon-bpe)

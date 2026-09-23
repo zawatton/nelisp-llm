@@ -3,9 +3,10 @@
 ;; checkpoint, STOP the GPU server, then load the checkpoint from disk, restart
 ;; the GPU, and generate from the loaded weights with the on-GPU KV-cache decode.
 ;; A correct round-trip reproduces the memorised passage from the reloaded model.
-;;   emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l examples/checkpoint-gpu.el
-(add-to-list 'load-path (expand-file-name "lisp"))
-(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+;;   emacs -Q --batch -l examples/checkpoint-gpu.el
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'cl-lib)
 (require 'photon-tensor)
 (require 'photon-bpe)

@@ -7,9 +7,10 @@
 ;; -> repeat.  The CPU rollout success rate rising, with the weights provably
 ;; changed only by the GPU training, shows the transfer closes the loop.
 ;; Needs a Vulkan device.  (docs/design/05-agent-harness.org)
-;;   emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l examples/agent-ondevice-demo.el
-(add-to-list 'load-path (expand-file-name "lisp"))
-(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+;;   emacs -Q --batch -l examples/agent-ondevice-demo.el
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'cl-lib)
 (require 'photon-tensor)
 (require 'nl-llm-agent)

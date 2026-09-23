@@ -3,9 +3,10 @@
 ;; compiled ONCE and re-submitted each window, with only the (resident) one-hot
 ;; token/target inputs refreshed per window via nlga-update.  Checks the loss
 ;; trajectory matches the CPU autograd reference.  Skips (exit 0) without a GPU.
-;;   emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l test/gpu-window-test.el
-(add-to-list 'load-path (expand-file-name "lisp"))
-(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+;;   emacs -Q --batch -l test/gpu-window-test.el
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'cl-lib)
 (require 'photon-tensor)
 (require 'photon-autograd)

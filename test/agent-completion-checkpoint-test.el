@@ -12,6 +12,9 @@
              (expand-file-name "../../nelisp-photon/lisp"
                                nl-llm-agent-completion-checkpoint-test--here))
 
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'nl-llm-agent-training-checkpoint)
 (require 'nl-llm-agent-completion-plan)
 (require 'nl-llm-agent-artifact)

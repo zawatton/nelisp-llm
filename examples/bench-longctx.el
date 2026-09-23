@@ -10,9 +10,10 @@
 ;;     long run to show the cache stays pinned, then project the KV bytes out to
 ;;     128k tokens.
 ;; Needs a Vulkan device (the ternary matmuls run on the GPU).
-;;   emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l examples/bench-longctx.el
-(add-to-list 'load-path (expand-file-name "lisp"))
-(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+;;   emacs -Q --batch -l examples/bench-longctx.el
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'cl-lib)
 (require 'photon-tensor)
 (require 'nl-llm-bitnet)

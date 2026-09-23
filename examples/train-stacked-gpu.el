@@ -4,9 +4,10 @@
 ;; resident-autograd builder: every weight stays resident on the GPU and the
 ;; whole forward + backward + SGD is one fused batch per step.  Prints the loss
 ;; curve and the steady-state per-step time.
-;;   emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l examples/train-stacked-gpu.el
-(add-to-list 'load-path (expand-file-name "lisp"))
-(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+;;   emacs -Q --batch -l examples/train-stacked-gpu.el
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'cl-lib)
 (require 'photon-tensor)
 (require 'photon-bpe)

@@ -1,5 +1,5 @@
 ;;; weights-gpu-test.el --- imported int8 weights through the DP4A kernel  -*- lexical-binding: t; -*-
-;; Run: emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l test/weights-gpu-test.el
+;; Run: emacs -Q --batch -l test/weights-gpu-test.el
 ;;
 ;; Doc 08 Phase 2d.  A linear from the imported table, uploaded as bytes and run
 ;; through `bitlinear-dp4a-rows', checked two ways that answer two different
@@ -24,8 +24,9 @@
 ;;
 ;; Needs the GPU server and the donor table; skips cleanly without either.
 
-(add-to-list 'load-path (expand-file-name "lisp"))
-(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'photon-tensor)
 (require 'nl-llm-weights)
 (require 'nl-llm-lora)

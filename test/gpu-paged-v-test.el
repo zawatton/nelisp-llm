@@ -6,9 +6,10 @@
 ;;  (3) two sequences SHARE a prompt-prefix's blocks -> identical continuation
 ;;      logits at fewer total blocks than separate copies.
 ;; Skips (exit 0) without a Vulkan device.
-;;   emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l test/gpu-paged-v-test.el
-(add-to-list 'load-path (expand-file-name "lisp"))
-(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+;;   emacs -Q --batch -l test/gpu-paged-v-test.el
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'cl-lib)
 (require 'photon-tensor)
 (require 'nl-llm-decode)

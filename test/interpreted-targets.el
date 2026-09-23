@@ -14,6 +14,9 @@
 ;; then reload the target files from their .el, which is what this provides.
 
 (require 'cl-lib)
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'nl-llm-inference-runtime)
 
 (defun interpreted-targets-precompiled ()

@@ -1,10 +1,11 @@
 ;;; agent-gradient-parity-test.el --- full P5 GPU/CPU gradient parity -*- lexical-binding: t; -*-
 ;; Run after other GPU work is idle:
-;;   emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l test/agent-gradient-parity-test.el
+;;   emacs -Q --batch -l test/agent-gradient-parity-test.el
 
 (setq load-prefer-newer t)
-(add-to-list 'load-path (expand-file-name "lisp"))
-(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'cl-lib)
 (require 'photon-tensor)
 (require 'photon-autograd)

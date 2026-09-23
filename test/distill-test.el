@@ -1,5 +1,5 @@
 ;;; distill-test.el --- the gates on teacher-generated training data  -*- lexical-binding: t; -*-
-;; Run: emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l test/distill-test.el
+;; Run: emacs -Q --batch -l test/distill-test.el
 ;;
 ;; Doc 08 Phase 3.  A teacher's output is not training data until something has
 ;; thrown the bad parts away, so the gates are what this suite is about: each
@@ -14,8 +14,9 @@
 ;; Limits duplicated in two files drift, so they are compared rather than
 ;; trusted.
 
-(add-to-list 'load-path (expand-file-name "lisp"))
-(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'nl-llm-distill)
 (require 'nl-llm-agent-tokenizer)
 (require 'nl-llm-agent-supervised)

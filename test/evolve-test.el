@@ -3,10 +3,11 @@
 ;; A candidate evolves away from an isolated champion copy.  Only a measured
 ;; improvement is promoted; regressions and failed mutations leave the champion
 ;; untouched.  Shared parameters stay shared across the copy.
-;;   emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l test/evolve-test.el
+;;   emacs -Q --batch -l test/evolve-test.el
 
-(add-to-list 'load-path (expand-file-name "lisp"))
-(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'photon-tensor)
 (require 'photon-autograd)
 (require 'nl-llm-evolve)

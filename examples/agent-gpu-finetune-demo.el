@@ -6,9 +6,10 @@
 ;; loop (which already closes end-to-end) to GPU-scale training of the agent on its
 ;; own wins; wiring the GPU-trained weights back into the rollout decoder closes the
 ;; whole loop on-device (the next integration).  Needs a Vulkan device.
-;;   emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l examples/agent-gpu-finetune-demo.el
-(add-to-list 'load-path (expand-file-name "lisp"))
-(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+;;   emacs -Q --batch -l examples/agent-gpu-finetune-demo.el
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'cl-lib)
 (require 'photon-tensor)
 (require 'nl-llm-agent-model)

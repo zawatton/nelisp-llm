@@ -3,9 +3,10 @@
 ;; what plain greedy would produce, regardless of the draft head's quality.  We
 ;; check this on an UNTRAINED (random) model -- so it needs no GPU and isolates
 ;; the acceptance logic -- across several seeds, and report the accept rate.
-;;   emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l test/spec-test.el
-(add-to-list 'load-path (expand-file-name "lisp"))
-(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+;;   emacs -Q --batch -l test/spec-test.el
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'cl-lib)
 (require 'photon-tensor)
 (require 'nl-llm-spec)

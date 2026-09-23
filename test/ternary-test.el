@@ -12,6 +12,9 @@
 ;; here against a pass in tools/ternary-verify.py separates "the reader
 ;; unpacks it wrong" from "the exporter wrote it wrong".
 
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'nl-llm-weights)
 (require 'cl-lib)
 

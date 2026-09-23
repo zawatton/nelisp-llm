@@ -1,6 +1,6 @@
 ;;; teacher-cache-test.el --- the cache must save calls, never answers  -*- lexical-binding: t; -*-
 
-;;   emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l test/teacher-cache-test.el
+;;   emacs -Q --batch -l test/teacher-cache-test.el
 ;;
 ;; A cache is only worth having if a hit is indistinguishable from a call, so
 ;; every check here has a control: the saving is real (the teacher stops being
@@ -8,7 +8,9 @@
 ;; prompt, or the stored material, produces a miss rather than someone else's
 ;; answer).
 
-(add-to-list 'load-path (expand-file-name "lisp"))
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'cl-lib)
 (require 'nl-llm-teacher-cache)
 

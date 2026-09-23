@@ -2,8 +2,10 @@
 ;; Drives the agent harness with a deterministic scripted policy (a stand-in for
 ;; the LLM) so the loop, action parsing, SEARCH/REPLACE edits and the linter
 ;; guardrail are all pinned without needing a model or a GPU.
-;;   emacs -Q --batch -L lisp -l test/agent-test.el
-(add-to-list 'load-path (expand-file-name "lisp"))
+;;   emacs -Q --batch -l test/agent-test.el
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'cl-lib)
 (require 'nl-llm-agent)
 

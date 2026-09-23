@@ -1,7 +1,8 @@
 ;;; autograd-test.el --- numerical gradient checks for modern-block autograd  -*- lexical-binding: t; -*-
-;; Run: emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l test/autograd-test.el
-(add-to-list 'load-path (expand-file-name "lisp"))
-(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+;; Run: emacs -Q --batch -l test/autograd-test.el
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'photon-tensor)
 (require 'photon-autograd)
 (require 'nl-llm-autograd)

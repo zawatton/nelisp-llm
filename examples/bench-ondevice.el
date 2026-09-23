@@ -8,9 +8,10 @@
 ;;                all weights resident, on-device SGD)
 ;; and prints a table with the on-device speedups, to show how the advantage
 ;; grows with model size.
-;;   emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l examples/bench-ondevice.el
-(add-to-list 'load-path (expand-file-name "lisp"))
-(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+;;   emacs -Q --batch -l examples/bench-ondevice.el
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'cl-lib)
 (require 'photon-tensor)
 (require 'photon-autograd)

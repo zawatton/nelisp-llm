@@ -1,6 +1,9 @@
 ;;; evolve-promotion-gate-test.el --- generic promotion gates -*- lexical-binding: t; -*-
 
 (require 'ert)
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'nl-llm-evolve)
 (require 'nl-llm-evolve-queue)
 

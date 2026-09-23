@@ -5,9 +5,10 @@
 ;;      cache-relative RoPE math, the MVP correctness gate for docs/design/02.
 ;;  (2) Boundedness: the cache never holds more than nsink+win entries no matter
 ;;      how long we decode, and the kept slots hold the expected stream positions.
-;;   emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l test/stream-test.el
-(add-to-list 'load-path (expand-file-name "lisp"))
-(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+;;   emacs -Q --batch -l test/stream-test.el
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'cl-lib)
 (require 'photon-tensor)
 (require 'nl-llm-decode)

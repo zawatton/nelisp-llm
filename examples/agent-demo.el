@@ -6,8 +6,10 @@
 ;; plugged in as the policy, can strengthen its own toolset (Phase 4/5 wire the
 ;; real model + trajectory fine-tuning -- docs/design/05-agent-harness.org).
 ;; No model / GPU needed: the scripted policy makes it deterministic.
-;;   emacs -Q --batch -L lisp -l examples/agent-demo.el
-(add-to-list 'load-path (expand-file-name "lisp"))
+;;   emacs -Q --batch -l examples/agent-demo.el
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'nl-llm-agent)
 
 (let* ((dir (make-temp-file "nl-agent-demo-" t))

@@ -2,6 +2,9 @@
 
 (require 'ert)
 (require 'cl-lib)
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'photon-tensor)
 
 (defconst nl-llm-agent-completion-resume-test--here

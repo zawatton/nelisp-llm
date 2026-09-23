@@ -4,9 +4,10 @@
 ;; an nlga model is trained on them on-device (CE + Adam) and the loss drops -- the
 ;; same gradient engine that powers train-*-gpu, now applied to agent trajectories.
 ;; Skips (exit 0) without a Vulkan device.
-;;   emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l test/agent-gpu-test.el
-(add-to-list 'load-path (expand-file-name "lisp"))
-(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+;;   emacs -Q --batch -l test/agent-gpu-test.el
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'cl-lib)
 (require 'photon-tensor)
 (require 'nl-llm-agent-model)

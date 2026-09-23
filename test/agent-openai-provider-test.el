@@ -1,9 +1,11 @@
 ;;; agent-openai-provider-test.el --- OpenAI-compatible adapter  -*- lexical-binding: t; -*-
 
 ;; Tests use an injected transport: no network or API key is required.
-;;   emacs -Q --batch -L lisp -l test/agent-openai-provider-test.el
+;;   emacs -Q --batch -l test/agent-openai-provider-test.el
 
-(add-to-list 'load-path (expand-file-name "lisp"))
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'nl-llm-agent-provider)
 (require 'nl-llm-agent-openai)
 

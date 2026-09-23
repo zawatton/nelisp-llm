@@ -10,7 +10,9 @@
 
 (let ((here nl-llm-copy-curriculum-test--here))
   (add-to-list 'load-path (expand-file-name "../lisp" here))
-  (add-to-list 'load-path (expand-file-name "../../nelisp-photon/lisp" here))
+  (load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                          (file-name-directory (or load-file-name buffer-file-name
+                                                   default-directory))) nil t)
   (load (expand-file-name "../examples/learn-copy-curriculum.el" here)
         nil nil t))
 

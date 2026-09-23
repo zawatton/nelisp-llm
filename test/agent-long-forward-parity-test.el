@@ -11,7 +11,9 @@
   (file-name-directory (or load-file-name buffer-file-name default-directory)))
 (setq load-prefer-newer t)
 (add-to-list 'load-path (expand-file-name "../lisp" alfp--here))
-(add-to-list 'load-path (expand-file-name "../../nelisp-photon/lisp" alfp--here))
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'cl-lib)
 (require 'ert)
 (require 'photon-tensor)

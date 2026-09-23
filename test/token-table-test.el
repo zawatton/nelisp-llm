@@ -1,6 +1,8 @@
 ;;; token-table-test.el --- donor byte-level vocabulary checks  -*- lexical-binding: t; -*-
 
-(add-to-list 'load-path (expand-file-name "lisp"))
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'cl-lib)
 (require 'nl-llm-token-table)
 

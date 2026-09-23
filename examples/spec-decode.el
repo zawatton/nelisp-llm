@@ -7,9 +7,10 @@
 ;; exactly when H2 has learned to look ahead.  The output is identical to plain
 ;; greedy by construction (checked here and pinned in test/spec-test.el).
 ;; Training is on the GPU; decode is CPU.  Skips (exit 0) without a Vulkan device.
-;;   emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l examples/spec-decode.el
-(add-to-list 'load-path (expand-file-name "lisp"))
-(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+;;   emacs -Q --batch -l examples/spec-decode.el
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'cl-lib)
 (require 'photon-tensor)
 (require 'photon-bpe)

@@ -1,5 +1,5 @@
 ;;; weights-lora-test.el --- a trainable adapter over a frozen int8 base  -*- lexical-binding: t; -*-
-;; Run: emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l test/weights-lora-test.el
+;; Run: emacs -Q --batch -l test/weights-lora-test.el
 ;;
 ;; Doc 08 Phase 3.  The barrier this suite is about: a frozen quantized weight
 ;; still has to appear in the backward pass, because dL/dx = W^T.g even when W
@@ -21,8 +21,9 @@
 ;; does nothing useful.  No donor table is needed: the weight is quantized here
 ;; with the same per-row scheme the exporter uses.
 
-(add-to-list 'load-path (expand-file-name "lisp"))
-(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'photon-tensor)
 (require 'nl-llm-weights)
 (require 'nl-llm-lora)

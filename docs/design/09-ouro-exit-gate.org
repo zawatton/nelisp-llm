@@ -1,0 +1,166 @@
+#+TITLE: Learned exit gate -- per-token depth allocation for the recurrent core
+#+OPTIONS: toc:2 num:t
+#+STATUS: DRAFT
+
+* Status
+DRAFT.  Nothing implemented.  Builds directly on Doc 07 (=lisp/nl-llm-recur.el=),
+which already has the prelude / shared core / coda model, the =R= sampler and
+truncated BPTT.  What Doc 07 lacks is *when to stop*: its adaptive exit is
+zero-shot (iterate, run the coda, stop when the KL between consecutive output
+distributions drops below =eps=) and decides once for the whole sequence.
+
+Source: Zhu, Wang, Hua, Zhang, Li et al., "Scaling Latent Reasoning via Looped
+Language Models" (arXiv 2510.25741, the Ouro family).  Survey context and the
+alternatives we are not taking: =docs/astra-recurrent-depth-frontier.md=.
+
+* Motivation
+Doc 07 buys test-time compute in depth, but spends the same depth on every
+token of every input.  A learned gate makes the depth a *decision*: emit a
+halting probability at each iteration, per token, and stop that token when the
+cumulative probability of having halted passes a threshold.
+
+Two reasons to want this here rather than a bigger =r=:
+
+- Doc 07's own measurement says more depth is not free accuracy at toy scale
+  (held-out loss is not monotone in =r=; no =r= in {1,2,4,8,16} was a clear
+  winner).  Allocation is the claim worth testing: *fewer* steps on easy
+  positions at the same mean depth.
+- The exit rule we have is a threshold on a KL we never trained.  It works or
+  it does not, and =eps= is a knob nobody can set from data.  The gate is
+  trained from the model's own loss improvement.
+
+This is deliberately *not* a claim about reasoning depth.  See the three
+results collected in the survey (recurrence-equivalence exponent 0.46, the
+probing study that found little interpretable latent CoT in Huginn, and the
+memory-budget separation for compressed loops).
+
+* Principle
+Write =h^(t)= for the hidden rows the coda hands to the LM head at iteration
+=t= (seq x dim), =z^(t) = Linear_phi(h^(t))= for a single logit per row, and
+
+: lambda_t = sigmoid(z^(t))            per-token halting probability
+: S_t      = prod_{j<=t} (1 - lambda_j)     survival ("still running")
+: p_t      = lambda_t * S_{t-1}             exit distribution, t < T_max
+: p_Tmax   = S_{Tmax-1}                     the remainder lands on the last step
+
+=S_0 = 1=.  The gate is one linear map (dim -> 1) plus its bias; everything
+else is products of the =lambda=.
+
+** Stage I: the model trains against the expected loss
+: L = sum_t p_t * L^(t)  -  beta * H(p)
+: H(p) = - sum_t p_t log p_t
+
+=L^(t)= is the per-token cross-entropy of the coda's output at iteration =t=.
+The entropy term is what stops the gate from collapsing to "always exit at 1"
+(the cheapest way to minimise the first term alone once step 1 is decent); the
+paper notes it is the ELBO form of a KL against a uniform prior over steps,
+=KL(p || uniform) = -H(p) + log T_max=, so the constant drops out.
+
+** Stage II: the gate trains against loss improvement
+With the model's per-step losses *detached*:
+
+: I^(t)  = max(0, L_stop^(t-1) - L_stop^(t))      per token, how much step t bought
+: w^(t)  = sigmoid(k * (I^(t) - gamma))            soft "should have continued" label
+: L_gate = mean over t>=2 of BCE(lambda^(t), 1 - w^(t))
+
+with the paper's =k = 50.0=, =gamma = 0.005=.  =w -> 1= means the step paid for
+itself, so the gate is pushed towards *not* halting there.
+
+** Inference: q-exit
+: CDF(n) = 1 - prod_{j<=n} (1 - lambda_j)
+: t_exit = min { m : CDF(m) >= q }
+
+=q= is the one inference knob, monotone by construction: raising =q= cannot
+lower the exit step.  =q = 0= exits at 1, =q = 1= runs to =T_max=.
+
+* Where it lands here
+One gate parameter pair, two new autograd ops, one new loss path.  No kernels.
+
+- *Gate*: =:wg-exit (1 x dim)=, =:bg-exit (1)= added to the Doc 07 model plist
+  and to =nl-llm-recur-params=.  The gate reads the coda's final-RMSNorm rows,
+  which means *running the coda at every iteration* -- the same cost the
+  current zero-shot adaptive exit already pays at inference, now also paid in
+  training.  Budget it: Stage I costs =T_max= coda passes per step.
+- *New ops* (both need gradient checks against finite differences):
+  - =nl-llm-ag-sigmoid= -- elementwise, =d/dz = s (1 - s)=.
+  - =nl-llm-ag-logsigmoid= -- the numerically stable =log sigmoid(z)=, computed
+    as =-softplus(-z)=, with =d/dz = sigmoid(-z)=.  This is what keeps the
+    entropy and the BCE out of =log(0)=: =log lambda = logsigmoid(z)= and
+    =log(1 - lambda) = logsigmoid(-z)=, so no probability is ever logged
+    directly and no separate fused BCE op is needed.
+  - =nl-llm-ag-ce-rows= -- softmax cross-entropy that returns *one value per
+    row* instead of the scalar mean that =photon-autograd-softmax-ce= returns.
+    Stage I weights each row's loss by that row's =p_t=; a mean cannot.
+- *Composition*: =p_t= comes from products of =lambda= via the existing
+  =nl-llm-ag-mul=; =log p_t= comes from sums of =logsigmoid= outputs.  Entropy
+  uses both, so nothing needs =exp=.
+- *Inference*: =nl-llm-recur-forward-gated MODEL TOKENS RMAX Q &key S0= ->
+  =(:logits :t-exit (per token) :lambdas :cdf)=.  Doc 07's
+  =nl-llm-recur-forward-adaptive= stays as the zero-shot baseline to compare
+  against; this does not replace it.
+
+* Phases
+- *P1 -- plumbing.*  Gate parameters, the two ops with gradient checks, and
+  =forward-gated= with an untrained gate.  No training.
+- *P2 -- Stage II.*  Train the gate alone, model frozen, from detached
+  per-step losses.  Needs =ce-rows= but not the entropy path.
+- *P3 -- Stage I.*  The joint objective with =beta=, trained end to end.
+
+P2 before P3 on purpose: it is the half that can be checked against a frozen
+model, so a failure there is the gate's fault and nothing else's.
+
+* Verification
+Each phase states the number it produces.  Held-out loss at toy scale is noisy
+(Doc 07), so every accuracy claim is *at matched mean depth*, never "more steps
+helped".
+
+1. *Gradient checks* (P1).  =sigmoid= and =logsigmoid= against finite
+   differences at the scales the gate actually sees, including =|z| ~ 30= where
+   a naive =log(sigmoid z)= underflows and =logsigmoid= must not.
+2. *q monotonicity* (P1).  On a fixed model and input, sweep
+   =q in {0, 0.1, ..., 1}=: the mean exit step must be non-decreasing, =q=0=
+   gives 1 and =q=1= gives =T_max=.  This is a property of the construction,
+   so a failure here is a bug, not a result.
+3. *Probability mass* (P1).  =sum_t p_t = 1= per token within 1e-6, including
+   the =p_Tmax= remainder term.
+4. *Label sanity* (P2).  With a model whose loss does not improve after step 1
+   (train it at =r=1=), =I^(t)= must be ~0 for =t>=2=, so =w ~ 0= and the gate
+   is pushed to halt early.  The mean exit step after training must fall.
+5. *Depth allocation* (P2).  On =nl-llm-recur-task-sum-mod= with mixed =K=
+   (the task needs =K-1= additions, so difficulty is known by construction),
+   report the mean exit step per =K=.  The claim under test is that it rises
+   with =K=; report the numbers either way, including the correlation.
+6. *No worse at matched depth* (P2/P3).  Compare held-out loss of the gated
+   model at mean depth =d= against fixed =r = round(d)=.  The gate earns its
+   place only if it is not worse; if it is better, say by how much.
+7. *Entropy knob* (P3).  Sweep =beta=: as =beta -> 0= the exit distribution
+   should collapse toward =t=1=, and as =beta= grows it should flatten toward
+   uniform.  This is the collapse guard doing its job, reported as a curve.
+8. *Detachment* (P2).  Assert that the Stage II gate loss produces no gradient
+   on any model parameter -- zero-grad the model, run the gate step, and check
+   every model pav's grad is still zero.
+
+* Cost / risk
+- Effort: medium.  Two ops, one gate, three loss paths.  The ops are small; the
+  risk sits in the training dynamics, not the code.
+- *Compute*: =T_max= coda passes per training step.  At Doc 07's toy sizes
+  (dim 16, one block per stage) this is affordable; it is the first thing that
+  will hurt when the model grows, and it is why P2 freezes the model.
+- *Collapse*: the known failure is a gate that always halts at 1.  Guards: the
+  entropy term, and check 7 which measures the collapse directly.
+- *Toy-scale honesty*: Doc 07 reported non-monotone loss vs =r= on this
+  hardware.  If check 6 comes out flat, the honest conclusion is that depth
+  allocation buys nothing at this scale -- that is a result, and it belongs in
+  the doc rather than in a tuned-up demo.
+
+* Follow-ups (not MVP)
+- Per-token *routing* instead of halting (Mixture-of-Recursions, arXiv
+  2507.10524): a router picks each token's depth up front, with recursion-wise
+  KV caching so attention at depth =d= only covers tokens still active.  That
+  is the version that saves compute rather than deciding when to stop; it wants
+  the cache bookkeeping Doc 07 also lists.
+- KV-cache sharing across iterations (Huginn sec. 5; Ouro reports last-step-only
+  caching at ~4x reduction with little loss).
+- On-device training of the gated model through =nl-llm-gpu-ag.el=.
+- Ouro's two-stage pretraining schedule (8 recurrent steps, then 4) is *not*
+  adopted: it is a pretraining-scale recipe, and nothing here pretrains.

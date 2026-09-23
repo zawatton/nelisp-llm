@@ -6,9 +6,10 @@
 ;;   bitlinear-packed f32 ternary weights (base-4 unpack, `in' f32 MACs/row)
 ;;   bitlinear-dp4a   int8 activations + ternary weights via hardware OpSDot
 ;;                    (`in'/4 DP4A instructions/row -- the compute win)
-;;   emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l examples/bench-dp4a.el
-(add-to-list 'load-path (expand-file-name "lisp"))
-(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+;;   emacs -Q --batch -l examples/bench-dp4a.el
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'cl-lib)
 (require 'photon-tensor)
 (require 'nl-llm-gpu)

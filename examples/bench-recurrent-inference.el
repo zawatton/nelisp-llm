@@ -23,6 +23,9 @@
 
 (require 'cl-lib)
 (require 'json)
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'nl-llm-agent-recur-artifact)
 (require 'nl-llm-agent-recur-provider)
 (require 'nl-llm-inference-runtime)

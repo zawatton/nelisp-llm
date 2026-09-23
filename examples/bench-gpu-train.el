@@ -8,9 +8,10 @@
 ;;                   updated on the GPU; no weight round-trip per step
 ;; The on-device per-step time is measured by differencing (2S vs S steps) to
 ;; remove the one-time upload/readback.
-;;   emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l examples/bench-gpu-train.el
-(add-to-list 'load-path (expand-file-name "lisp"))
-(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+;;   emacs -Q --batch -l examples/bench-gpu-train.el
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'cl-lib)
 (require 'photon-tensor)
 (require 'photon-autograd)

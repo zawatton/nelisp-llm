@@ -2,9 +2,10 @@
 ;; Checks that decoding B sequences in parallel (nl-llm-gpu-decode-batch) gives,
 ;; for each sequence, the same per-position logits as decoding it alone with the
 ;; CPU KV-cache decoder.  Skips (exit 0) without a Vulkan device.
-;;   emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l test/gpu-batch-test.el
-(add-to-list 'load-path (expand-file-name "lisp"))
-(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+;;   emacs -Q --batch -l test/gpu-batch-test.el
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'cl-lib)
 (require 'photon-tensor)
 (require 'nl-llm-decode)

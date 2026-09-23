@@ -1,8 +1,9 @@
 ;;; agent-tokenizer-test.el --- native agent tokenizer tests -*- lexical-binding: t; -*-
-;; emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l test/agent-tokenizer-test.el
+;; emacs -Q --batch -l test/agent-tokenizer-test.el
 
-(add-to-list 'load-path (expand-file-name "lisp"))
-(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'nl-llm-agent-tokenizer)
 
 (defvar agent-tokenizer-test--fail 0)

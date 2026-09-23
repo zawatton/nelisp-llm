@@ -5,9 +5,10 @@
 ;; decreasing.  This exercises the multi-head GQA backward (per-head autograd
 ;; slice/concat) and the MoE backward (top-k routing) added on top of the
 ;; single-head SwiGLU demo in train-modern.el.  CPU path.
-;;   emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l examples/train-modern-full.el
-(add-to-list 'load-path (expand-file-name "lisp"))
-(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+;;   emacs -Q --batch -l examples/train-modern-full.el
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'cl-lib)
 (require 'photon-tensor)
 (require 'photon-bpe)

@@ -4,8 +4,10 @@
 ;; demo feeds the agent a string of malicious actions; every one is denied, the
 ;; host filesystem is untouched, an infinite loop is killed by the timeout, and a
 ;; legitimate action still works in the isolated subprocess.
-;;   emacs -Q --batch -L lisp -l examples/agent-sandbox-demo.el
-(add-to-list 'load-path (expand-file-name "lisp"))
+;;   emacs -Q --batch -l examples/agent-sandbox-demo.el
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'nl-llm-agent)
 
 (let* ((dir (make-temp-file "nl-sb-demo-" t))

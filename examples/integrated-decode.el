@@ -11,9 +11,10 @@
 ;; steps -- closed-form CE gradient on a linear head), purely to show a realistic
 ;; acceptance rate; the lossless guarantee holds for any head.  Needs a Vulkan
 ;; device (the ternary kernel runs on the GPU).
-;;   emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l examples/integrated-decode.el
-(add-to-list 'load-path (expand-file-name "lisp"))
-(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+;;   emacs -Q --batch -l examples/integrated-decode.el
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'cl-lib)
 (require 'photon-tensor)
 (require 'nl-llm-bitnet)

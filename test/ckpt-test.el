@@ -1,9 +1,10 @@
 ;;; ckpt-test.el --- checkpoint save/load round-trip  -*- lexical-binding: t; -*-
 ;; Checks nl-llm-ckpt-save/load round-trips a modern model (config, step, and all
 ;; tensors incl. block biases) exactly, and rejects a bad format tag.  Pure CPU.
-;;   emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l test/ckpt-test.el
-(add-to-list 'load-path (expand-file-name "lisp"))
-(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+;;   emacs -Q --batch -l test/ckpt-test.el
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'cl-lib)
 (require 'photon-tensor)
 (require 'nl-llm-ckpt)

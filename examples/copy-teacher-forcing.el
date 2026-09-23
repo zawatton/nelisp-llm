@@ -21,6 +21,9 @@
           (nl-llm-learn-literal-copy-no-run t))
       (load curriculum nil nil t))))
 
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'nl-llm-agent-tokenizer)
 (require 'nl-llm-decode)
 (require 'nl-llm-gpu)

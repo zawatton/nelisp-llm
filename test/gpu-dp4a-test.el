@@ -3,9 +3,10 @@
 ;; SPV_KHR_integer_dot_product) and the f32-carried uint32 packing: four signed
 ;; int8 lanes per uint32, carried as two 0..65535 f32 halves, dotted on the GPU.
 ;; Compares against a CPU signed dot product.  Skips (exit 0) without Vulkan.
-;;   emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l test/gpu-dp4a-test.el
-(add-to-list 'load-path (expand-file-name "lisp"))
-(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+;;   emacs -Q --batch -l test/gpu-dp4a-test.el
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'cl-lib)
 (require 'photon-tensor)
 (require 'nl-llm-gpu)

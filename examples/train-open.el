@@ -2,9 +2,10 @@
 ;; End-to-end training demo: BPE-tokenize a public-domain corpus, build a tiny
 ;; 1-layer transformer with photon-autograd, run several SGD steps over text
 ;; windows, and show the loss decreasing.  CPU path (no GPU needed).
-;;   emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l examples/train-open.el
-(add-to-list 'load-path (expand-file-name "lisp"))
-(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+;;   emacs -Q --batch -l examples/train-open.el
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'cl-lib)
 (require 'photon-tensor)
 (require 'photon-bpe)

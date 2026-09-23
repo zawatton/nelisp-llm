@@ -24,6 +24,9 @@
 
 ;;; Code:
 
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'nl-llm-agent-provider)
 (require 'nl-llm-agent-openai)
 (require 'nl-llm-distill)

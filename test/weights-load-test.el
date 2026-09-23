@@ -1,5 +1,5 @@
 ;;; weights-load-test.el --- the Elisp reader unpacks what the exporter packed  -*- lexical-binding: t; -*-
-;; Run: emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l test/weights-load-test.el
+;; Run: emacs -Q --batch -l test/weights-load-test.el
 ;;
 ;; Doc 08 Phase 2c.  lisp/nl-llm-weights.el has three things it can get wrong
 ;; while still returning numbers: which lane of a packed word it reads, which
@@ -20,8 +20,9 @@
 ;; Table and fixture are donor-derived and gitignored, so this skips rather than
 ;; fails when they are absent.
 
-(add-to-list 'load-path (expand-file-name "lisp"))
-(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'nl-llm-weights)
 
 (defvar wl--fail 0)

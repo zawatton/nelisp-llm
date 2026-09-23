@@ -16,8 +16,10 @@
 ;; and wrong.  The epsilon in x / (|x| + 1e-6) does not scale with x, so the
 ;; pre-division survives it.  A 1e-5 tolerance would have shipped that.
 
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'cl-lib)
-(add-to-list 'load-path (expand-file-name "lisp"))
 (require 'nl-llm-deltanet)
 (require 'json)
 

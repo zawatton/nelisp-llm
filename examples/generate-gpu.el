@@ -6,9 +6,10 @@
 ;; asked to continue its prompt -- so a correct pipeline reproduces the passage.
 ;; Generation is forward-only and reuses the CPU autograd forward (nl-llm-ag-block
 ;; + tied head), numerically the same model the on-device path trained.
-;;   emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l examples/generate-gpu.el
-(add-to-list 'load-path (expand-file-name "lisp"))
-(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+;;   emacs -Q --batch -l examples/generate-gpu.el
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'cl-lib)
 (require 'photon-tensor)
 (require 'photon-bpe)

@@ -1,14 +1,14 @@
 ;;; agent-initialization-test.el --- tests for opt-in model initialization -*- lexical-binding: t; -*-
 
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'ert)
 (require 'cl-lib)
 
 (defconst nl-llm-agent-initialization-test--here
   (file-name-directory (or load-file-name buffer-file-name)))
 
-(let ((here nl-llm-agent-initialization-test--here))
-  (add-to-list 'load-path (expand-file-name "../lisp" here))
-  (add-to-list 'load-path (expand-file-name "../../nelisp-photon/lisp" here)))
 
 (require 'photon-tensor)
 (require 'photon-autograd)

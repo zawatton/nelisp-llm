@@ -1,9 +1,10 @@
 ;;; sample-test.el --- temperature / top-k sampling correctness  -*- lexical-binding: t; -*-
 ;; Deterministic checks of nl-llm-sample (seeded RNG): top-k=1 and temp->0 reduce
 ;; to argmax, top-k restricts the support, and a uniform distribution spreads.
-;;   emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l test/sample-test.el
-(add-to-list 'load-path (expand-file-name "lisp"))
-(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+;;   emacs -Q --batch -l test/sample-test.el
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'photon-tensor)
 (require 'nl-llm-arch) (require 'nl-llm-attn) (require 'nl-llm-moe) (require 'nl-llm-block)
 

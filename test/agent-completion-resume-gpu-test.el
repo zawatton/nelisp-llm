@@ -14,6 +14,9 @@
              (expand-file-name "../../nelisp-photon/lisp"
                                nl-llm-agent-completion-resume-gpu-test--here))
 
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'photon-tensor)
 (require 'nl-llm-agent-artifact)
 (require 'nl-llm-agent-completion-plan)

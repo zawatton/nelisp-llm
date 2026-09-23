@@ -3,9 +3,10 @@
 ;; (RMSNorm + RoPE single-head attention + SwiGLU) on public-domain text, and
 ;; shows the loss decreasing -- i.e. the modern block is directly trainable
 ;; (not via the GPT baseline).  CPU path.
-;;   emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l examples/train-modern.el
-(add-to-list 'load-path (expand-file-name "lisp"))
-(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+;;   emacs -Q --batch -l examples/train-modern.el
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'cl-lib)
 (require 'photon-tensor)
 (require 'photon-bpe)

@@ -41,6 +41,9 @@
        (nl-llm-learn-copy-curriculum-auto-run nil))
   (load curriculum nil nil t))
 
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'nl-llm-agent-initialization)
 (require 'nl-llm-agent-supervised)
 (require 'nl-llm-agent-tokenizer)

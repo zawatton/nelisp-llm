@@ -1,5 +1,5 @@
 ;;; weights-train-test.el --- the training loop over an imported model  -*- lexical-binding: t; -*-
-;; Run: emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l test/weights-train-test.el
+;; Run: emacs -Q --batch -l test/weights-train-test.el
 ;;
 ;; Doc 08 Phase 3, the loop.  Everything under it is already checked against
 ;; finite differences: the linear's backward including the frozen base's W^T.g,
@@ -23,8 +23,9 @@
 ;; a suite -- one forward at a hundred tokens is hours on the CPU -- and that
 ;; cost is reported in the design doc rather than hidden in a skipped test.
 
-(add-to-list 'load-path (expand-file-name "lisp"))
-(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'photon-tensor)
 (require 'nl-llm-attn)
 (require 'nl-llm-weights)

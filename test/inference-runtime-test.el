@@ -1,10 +1,11 @@
 ;;; inference-runtime-test.el --- in-memory inference compiler tests  -*- lexical-binding: t; -*-
 
-;;   emacs -Q --batch -L lisp -L ../nelisp-photon/lisp \
+;;   emacs -Q --batch \
 ;;     -l test/inference-runtime-test.el
 
-(add-to-list 'load-path (expand-file-name "lisp"))
-(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'cl-lib)
 (require 'photon-tensor)
 (require 'nl-llm-decode)

@@ -1,5 +1,5 @@
 ;;; weights-backward-test.el --- gradient checks for the block's vjps  -*- lexical-binding: t; -*-
-;; Run: emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l test/weights-backward-test.el
+;; Run: emacs -Q --batch -l test/weights-backward-test.el
 ;;
 ;; Doc 08 Phase 3.  Every piece between one linear and the next, checked against
 ;; finite differences on its own before anything is composed: RMSNorm, the
@@ -16,8 +16,9 @@
 ;; L = <w, f(x)>, so dL/dx is exactly the vjp applied to w.  Central differences
 ;; at 1e-6 then give the reference.
 
-(add-to-list 'load-path (expand-file-name "lisp"))
-(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'nl-llm-attn)
 (require 'nl-llm-weights-forward)
 (require 'nl-llm-weights-backward)

@@ -7,9 +7,10 @@
 ;; model, however weak, into a structurally-valid agent; Phase 5 then trains the
 ;; model on its own successful trajectories so the content becomes useful too
 ;; (docs/design/05-agent-harness.org).  No GPU needed.
-;;   emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l examples/agent-model-demo.el
-(add-to-list 'load-path (expand-file-name "lisp"))
-(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+;;   emacs -Q --batch -l examples/agent-model-demo.el
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'cl-lib)
 (require 'photon-tensor)
 (require 'nl-llm-agent)

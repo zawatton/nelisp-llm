@@ -4,9 +4,10 @@
 ;;   - training:  one forward+backward+SGD step (weights re-uploaded each step)
 ;; and prints a CPU-vs-GPU table.  Honest: inference is where residency pays
 ;; off; training re-encodes the (mutated) weights every step.
-;;   emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l examples/bench-gpu.el
-(add-to-list 'load-path (expand-file-name "lisp"))
-(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+;;   emacs -Q --batch -l examples/bench-gpu.el
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'cl-lib)
 (require 'photon-tensor)
 (require 'photon-autograd)

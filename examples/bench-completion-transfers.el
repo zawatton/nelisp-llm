@@ -11,7 +11,9 @@
               (or load-file-name buffer-file-name default-directory)))
        (root (expand-file-name ".." here)))
   (add-to-list 'load-path (expand-file-name "lisp" root))
-  (add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp" root))
+  (load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                          (file-name-directory (or load-file-name buffer-file-name
+                                                   default-directory))) nil t)
   (add-to-list 'load-path (expand-file-name "../nelisp-gpu/lisp" root)))
 
 (require 'cl-lib)

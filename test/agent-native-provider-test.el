@@ -2,11 +2,12 @@
 
 ;; The native model adapter exposes safe catalog metadata and turns the existing
 ;; nelisp-llm policy builder into the same session contract as remote providers.
-;;   emacs -Q --batch -L lisp -L ../nelisp-photon/lisp \
+;;   emacs -Q --batch \
 ;;     -l test/agent-native-provider-test.el
 
-(add-to-list 'load-path (expand-file-name "lisp"))
-(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'cl-lib)
 (require 'nl-llm-agent-provider)
 (require 'nl-llm-agent-model)

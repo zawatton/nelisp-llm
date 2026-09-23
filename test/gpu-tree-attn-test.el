@@ -4,9 +4,10 @@
 ;; sentinel = M).  Checks the single-dispatch tree-attn kernel against a CPU
 ;; reference that, per node, attends to the context plus the walked parent chain.
 ;; Skips (exit 0) without a Vulkan device.
-;;   emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l test/gpu-tree-attn-test.el
-(add-to-list 'load-path (expand-file-name "lisp"))
-(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+;;   emacs -Q --batch -l test/gpu-tree-attn-test.el
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'cl-lib)
 (require 'nl-llm-gpu)
 (require 'nelisp-gpu-server)

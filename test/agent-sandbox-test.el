@@ -3,8 +3,10 @@
 ;; destructive Elisp is DENIED before it runs, shells are DENIED, edits outside the
 ;; workdir are DENIED, an infinite loop is killed by the timeout (not hung), and
 ;; safe Elisp still evaluates correctly in the isolated subprocess.
-;;   emacs -Q --batch -L lisp -l test/agent-sandbox-test.el
-(add-to-list 'load-path (expand-file-name "lisp"))
+;;   emacs -Q --batch -l test/agent-sandbox-test.el
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'cl-lib)
 (require 'nl-llm-agent)
 

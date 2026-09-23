@@ -7,9 +7,10 @@
 ;; programs with a replay buffer (keeps the curriculum balanced), the mean success
 ;; across the bank climbs from the ~1/8 random baseline.  This is the loop scaling
 ;; toward real coding (docs/design/05-agent-harness.org).  CPU; seeded.
-;;   emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l examples/agent-tasks-demo.el
-(add-to-list 'load-path (expand-file-name "lisp"))
-(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+;;   emacs -Q --batch -l examples/agent-tasks-demo.el
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'cl-lib)
 (require 'nl-llm-agent)
 (require 'nl-llm-agent-model)

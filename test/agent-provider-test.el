@@ -3,9 +3,11 @@
 ;; The agent runtime must be able to switch between local and remote models
 ;; without coupling its message loop to either backend.  A failed switch must
 ;; leave the current backend usable.
-;;   emacs -Q --batch -L lisp -l test/agent-provider-test.el
+;;   emacs -Q --batch -l test/agent-provider-test.el
 
-(add-to-list 'load-path (expand-file-name "lisp"))
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'cl-lib)
 (require 'nl-llm-agent)
 (require 'nl-llm-agent-provider)

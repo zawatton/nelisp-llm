@@ -10,6 +10,9 @@
 ;; linear.  The transpose is held by <W.x, g> = <x, W'.g>, which needs no
 ;; reference and which no index swap survives.
 
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'nl-llm-weights)
 (require 'nl-llm-weights-gpu)
 (require 'nelisp-gpu-server)

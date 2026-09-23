@@ -9,9 +9,10 @@
 ;; spending a few slots on attention sinks.  The attention-sink benefit is a
 ;; learned effect, hence the training step.  Training is on the GPU; decode is CPU
 ;; (nl-llm-stream).  Skips cleanly (exit 0) without a Vulkan device.
-;;   emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l examples/stream-decode.el
-(add-to-list 'load-path (expand-file-name "lisp"))
-(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+;;   emacs -Q --batch -l examples/stream-decode.el
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'cl-lib)
 (require 'photon-tensor)
 (require 'photon-bpe)

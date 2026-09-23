@@ -1,7 +1,8 @@
 ;;; agent-unicode-pipeline-test.el --- versioned tokenizer pipeline tests -*- lexical-binding: t; -*-
 
-(add-to-list 'load-path (expand-file-name "lisp"))
-(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (setq load-prefer-newer t)
 (require 'ert)
 (require 'nl-llm-agent-tokenizer)

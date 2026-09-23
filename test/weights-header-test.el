@@ -1,5 +1,5 @@
 ;;; weights-header-test.el --- the exported weight table is Elisp-readable  -*- lexical-binding: t; -*-
-;; Run: emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l test/weights-header-test.el
+;; Run: emacs -Q --batch -l test/weights-header-test.el
 ;;
 ;; Doc 08 Phase 2b.  The table's header is one Lisp sexp precisely so the Phase
 ;; 2c loader needs no parser, and this pins that claim: `read' must accept it,
@@ -14,8 +14,9 @@
 ;; The table is donor-derived and gitignored, so this skips rather than fails
 ;; when it is absent.
 
-(add-to-list 'load-path (expand-file-name "lisp"))
-(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 
 (defvar wh--fail 0)
 (defvar wh--table (expand-file-name "build/donor/qwen3-0.6b/weights.bin"))

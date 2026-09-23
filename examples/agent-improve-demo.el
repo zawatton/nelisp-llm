@@ -6,9 +6,10 @@
 ;; with x the target char; reward = 1 when x matches.  The same mechanism, with a
 ;; richer grammar + real coding rewards (tests pass), scales to self-improving the
 ;; model's coding ability (docs/design/05-agent-harness.org).  CPU; seeded RNG.
-;;   emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l examples/agent-improve-demo.el
-(add-to-list 'load-path (expand-file-name "lisp"))
-(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+;;   emacs -Q --batch -l examples/agent-improve-demo.el
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'cl-lib)
 (require 'nl-llm-agent)
 (require 'nl-llm-agent-model)

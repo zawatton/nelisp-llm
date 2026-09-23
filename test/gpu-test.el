@@ -4,9 +4,10 @@
 ;;   B. modern model forward matches the CPU result (inference)
 ;;   C. the modern block (GQA + MoE) actually trains on the GPU (loss falls)
 ;; Skips cleanly (exit 0) when no Vulkan device / server is available.
-;;   emacs -Q --batch -L lisp -L ../nelisp-photon/lisp -l test/gpu-test.el
-(add-to-list 'load-path (expand-file-name "lisp"))
-(add-to-list 'load-path (expand-file-name "../nelisp-photon/lisp"))
+;;   emacs -Q --batch -l test/gpu-test.el
+(load (expand-file-name "../lisp/nl-llm-stack-paths.el"
+                        (file-name-directory (or load-file-name buffer-file-name
+                                                 default-directory))) nil t)
 (require 'cl-lib)
 (require 'photon-tensor)
 (require 'photon-autograd)
