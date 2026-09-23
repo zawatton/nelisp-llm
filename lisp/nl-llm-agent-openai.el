@@ -254,7 +254,7 @@ REQUEST is a plist containing :url, :headers, :body, and :timeout-sec."
 ;;;###autoload
 (cl-defun nl-llm-agent-openai-provider
     (id &key base-url models api-key headers transport name
-        (chat-path "/chat/completions"))
+        (chat-path "/chat/completions") timeout-sec)
   "Create an OpenAI-compatible provider named ID.
 
 BASE-URL normally ends in /v1.  MODELS is the static or callable catalog
@@ -262,7 +262,8 @@ accepted by `nl-llm-agent-provider-new'.  API-KEY may be a string or a
 zero-argument function, allowing credential rotation without rebuilding a
 session.  HEADERS is an alist.  TRANSPORT receives a request plist and returns
 parsed JSON.  The default uses Emacs URL without exposing credentials in process
-arguments."
+arguments.  TIMEOUT-SEC is the default per-request timeout in seconds, used
+when the session options do not set :timeout-sec."
   (unless (and (stringp base-url)
                (string-match-p "\\`https?://" base-url))
     (error "OpenAI provider: BASE-URL must use http or https"))
@@ -272,6 +273,9 @@ arguments."
     (error "OpenAI provider: API-KEY must be nil, string, or function"))
   (when (and transport (not (functionp transport)))
     (error "OpenAI provider: TRANSPORT must be nil or a function"))
+  (unless (or (null timeout-sec)
+              (and (numberp timeout-sec) (> timeout-sec 0)))
+    (error "OpenAI provider: TIMEOUT-SEC must be nil or a positive number"))
   (let ((endpoint
          (concat (replace-regexp-in-string "/+\\'" "" base-url)
                  chat-path))
@@ -298,7 +302,8 @@ arguments."
                      :body
                      (nl-llm-agent-openai--body
                       (plist-get state :model) messages options)
-                     :timeout-sec (plist-get options :timeout-sec)))
+                     :timeout-sec (or (plist-get options :timeout-sec)
+                                      timeout-sec)))
               (response (funcall request-transport request)))
          (nl-llm-agent-openai--response-text response))))))
 

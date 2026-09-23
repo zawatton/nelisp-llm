@@ -122,6 +122,43 @@
       (lambda ()
         (nl-llm-agent-session-complete session '((user . "hello"))))))))
 
+(let* ((requests nil)
+       (provider
+        (nl-llm-agent-openai-provider
+         "default-timeout"
+         :base-url "https://example.invalid/v1"
+         :models '("slow")
+         :timeout-sec 180
+         :transport
+         (lambda (request)
+           (setq requests (append requests (list request)))
+           '(:choices ((:message (:content "slow model")))))))
+       (registry (nl-llm-agent-provider-registry-new)))
+  (nl-llm-agent-provider-register registry provider)
+  (nl-llm-agent-session-complete
+   (nl-llm-agent-session-open registry "default-timeout/slow")
+   '((user . "hello")))
+  (nl-llm-agent-session-complete
+   (nl-llm-agent-session-open registry "default-timeout/slow"
+                              :options '(:timeout-sec 5))
+   '((user . "again")))
+  (agent-openai-provider--ck
+   "provider timeout defaults the request timeout"
+   (= (plist-get (nth 0 requests) :timeout-sec) 180))
+  (agent-openai-provider--ck
+   "session timeout overrides provider timeout"
+   (= (plist-get (nth 1 requests) :timeout-sec) 5)))
+
+(agent-openai-provider--ck
+ "non-positive provider timeouts are rejected"
+ (agent-openai-provider--error-p
+  (lambda ()
+    (nl-llm-agent-openai-provider
+     "bad-timeout"
+     :base-url "https://example.invalid/v1"
+     :models '("x")
+     :timeout-sec -1))))
+
 (agent-openai-provider--ck
  "non-HTTP base URLs are rejected"
  (agent-openai-provider--error-p
