@@ -87,6 +87,64 @@
     (agent-openai-http--ck "default transport always releases response buffers"
                            (not (cl-some #'buffer-live-p buffers)))))
 
+(let ((captured nil))
+  (cl-letf (((symbol-function 'url-retrieve-synchronously)
+             (lambda (&rest _)
+               (setq captured
+                     (list :method url-request-method
+                           :headers url-request-extra-headers
+                           :data url-request-data))
+               (let ((buffer (generate-new-buffer " *openai-http-utf8-test*")))
+                 (with-current-buffer buffer
+                   (setq-local url-http-response-status 200)
+                   (insert
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json"
+                    "\r\n\r\n{\"choices\":[{\"message\":{\"content\":"
+                    "\"DONE local\"}}]}"))
+                 buffer))))
+    (nl-llm-agent-openai-default-transport
+     (list :url "https://example.invalid/v1/chat/completions"
+           :headers (list (cons "Authorization"
+                                (string-to-multibyte "Bearer sk-test")))
+           :body '(:model "m"
+                    :messages
+                    [(:role "assistant" :content "I’m")])
+           :timeout-sec 7))
+    (let ((request
+           (concat
+            "POST /v1/chat/completions HTTP/1.1\r\n"
+            (mapconcat
+             (lambda (h) (concat (car h) ": " (cdr h) "\r\n"))
+             (plist-get captured :headers) "")
+            "\r\n" (plist-get captured :data))))
+      (agent-openai-http--ck
+       "default transport request passes the url-http multibyte guard"
+       (= (string-bytes request) (length request))))))
+
+(let ((captured-message nil))
+  (cl-letf (((symbol-function 'url-retrieve-synchronously)
+             (lambda (&rest _)
+               (error
+                "Multibyte text in HTTP request: POST /x HTTP/1.1\r\nAuthorization: Bearer sk-or-v1-SECRET\r\n"))))
+    (condition-case err
+        (progn
+          (nl-llm-agent-openai-default-transport
+           '(:url "https://example.invalid/v1/chat/completions"
+             :headers nil :body (:model "m" :messages [])))
+          (setq captured-message ""))
+      (error
+       (setq captured-message (error-message-string err)))))
+  (agent-openai-http--ck
+   "default transport redacts credentials from request errors"
+   (and (string-match-p "OpenAI provider: request to" captured-message)
+        (not (string-match-p "SECRET" captured-message)))))
+
+(agent-openai-http--ck
+ "openai redactor removes Bearer token punctuation runs"
+ (not (string-match-p
+       "abc\\.def"
+       (nl-llm-agent-openai--redact "x Bearer abc.def y"))))
+
 (princ (format "NL-LLM-AGENT-OPENAI-HTTP %s (%d failures)\n"
                (if (= agent-openai-http--fail 0)
                    "ALL-PASS"

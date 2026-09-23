@@ -170,6 +170,15 @@ OBJECT may be a hash table, keyword plist, or alist."
         (error "OpenAI provider: response has no assistant text"))
       text)))
 
+(defun nl-llm-agent-openai--redact (text)
+  "Return TEXT with Authorization headers and Bearer tokens redacted."
+  (let ((case-fold-search t))
+    (replace-regexp-in-string
+     "Authorization:[^\r\n]*" "Authorization: [redacted]"
+     (replace-regexp-in-string
+      "Bearer [^[:space:]\"\\]+" "Bearer [redacted]"
+      text))))
+
 (defun nl-llm-agent-openai-default-transport (request)
   "Perform OpenAI-compatible REQUEST with Emacs URL and JSON libraries.
 REQUEST is a plist containing :url, :headers, :body, and :timeout-sec."
@@ -178,13 +187,32 @@ REQUEST is a plist containing :url, :headers, :body, and :timeout-sec."
   (require 'json)
   (let* ((url (plist-get request :url))
          (url-request-method "POST")
-         (url-request-extra-headers (plist-get request :headers))
+         (url-request-extra-headers
+          ;; getenv returns multibyte strings; one multibyte header makes
+          ;; url-http reject a request whose body has non-ASCII bytes.
+          (mapcar (lambda (header)
+                    ;; Without NOCOPY: an ASCII-only multibyte string would
+                    ;; otherwise come back unchanged, still multibyte.
+                    (cons (encode-coding-string (car header) 'utf-8)
+                          (encode-coding-string (cdr header) 'utf-8)))
+                  (plist-get request :headers)))
          (url-request-data
-          (json-serialize (plist-get request :body)
-                          :null-object nil
-                          :false-object :json-false))
+          (encode-coding-string
+           (json-serialize (plist-get request :body)
+                           :null-object nil
+                           :false-object :json-false)
+           'utf-8 t))
          (timeout (or (plist-get request :timeout-sec) 60))
-         (buffer (url-retrieve-synchronously url t t timeout)))
+         (buffer
+          (condition-case err
+              (url-retrieve-synchronously url t t timeout)
+            (error
+             (signal 'error
+                     (list (format
+                            "OpenAI provider: request to %s failed: %s"
+                            url
+                            (nl-llm-agent-openai--redact
+                             (error-message-string err)))))))))
     ;; `url-retrieve-synchronously' returns nil when it gave up waiting, which
     ;; is what a slow local teacher looks like from here.  The old wording --
     ;; "failed without a response" -- reads as a server fault and cost a whole
